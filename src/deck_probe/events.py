@@ -38,6 +38,17 @@ class ProbeState:
     marker_x: int | None = None
 
 
+def _paint_full_touchscreen(deck: StreamDeck, image: bytes) -> None:
+    """Paint the entire touch strip.
+
+    The library requires explicit region dimensions for a non-empty image
+    (width/height default to 0, which raises `IndexError: Invalid draw
+    width 0.`), so full repaints must pass the strip's full size.
+    """
+    width, height = deck.touchscreen_image_format()["size"]
+    deck.set_touchscreen_image(image, 0, 0, width, height)
+
+
 def paint_initial_state(deck: StreamDeck) -> ProbeState:
     """Paint all keys and the touch strip for a freshly connected deck.
 
@@ -49,12 +60,13 @@ def paint_initial_state(deck: StreamDeck) -> ProbeState:
         deck.set_brightness(state.brightness_percent)
         for index in range(deck.key_count()):
             deck.set_key_image(index, rendering.render_key_image(deck, index))
-        deck.set_touchscreen_image(
+        _paint_full_touchscreen(
+            deck,
             rendering.render_touchscreen_full(
                 deck,
                 brightness_percent=state.brightness_percent,
                 counters=state.dial_counters,
-            )
+            ),
         )
     return state
 
@@ -133,13 +145,14 @@ def make_touchscreen_callback(state: ProbeState):
             logger.info("touch SHORT tap at (%d, %d)", x, y)
             state.marker_x = x
             with deck:
-                deck.set_touchscreen_image(
+                _paint_full_touchscreen(
+                    deck,
                     rendering.render_touchscreen_full(
                         deck,
                         brightness_percent=state.brightness_percent,
                         counters=state.dial_counters,
                         marker_x=state.marker_x,
-                    )
+                    ),
                 )
 
         elif event_type == TouchscreenEventType.LONG:

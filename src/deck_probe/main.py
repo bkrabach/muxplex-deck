@@ -173,6 +173,11 @@ def run() -> int:
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")
                 _safe_close(deck)
+                # Back off before re-enumerating: without this, a deterministic
+                # error during session setup (e.g. a bad paint call) spins the
+                # connect/fail/reset cycle at full speed -- flooding the log and
+                # strobing the device.
+                shutting_down.wait(POLL_INTERVAL_SECONDS)
     finally:
         logger.info("deck-probe shutting down")
 
