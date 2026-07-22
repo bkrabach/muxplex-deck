@@ -16,6 +16,13 @@ with a second layer of state nested inside DEVICE_ACTIVE:
 
 Unplug at any point drops straight back to DEVICE_ABSENT (server traffic
 stops entirely). Ctrl+C/SIGTERM blanks the deck (if present) and exits 0.
+
+This module depends only on the `DeckDevice` / `DeviceManager` protocols in
+`.device` -- never on the `streamdeck` library or hidapi directly. Which
+backend actually implements those protocols (real hardware via
+`device_real.py`, or the in-process `emulator.py`) is chosen once in
+`main()` based on `--emulator`, and everything below that point is
+backend-agnostic.
 """
 
 from __future__ import annotations
@@ -28,17 +35,16 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from StreamDeck.DeviceManager import DeviceManager, ProbeError
-from StreamDeck.Devices.StreamDeck import (
-    DialEventType,
-    StreamDeck,
-    TouchscreenEventType,
-)
-from StreamDeck.Transport.Transport import TransportError
-
 from . import rendering
 from .client import AuthError, MuxplexClient, MuxplexError, Session, UnreachableError
 from .config import Config, ConfigError, load_config
+from .device import (
+    DeckDevice,
+    DeviceManager,
+    DeviceProbeError,
+    DialEventType,
+    TouchscreenEventType,
+)
 
 logger = logging.getLogger("muxplex_deck")
 
@@ -65,36 +71,28 @@ def _configure_logging() -> None:
     )
 
 
-def _explain_missing_hidapi() -> str:
-    return (
-        "Could not find the native HIDAPI library required to talk to the Stream Deck.\n"
-        "Install it for your platform, then try again:\n"
-        "  macOS:          brew install hidapi\n"
-        "  Debian/Ubuntu:  sudo apt install libhidapi-libusb0\n"
-        "  Windows:        bundled with the 'streamdeck' wheel; if missing, install\n"
-        "                  hidapi via your package manager of choice.\n"
-    )
+def _find_deck(manager: DeviceManager) -> DeckDevice | None:
+    return manager.find_device()
 
 
-def _find_deck(manager: DeviceManager) -> StreamDeck | None:
-    decks = manager.enumerate()
-    return decks[0] if decks else None
-
-
-def _log_device_info(deck: StreamDeck) -> None:
+def _log_device_info(deck: DeckDevice) -> None:
     logger.info("connected: %s", deck.deck_type())
     logger.info("  serial number:    %s", deck.get_serial_number())
     logger.info("  firmware version: %s", deck.get_firmware_version())
     logger.info("  key count:        %d", deck.key_count())
 
 
-def _safe_close(deck: StreamDeck) -> None:
-    """Reset and close the device, swallowing (but logging) any I/O errors."""
+def _safe_close(deck: DeckDevice) -> None:
+    """Reset and close the device, swallowing (but logging) any I/O errors.
+
+    Backend-specific "this is an expected disconnect error, not a bug"
+    exceptions (e.g. the real backend's `TransportError`) are swallowed
+    *inside* the backend's `reset()`/`close()` -- this function only needs
+    to guard against genuinely unexpected failures, from either backend.
+    """
     try:
         if deck.is_open():
             deck.reset()
-    except TransportError:
-        pass
     except Exception:
         logger.exception("Unexpected error while resetting deck during close")
 
@@ -105,7 +103,7 @@ def _safe_close(deck: StreamDeck) -> None:
 
 
 def _interruptible_wait(
-    deck: StreamDeck, shutting_down: threading.Event, seconds: float
+    deck: DeckDevice, shutting_down: threading.Event, seconds: float
 ) -> bool:
     """Wait up to `seconds`, checking shutdown and device-health every ~1s.
 
@@ -133,7 +131,7 @@ def _session_render_key(sessions: list[Session], active_session: str | None) -> 
 
 
 def _paint_sessions(
-    deck: StreamDeck, sessions: list[Session], active_session: str | None, hostname: str
+    deck: DeckDevice, sessions: list[Session], active_session: str | None, hostname: str
 ) -> None:
     key_count = deck.key_count()
     pairs = [(s.name, s.bell.is_ringing) for s in sessions[:key_count]]
@@ -143,16 +141,16 @@ def _paint_sessions(
         rendering.paint_status_strip(deck, strip_message)
 
 
-def _paint_status_only(deck: StreamDeck, message: str) -> None:
+def _paint_status_only(deck: DeckDevice, message: str) -> None:
     with deck:
         rendering.paint_blank_keys(deck)
         rendering.paint_status_strip(deck, message)
 
 
 def _make_key_callback(
-    client: MuxplexClient, deck: StreamDeck, session_names: list[str]
+    client: MuxplexClient, deck: DeckDevice, session_names: list[str]
 ):
-    def on_key(_deck: StreamDeck, key: int, pressed: bool) -> None:
+    def on_key(_deck: DeckDevice, key: int, pressed: bool) -> None:
         if not pressed:
             return
         if key >= len(session_names):
@@ -172,17 +170,17 @@ def _make_key_callback(
 
 
 def _on_dial(
-    _deck: StreamDeck, dial: int, event_type: DialEventType, value: object
+    _deck: DeckDevice, dial: int, event_type: DialEventType, value: object
 ) -> None:
     logger.info("dial[%d] %s %r (unassigned in v1)", dial, event_type, value)
 
 
-def _on_touch(_deck: StreamDeck, event_type: TouchscreenEventType, value: dict) -> None:
+def _on_touch(_deck: DeckDevice, event_type: TouchscreenEventType, value: dict) -> None:
     logger.info("touch %s %r (unassigned in v1)", event_type, value)
 
 
 def _run_active(
-    deck: StreamDeck,
+    deck: DeckDevice,
     client: MuxplexClient,
     shutting_down: threading.Event,
     poll_interval: float,
@@ -276,14 +274,8 @@ def _install_signal_handler() -> threading.Event:
     return shutting_down
 
 
-def run(config: Config) -> int:
+def run(config: Config, manager: DeviceManager) -> int:
     _configure_logging()
-
-    try:
-        manager = DeviceManager()
-    except ProbeError:
-        print(_explain_missing_hidapi(), file=sys.stderr)
-        return 1
 
     shutting_down = _install_signal_handler()
     hostname = urlparse(config.server_url).hostname or config.server_url
@@ -342,6 +334,23 @@ def run(config: Config) -> int:
     return 0
 
 
+def _build_manager(*, emulator: bool, emulator_port: int) -> DeviceManager:
+    """Construct the backend's device manager -- the only backend-selection point.
+
+    Real and emulator backends are imported lazily, here, so choosing
+    `--emulator` never imports (and thus never risks constructing) the
+    hidapi-dependent real backend, and vice versa.
+    """
+    if emulator:
+        from .emulator import EmulatorDeviceManager
+
+        return EmulatorDeviceManager(emulator_port)
+
+    from .device_real import RealDeviceManager
+
+    return RealDeviceManager()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="muxplex-deck",
@@ -352,6 +361,18 @@ def main() -> None:
         help="Path to config JSON file (overrides MUXPLEX_DECK_CONFIG and the default "
         "~/.config/muxplex-deck/config.json)",
     )
+    parser.add_argument(
+        "--emulator",
+        action="store_true",
+        help="Run against the in-process Stream Deck+ emulator (localhost web UI) "
+        "instead of real hardware -- no device, no hidapi required.",
+    )
+    parser.add_argument(
+        "--emulator-port",
+        type=int,
+        default=8484,
+        help="Port for the emulator's web UI (default: 8484). Ignored without --emulator.",
+    )
     args = parser.parse_args()
 
     try:
@@ -360,7 +381,15 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    sys.exit(run(config))
+    try:
+        manager = _build_manager(
+            emulator=args.emulator, emulator_port=args.emulator_port
+        )
+    except DeviceProbeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(run(config, manager))
 
 
 if __name__ == "__main__":

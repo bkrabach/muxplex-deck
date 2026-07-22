@@ -11,6 +11,14 @@ This repo has two apps, sharing one `uv` project:
   muxplex tmux sessions on the deck's 8 keys and switches sessions on key
   press. See "muxplex sidecar" below.
 
+`muxplex-deck` talks to the deck only through a small `DeckDevice` protocol
+(`src/muxplex_deck/device.py`), with two interchangeable backends: the real
+hardware (`device_real.py`, a thin wrapper over the `streamdeck` library)
+and an in-process **emulator** (`emulator.py`) with a localhost web UI. This
+means the whole sidecar -- state machine, muxplex client, rendering,
+interaction flow -- can be developed and tested with zero hardware, on any
+machine, with no `hidapi` installed. See "Stream Deck+ emulator" below.
+
 ## macOS setup
 
 1. Install [uv](https://docs.astral.sh/uv/) if you don't have it:
@@ -265,3 +273,97 @@ device handle closed before the process exits.
 - Same as the probe -- see the Stream Deck+ hardware probe's
   Troubleshooting section above (quit the official Elgato app, install
   `hidapi`, check the USB cable).
+
+## Stream Deck+ emulator
+
+`muxplex-deck` can run against an **in-process virtual Stream Deck+** instead
+of real hardware -- no device, no `hidapi`, no native library at all. This
+is the same code path as real hardware above the device layer: state
+machine, muxplex client, polling, rendering, key-press-to-session-switch.
+Only the physical HID transport is swapped out (see "How this works" below).
+
+### Running
+
+```sh
+uv run muxplex-deck --emulator
+```
+
+Then open **http://127.0.0.1:8484** in a browser. You'll see the 8 keys and
+the touch strip rendered as images, a Plug in / Unplug toggle, and simple
+dial controls. The emulator starts **unplugged** -- click "Plug in" to bring
+the sidecar's state machine up (same as physically connecting the real
+device), point your `config.json` at a running muxplex server as usual, and
+watch keys populate with session names. Click a key to switch sessions,
+exactly like pressing a physical button.
+
+Use a different port with `--emulator-port <N>` if 8484 is taken.
+
+The same HTTP endpoints the UI polls (`GET /state`, `GET /keys/<n>.jpg`,
+`GET /strip.jpg`, `POST /plug`, `POST /unplug`, `POST /input/key`,
+`POST /input/dial`, `POST /input/touch`) can be driven directly with
+`curl`/`httpx` -- useful for scripted or agent-driven testing without a
+browser at all.
+
+### What this proves vs. what only real hardware proves
+
+**Proves (same code as production):** the hotplug state machine
+(DEVICE_ABSENT/ACTIVE/UNREACHABLE/AUTH_FAILED transitions), the muxplex HTTP
+client against a real muxplex server, session-list polling and repaint-only-
+on-change logic, key-press-to-`connect_session` wiring, and all of
+`rendering.py`'s image generation (via the same `PILHelper` calls, same
+image formats/sizes).
+
+**Does NOT prove:** anything about the physical USB/HID transport itself --
+whether the real `streamdeck` library's read thread, hidapi bindings, or
+actual device firmware behave as expected. That layer is covered by
+`deck-probe` against real hardware (see above), not by the emulator. Always
+confirm a change against real hardware before considering it fully proven.
+
+### How this works
+
+`muxplex_deck.main` depends only on the `DeckDevice` protocol
+(`device.py`), never on the `streamdeck` library directly. `--emulator`
+selects `emulator.EmulatorDeviceManager` instead of
+`device_real.RealDeviceManager` as the one and only backend-selection point
+(`main._build_manager`) -- the two backends are mutually exclusive imports,
+so running with `--emulator` never imports (and thus never risks
+constructing) anything hidapi-dependent.
+
+The emulator's HTTP server runs for the whole sidecar process -- it *is*
+the virtual USB bus. "Unplug" doesn't stop the server; it flips a flag so
+the manager's `find_device()` returns nothing (exactly like a real
+`DeviceManager.enumerate()` returning no devices), which drives the sidecar
+into `DEVICE_ABSENT` with zero muxplex traffic, same as pulling a real
+cable. "Plug" flips it back for a fresh `ACTIVE` bring-up.
+
+### Plane mode / fully offline development
+
+To develop with **no network at all** (e.g. no Tailscale reachability),
+run a local muxplex server on the same machine as the sidecar:
+
+1. **Before you lose connectivity**, install tmux and muxplex on the Mac.
+   muxplex isn't assumed to be on PyPI -- install it from source/git, e.g.:
+   ```sh
+   brew install tmux
+   git clone <muxplex-repo-url> ~/dev/muxplex
+   cd ~/dev/muxplex && uv sync
+   ```
+2. Start a local muxplex bound to localhost (no TLS needed for localhost):
+   ```sh
+   uv run muxplex --host 127.0.0.1 --port 8099
+   ```
+3. Point the sidecar's config at it. Localhost muxplex still expects the
+   `Authorization` header to be present and non-empty (check your muxplex
+   version's auth requirements), so `key_file` is still required by
+   `config.py` -- a dummy file is fine if your local instance doesn't
+   enforce a real key:
+   ```json
+   {"server_url": "http://127.0.0.1:8099", "key_file": "~/.config/muxplex-deck/dummy_key"}
+   ```
+   ```sh
+   mkdir -p ~/.config/muxplex-deck && echo "dummy" > ~/.config/muxplex-deck/dummy_key
+   ```
+4. Run the sidecar in emulator mode as above (`uv run muxplex-deck
+   --emulator`) and click "Plug in". You now have a complete, fully offline
+   dev loop: virtual deck -> sidecar -> local muxplex -> real tmux sessions
+   -- no hardware, no network, no spark-1 required.
