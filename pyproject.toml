@@ -10,17 +10,19 @@ requires-python = ">=3.11"
 dependencies = [
     "streamdeck>=0.9.5",
     "pillow>=10.0.0",
+    "httpx>=0.27.0",
 ]
 
 [project.scripts]
 deck-probe = "deck_probe.main:main"
+muxplex-deck = "muxplex_deck.main:main"
 
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = "deck_probe"
+module-name = ["deck_probe", "muxplex_deck"]
 module-root = "src"
 
 [tool.pyright]

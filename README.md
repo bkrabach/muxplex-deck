@@ -1,10 +1,15 @@
-# muxplex-deck: Stream Deck+ hardware probe
+# muxplex-deck: Stream Deck+ hardware probe & muxplex sidecar
 
-A PoC/spike app that proves we can drive every feature of an Elgato Stream
-Deck+ (8 LCD keys, 4 push-dial encoders, 800x100 touch strip) and capture
-every input it can produce, including clean hotplug (unplug/replug without
-restarting the process). It is the seed of a future muxplex sidecar --
-this probe does device I/O only, no server/network integration.
+This repo has two apps, sharing one `uv` project:
+
+- **`deck-probe`** -- a PoC/spike app that proves we can drive every feature
+  of an Elgato Stream Deck+ (8 LCD keys, 4 push-dial encoders, 800x100
+  touch strip) and capture every input it can produce, including clean
+  hotplug (unplug/replug without restarting the process). Device I/O only,
+  no server/network integration. See "Stream Deck+ hardware probe" below.
+- **`muxplex-deck`** -- the actual product: a sidecar that shows your
+  muxplex tmux sessions on the deck's 8 keys and switches sessions on key
+  press. See "muxplex sidecar" below.
 
 ## macOS setup
 
@@ -24,7 +29,9 @@ this probe does device I/O only, no server/network integration.
    uv sync
    ```
 
-## Running
+## Stream Deck+ hardware probe
+
+### Running
 
 ```sh
 uv run deck-probe
@@ -39,7 +46,7 @@ uv run python -m deck_probe
 Press `Ctrl+C` to exit cleanly at any time -- the deck is reset (blanked)
 and the device handle is closed before the process exits.
 
-## Verification checklist
+### Verification checklist
 
 Walk through these in order. Everything is logged to the console with a
 timestamp; watch both the terminal and the physical device.
@@ -113,7 +120,7 @@ timestamp; watch both the terminal and the physical device.
     - Also try `Ctrl+C` while in the `waiting for Stream Deck+...` state
       (no device connected) -- same clean exit expected.
 
-## Troubleshooting
+### Troubleshooting
 
 **Device not found / stuck waiting forever**
 - Is the official Elgato Stream Deck app running? Quit it -- it holds
@@ -146,3 +153,115 @@ timestamp; watch both the terminal and the physical device.
   sudo udevadm control --reload-rules
   sudo udevadm trigger
   ```
+
+## muxplex sidecar (`muxplex-deck`)
+
+Shows your muxplex tmux sessions on the deck's 8 keys and switches the
+active session on key press. Polls `GET /api/sessions` + `GET /api/state`
+on the muxplex server every `poll_interval` seconds; repaints only when
+something render-relevant changed (no flicker). Dials and touch-strip
+gestures are logged only in v1 -- unassigned, pending interaction design.
+
+### Config
+
+Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
+(override with `--config <path>` or the `MUXPLEX_DECK_CONFIG` env var):
+
+```json
+{
+  "server_url": "https://spark-1:8088",
+  "key_file": "~/.config/muxplex-deck/federation_key",
+  "poll_interval": 2.0
+}
+```
+
+- `server_url` (required) -- the muxplex server's base URL, reached over
+  Tailscale from the Mac.
+- `key_file` (optional, defaults to `~/.config/muxplex-deck/federation_key`)
+  -- path to a file containing the federation Bearer key, read fresh at
+  startup and whitespace-stripped.
+- `ca_file` (optional) -- path to a CA bundle for TLS verification. Python
+  does **not** use the macOS Keychain trust store, so if the server's
+  certificate was issued by muxplex's own local CA (`muxplex setup-tls`),
+  point this at that CA file. Never omit verification instead -- see
+  Troubleshooting below.
+- `poll_interval` (optional, default `2.0`) -- seconds between session
+  polls while active.
+
+Any missing/invalid config or unreadable key file produces a clear,
+actionable message on stderr and a non-zero exit -- there is no default
+that silently skips auth or TLS verification.
+
+### Getting the federation key onto the Mac
+
+The muxplex server already has a federation key generated
+(`~/.config/muxplex/federation_key` on spark-1, federation enabled). Copy
+it over:
+
+```sh
+mkdir -p ~/.config/muxplex-deck
+scp spark-1:.config/muxplex/federation_key ~/.config/muxplex-deck/federation_key
+chmod 600 ~/.config/muxplex-deck/federation_key
+```
+
+Then create `~/.config/muxplex-deck/config.json` with your `server_url`
+(the default `key_file` path above already matches, so you can omit it).
+
+### Running
+
+```sh
+uv run muxplex-deck
+```
+
+Or with an explicit config path:
+
+```sh
+uv run muxplex-deck --config ~/some/other/config.json
+```
+
+`Ctrl+C` exits cleanly at any time -- the deck is reset (blanked) and the
+device handle closed before the process exits.
+
+### Verification checklist
+
+1. **Cold start** -- run with the deck unplugged: waits quietly, no
+   server traffic (check with e.g. `tcpdump` or just trust the code: the
+   poll loop only starts once a device is open).
+2. **Plug in, server reachable** -- keys populate with your first 8
+   session names within `poll_interval`; the touch strip shows
+   `<hostname> · N sessions · ACTIVE: <name>`.
+3. **Bell indicator** -- trigger a bell in one of your tmux sessions
+   (e.g. `printf '\a'`); its key should grow an amber dot within one poll
+   tick.
+4. **Press a key** -- switches muxplex's active session (confirm in the
+   PWA or by reconnecting a terminal); the highlight (green background)
+   moves to the pressed key's session on the next poll tick.
+5. **Server down** -- stop muxplex (or block the URL) while the sidecar
+   is running: strip shows `<hostname> UNREACHABLE -- retrying`, keys go
+   blank, and it recovers automatically (repainting sessions) once the
+   server comes back.
+6. **Bad key** -- temporarily corrupt the key file: strip shows
+   `AUTH FAILED -- check key file`, a `CRITICAL` log line appears, and it
+   retries slowly (every 30s) rather than spinning.
+7. **Unplug/replug** -- same hotplug behavior as the probe: unplug stops
+   all server traffic and returns to waiting; replug brings up a fresh
+   ACTIVE session.
+
+### Troubleshooting
+
+**SSL verification failure** (`SSLCertVerificationError` or similar)
+- Your muxplex server is likely using a certificate from its own local CA
+  (`muxplex setup-tls`) rather than a publicly trusted one. Set `ca_file`
+  in your config to that CA's certificate path and retry.
+- Never work around this by disabling verification -- point at the right
+  CA file instead.
+
+**401 / 403 -- `AUTH FAILED` on the strip**
+- The federation key is missing, stale, or doesn't match the server's.
+  Re-copy it from the server (see "Getting the federation key onto the
+  Mac" above) and confirm `key_file` in your config points at it.
+
+**Device not found / `Could not find the native HIDAPI library...`**
+- Same as the probe -- see the Stream Deck+ hardware probe's
+  Troubleshooting section above (quit the official Elgato app, install
+  `hidapi`, check the USB cable).
