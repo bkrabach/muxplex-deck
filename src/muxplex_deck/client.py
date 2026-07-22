@@ -7,13 +7,21 @@ parsing of the handful of endpoints the sidecar needs. Distinct exceptions
 down" apart from "bad key" without inspecting httpx internals.
 
 Endpoint shapes below were read directly from the muxplex server source
-(muxplex/muxplex/main.py), not guessed:
+(muxplex/muxplex/main.py, views.py, settings.py), not guessed:
 
 - GET  /api/sessions              -> [{"name": str, "snapshot": str,
                                         "bell": {"last_fired_at": float|None,
                                                  "seen_at": float|None,
                                                  "unseen_count": int}}, ...]
-- GET  /api/state                 -> {"active_session": str|None, ...}
+- GET  /api/state                 -> {"active_session": str|None,
+                                       "active_view": str, ...}
+                                       (active_view defaults to "all" server-side)
+- GET  /api/settings               -> {"views": [{"name": str,
+                                        "sessions": [str, ...]}, ...],
+                                        "hidden_sessions": [str, ...],
+                                        "sort_order": str, ...}
+                                        (sensitive keys are redacted by the
+                                        server; irrelevant to view resolution)
 - POST /api/sessions/{name}/connect -> {"active_session": str, "ttyd_port": int}
                                         (404 if name is not a known session)
 
@@ -52,8 +60,21 @@ class Bell:
     unseen_count: int
 
     @property
-    def is_ringing(self) -> bool:
-        return self.unseen_count > 0
+    def needs_attention(self) -> bool:
+        """Canonical "needs attention" predicate, ported verbatim from the PWA.
+
+        A session needs attention iff it has unseen bell events AND either
+        they have never been seen, or the most recent fire is newer than the
+        last time they were seen. The muxplex frontend uses this identical
+        form in three places; ported here so the deck's bell indicator
+        matches it exactly rather than approximating with `unseen_count > 0`
+        alone (which would keep showing attention after the user has already
+        acknowledged a bell that hasn't fired again).
+        """
+        return self.unseen_count > 0 and (
+            self.seen_at is None
+            or (self.last_fired_at is not None and self.last_fired_at > self.seen_at)
+        )
 
 
 @dataclass(frozen=True)
@@ -70,6 +91,33 @@ class ServerState:
     """The subset of GET /api/state the sidecar cares about."""
 
     active_session: str | None
+    active_view: str
+
+
+@dataclass(frozen=True)
+class View:
+    """One user-defined view, as returned by GET /api/settings.
+
+    `sessions` is the view's raw membership list from muxplex. Entries are
+    often the canonical "device_id:name" form -- muxplex runs a background
+    normalization cycle that rewrites bare-name entries this way
+    unconditionally, even with no federation/remote instances configured
+    (verified empirically against a live server). `.views.resolve_view`
+    matches against both the bare name and this prefixed form; see its
+    module docstring for the full rationale.
+    """
+
+    name: str
+    sessions: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Settings:
+    """The subset of GET /api/settings the sidecar needs for view resolution."""
+
+    views: tuple[View, ...]
+    hidden_sessions: frozenset[str]
+    sort_order: str
 
 
 def _parse_bell(raw: dict) -> Bell:
@@ -151,7 +199,32 @@ class MuxplexClient:
         """GET /api/state -> the subset of persistent state we render from."""
         response = self._request("GET", "/api/state")
         data = response.json()
-        return ServerState(active_session=data.get("active_session"))
+        return ServerState(
+            active_session=data.get("active_session"),
+            active_view=data.get("active_view") or "all",
+        )
+
+    def get_settings(self) -> Settings:
+        """GET /api/settings -> views, hidden_sessions, sort_order.
+
+        The server redacts sensitive keys (federation_key, remote instance
+        keys) in this response; irrelevant to view resolution, so ignored
+        here.
+        """
+        response = self._request("GET", "/api/settings")
+        data = response.json()
+        views = tuple(
+            View(
+                name=item.get("name", ""),
+                sessions=frozenset(item.get("sessions") or []),
+            )
+            for item in (data.get("views") or [])
+        )
+        return Settings(
+            views=views,
+            hidden_sessions=frozenset(data.get("hidden_sessions") or []),
+            sort_order=data.get("sort_order", "manual"),
+        )
 
     def connect_session(self, name: str) -> None:
         """POST /api/sessions/{name}/connect -- switch the active session.

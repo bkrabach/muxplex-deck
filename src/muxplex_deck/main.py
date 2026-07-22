@@ -5,8 +5,10 @@ DEVICE_ACTIVE, backoff-on-error after unexpected active-session failures)
 with a second layer of state nested inside DEVICE_ACTIVE:
 
 - ACTIVE: deck present, server reachable and authenticated. Poll
-  `GET /api/sessions` + `GET /api/state` every `poll_interval` seconds and
-  render keys/strip -- but only repaint when render-relevant state changes.
+  `GET /api/sessions` + `GET /api/state` + `GET /api/settings` every
+  `poll_interval` seconds, resolve the server's current view (`.views`
+  module -- a port of muxplex's `filter_visible`) and render keys/strip from
+  the result -- but only repaint when render-relevant state changes.
 - SERVER_UNREACHABLE: deck present, server down/unreachable. Show it on the
   strip, retry with exponential backoff (2s doubling, capped at 30s).
 - AUTH_FAILED: deck present, server reachable but rejected the federation
@@ -35,7 +37,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from . import rendering
+from . import rendering, views
 from .client import AuthError, MuxplexClient, MuxplexError, Session, UnreachableError
 from .config import Config, ConfigError, load_config
 from .device import (
@@ -122,22 +124,52 @@ def _interruptible_wait(
     return False
 
 
-def _session_render_key(sessions: list[Session], active_session: str | None) -> tuple:
+_MAX_VIEW_LABEL_CHARS = 20
+
+
+def _truncate_view(name: str) -> str:
+    if len(name) <= _MAX_VIEW_LABEL_CHARS:
+        return name
+    return name[: _MAX_VIEW_LABEL_CHARS - 1] + "\u2026"
+
+
+def _session_render_key(
+    view: str,
+    sort_order: str,
+    filtered_sessions: list[Session],
+    active_session: str | None,
+) -> tuple:
     return (
         "active",
-        tuple((s.name, s.bell.is_ringing) for s in sessions),
+        view,
+        sort_order,
+        tuple((s.name, s.bell.needs_attention) for s in filtered_sessions),
         active_session,
     )
 
 
 def _paint_sessions(
-    deck: DeckDevice, sessions: list[Session], active_session: str | None, hostname: str
+    deck: DeckDevice,
+    filtered_sessions: list[Session],
+    active_session: str | None,
+    hostname: str,
+    view: str,
 ) -> None:
+    """Paint keys from the view-filtered session list; strip leads with the view name.
+
+    `filtered_sessions` is the full result of `views.resolve_view` (may exceed
+    `deck.key_count()`) so the strip's session count reflects the whole view,
+    matching the pre-view-aware behavior of showing the true total rather than
+    just what fits on the keys.
+    """
     key_count = deck.key_count()
-    pairs = [(s.name, s.bell.is_ringing) for s in sessions[:key_count]]
+    pairs = [(s.name, s.bell.needs_attention) for s in filtered_sessions[:key_count]]
     with deck:
         rendering.paint_sessions(deck, pairs, active_session)
-        strip_message = f"{hostname} \u00b7 {len(sessions)} sessions \u00b7 ACTIVE: {active_session or 'none'}"
+        strip_message = (
+            f"{_truncate_view(view)} \u00b7 {hostname} \u00b7 "
+            f"{len(filtered_sessions)} sessions \u00b7 ACTIVE: {active_session or 'none'}"
+        )
         rendering.paint_status_strip(deck, strip_message)
 
 
@@ -217,6 +249,7 @@ def _run_active(
             try:
                 sessions = client.get_sessions()
                 server_state = client.get_state()
+                settings = client.get_settings()
             except AuthError as exc:
                 logger.critical(
                     "muxplex auth rejected -- check the federation key file: %s", exc
@@ -251,10 +284,22 @@ def _run_active(
                 continue
 
             backoff = INITIAL_BACKOFF_SECONDS
-            session_names[:] = [s.name for s in sessions[: deck.key_count()]]
-            render_key = _session_render_key(sessions, server_state.active_session)
+            filtered = views.resolve_view(sessions, settings, server_state.active_view)
+            session_names[:] = [s.name for s in filtered[: deck.key_count()]]
+            render_key = _session_render_key(
+                server_state.active_view,
+                settings.sort_order,
+                filtered,
+                server_state.active_session,
+            )
             if render_key != last_render_key:
-                _paint_sessions(deck, sessions, server_state.active_session, hostname)
+                _paint_sessions(
+                    deck,
+                    filtered,
+                    server_state.active_session,
+                    hostname,
+                    server_state.active_view,
+                )
                 last_render_key = render_key
 
             if _interruptible_wait(deck, shutting_down, poll_interval):

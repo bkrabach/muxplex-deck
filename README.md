@@ -165,10 +165,26 @@ timestamp; watch both the terminal and the physical device.
 ## muxplex sidecar (`muxplex-deck`)
 
 Shows your muxplex tmux sessions on the deck's 8 keys and switches the
-active session on key press. Polls `GET /api/sessions` + `GET /api/state`
-on the muxplex server every `poll_interval` seconds; repaints only when
-something render-relevant changed (no flicker). Dials and touch-strip
-gestures are logged only in v1 -- unassigned, pending interaction design.
+active session on key press. Polls `GET /api/sessions` + `GET /api/state` +
+`GET /api/settings` on the muxplex server every `poll_interval` seconds;
+repaints only when something render-relevant changed (no flicker). Dials
+and touch-strip gestures are logged only in v1 -- unassigned, pending
+interaction design.
+
+**View-following:** the deck mirrors whatever view is active in the muxplex
+PWA. Keys show the sessions belonging to the server's current view
+(`active_view` from `GET /api/state`) -- `all`, `hidden`, or a user-defined
+view -- filtered and ordered the same way the PWA does (`sort_order` in
+settings; `alphabetical` sorts by name, anything else preserves server
+order). The touch strip leads with the view name (truncated to ~20 chars),
+followed by hostname, session count, and the active session. Switching
+views in the PWA is picked up within one poll cycle. An unknown/deleted
+view name shows honestly as zero sessions rather than silently falling
+back to `all`. The bell/attention dot uses the exact predicate the PWA
+uses: a session needs attention iff `unseen_count > 0` and either it has
+never been seen or the most recent fire is newer than the last time it was
+seen (`Bell.needs_attention` in `client.py`) -- so an old, acknowledged
+bell doesn't keep glowing forever.
 
 ### Config
 
