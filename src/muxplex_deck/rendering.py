@@ -61,10 +61,10 @@ _PREVIEW_TEXT_COLOR = "#a8a8a8"  # light gray -- low-contrast so name/badges pop
 # match so the crop still fits under the banner within the 120x120 key. Still
 # "recognize your session by its shape", not "read the text" -- see the fidelity
 # note in `_preview_lines` below.
-_PREVIEW_FONT_SIZE = 12
-_PREVIEW_LINE_HEIGHT = 14
-_PREVIEW_LINES = 7  # bottom N lines of the snapshot
-_PREVIEW_COLUMNS = 19  # first N columns of each of those lines (bottom-LEFT crop)
+_PREVIEW_FONT_SIZE = 11
+_PREVIEW_LINE_HEIGHT = 13
+_PREVIEW_LINES = 8  # bottom N lines of the snapshot
+_PREVIEW_COLUMNS = 21  # first N columns of each of those lines (bottom-LEFT crop)
 _PREVIEW_LEFT_MARGIN = 3
 
 _BANNER_HEIGHT = 20  # translucent strip behind the session name, top of key
