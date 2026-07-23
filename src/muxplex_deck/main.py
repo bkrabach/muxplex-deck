@@ -50,7 +50,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from . import attention, rendering, views
+from . import attention, focus, rendering, views
 from .client import (
     AuthError,
     MuxplexClient,
@@ -215,12 +215,20 @@ class _ActiveRuntime:
     """
 
     def __init__(
-        self, deck: DeckDevice, client: MuxplexClient, hostname: str, sort_mode: str
+        self,
+        deck: DeckDevice,
+        client: MuxplexClient,
+        hostname: str,
+        sort_mode: str,
+        focus_app_name: str = "",
     ) -> None:
         self.deck = deck
         self.client = client
         self.hostname = hostname
         self.sort_mode = sort_mode
+        # macOS app name of the local muxplex PWA to bring forward on a
+        # key-press session switch; "" disables (see `.focus`).
+        self.focus_app_name = focus_app_name
 
         # Guards every actual HTTP call -- poll-loop GETs, a dial-0 commit's
         # PATCH+refresh, and key-press connects can each originate from a
@@ -511,11 +519,14 @@ class _ActiveRuntime:
         # input and delayed the highlight by up to a full poll interval. The
         # PWA already does this optimistically; this mirrors it.
         with self.paint_lock:
+            changed = self.active_session != name
             self.active_session = name
         self.repaint()
-        threading.Thread(target=self._do_connect, args=(name,), daemon=True).start()
+        threading.Thread(
+            target=self._do_connect, args=(name, changed), daemon=True
+        ).start()
 
-    def _do_connect(self, name: str) -> None:
+    def _do_connect(self, name: str, changed: bool) -> None:
         """Background-thread body for a key-press connect (see `connect`).
 
         On failure, logs loudly and shows it on the strip -- but does not
@@ -523,7 +534,18 @@ class _ActiveRuntime:
         `refresh()` re-reads `/api/state` and repaints whatever the server
         actually has, which self-heals a wrong guess without this method
         needing to know anything about polling.
+
+        `changed` is whether this press actually moved the active session.
+        It gates the PWA foreground focus: pressing the already-active
+        session's key shouldn't yank a window around, and poll-driven
+        repaints / dial actions never reach this method at all -- focus
+        fires ONLY on an explicit key-press session switch. Focus runs
+        before the connect POST (it's ~100ms vs the server's multi-second
+        ttyd respawn, so the window is forward by the time the switch
+        lands) and is best-effort: `.focus` swallows every failure.
         """
+        if changed:
+            focus.focus_app(self.focus_app_name)
         try:
             with self.client_lock:
                 self.client.connect_session(name)
@@ -596,6 +618,7 @@ def _run_active(
     poll_interval: float,
     hostname: str,
     sort_mode: str,
+    focus_app_name: str,
 ) -> None:
     """Run one connected-device session against the muxplex server.
 
@@ -613,7 +636,7 @@ def _run_active(
         # but a device that just went away mid-open shouldn't be fatal here,
         # the outer loop's is_open()/connected() checks handle that.
         logger.exception("failed to set brightness to %d%%", FULL_BRIGHTNESS_PERCENT)
-    ctx = _ActiveRuntime(deck, client, hostname, sort_mode)
+    ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name)
     _paint_status_only(deck, "connecting to muxplex...")
 
     deck.set_key_callback(_make_key_callback(ctx))
@@ -747,6 +770,7 @@ def run(config: Config, manager: DeviceManager) -> int:
                         config.poll_interval,
                         hostname,
                         config.sort,
+                        config.focus_app,
                     )
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")

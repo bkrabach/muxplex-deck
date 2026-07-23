@@ -253,7 +253,8 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   "server_url": "https://spark-1:8088",
   "key_file": "~/.config/muxplex-deck/federation_key",
   "poll_interval": 2.0,
-  "sort": "attention"
+  "sort": "attention",
+  "focus_app": "muxplex"
 }
 ```
 
@@ -274,6 +275,40 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   recently active); `"server"` disables that reordering and shows exactly
   what the PWA's own `sort_order` setting produces. See "Dial 0 / Dial 1 /
   Sort order" above for the full behavior.
+- `focus_app` (optional, default off) -- macOS app name of the locally
+  installed muxplex PWA; see "Bringing the PWA to the foreground" below.
+
+### Bringing the PWA to the foreground (macOS)
+
+If the muxplex PWA is installed as a standalone app on the same Mac the
+sidecar runs on, set `focus_app` to its application name and every
+key-press session switch will also bring that window to the foreground --
+press a key, see the terminal you just switched to. It runs `open -a
+"<focus_app>"` on a background thread: it never delays the switch itself,
+and a focus failure (wrong name, app not installed) is logged as a warning
+and otherwise ignored.
+
+```json
+{
+  "server_url": "https://spark-1:8088",
+  "focus_app": "muxplex"
+}
+```
+
+**Finding the app name:** it's the name macOS shows for the installed PWA
+-- in the menu bar next to the Apple logo while it's frontmost, or under
+its Dock icon. For a PWA installed via Chrome's "Install app" this is the
+PWA's own title (Chrome puts the `.app` bundle under `~/Applications/Chrome
+Apps.localized/`); for Safari's "Add to Dock" it's the name you gave it.
+If the sidecar logs `focus: ... failed`, the name doesn't match -- check
+what `open -a "<name>"` does in a terminal.
+
+Scope, deliberately narrow: focus fires **only** on an explicit key-press
+that changes the active session -- never on dial turns, view/page changes,
+poll-driven repaints, or pressing the already-active session's key -- so
+the window is never yanked forward while you're just browsing the deck.
+macOS-only today (on other platforms a configured `focus_app` logs one
+INFO notice and is ignored); a Windows implementation is planned.
 
 Any missing/invalid config or unreadable key file produces a clear,
 actionable message on stderr and a non-zero exit -- there is no default

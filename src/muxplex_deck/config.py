@@ -42,6 +42,13 @@ class Config:
     vs server/manual order) with no client-side reordering. See `.attention`
     for the "attention" mode's tie-break rules.
     """
+    focus_app: str
+    """macOS application name of the locally installed muxplex PWA to bring
+    to the foreground when a key press switches the active session (see
+    `.focus`). Empty (the default) disables the feature entirely -- no
+    subprocess calls, no log noise. macOS-only today; on other platforms a
+    configured value logs one INFO notice and is otherwise ignored.
+    """
 
 
 def _resolve_config_path(explicit: str | None) -> Path:
@@ -130,10 +137,18 @@ def load_config(config_path: str | None = None) -> Config:
             f"Config field 'sort' must be one of {VALID_SORT_MODES}, got {sort!r}"
         )
 
+    focus_app = raw.get("focus_app", "")
+    if not isinstance(focus_app, str):
+        raise ConfigError(
+            f"Config field 'focus_app' must be a string (macOS app name), "
+            f"got {focus_app!r}"
+        )
+
     return Config(
         server_url=server_url.rstrip("/"),
         federation_key=federation_key,
         ca_file=ca_file,
         poll_interval=float(poll_interval),
         sort=sort,
+        focus_app=focus_app.strip(),
     )
