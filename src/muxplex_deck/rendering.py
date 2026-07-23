@@ -17,10 +17,19 @@ change no runtime behavior.
 
 Key preview design (v1): each occupied key shows a cropped mini terminal --
 the bottom-left corner of the session's live pane snapshot -- with the
-session name, active-border highlight, and bell dot layered on top so
+session name, active/attention status border(s), layered on top so
 identity/status stay legible regardless of what's scrolling underneath.
 ANSI color escapes are stripped (plain text only); see `_strip_ansi` and
 the module-level fidelity note below `_preview_lines`.
+
+Status borders (v2, real-hardware feedback): active-session and
+needs-attention are shown as colored rectangular borders rather than a
+background fill or a small dot, using the exact brand colors from
+muxplex's own frontend (`frontend/style.css`) so the deck's language
+matches the PWA's: cyan `#00D9F5` for the active session, amber `#F1A640`
+for needs-attention. When both apply to the same key, two concentric rings
+are drawn (amber outer, cyan inner) so neither state is lost -- see
+`render_session_key`.
 """
 
 from __future__ import annotations
@@ -39,7 +48,6 @@ _KEY_LABEL_FONT_SIZE = 16
 _STRIP_FONT_SIZE = 22
 
 _EMPTY_BG = "#000000"  # blank -- no session in this slot
-_BELL_COLOR = "#ffcc00"  # amber dot -- bell alert pending
 _TEXT_COLOR = "#ffffff"
 
 MAX_SESSION_LABEL_CHARS = 10
@@ -48,17 +56,25 @@ MAX_SESSION_LABEL_CHARS = 10
 
 _PREVIEW_BG = "#0a0a0a"  # near-black -- the preview's own background
 _PREVIEW_TEXT_COLOR = "#a8a8a8"  # light gray -- low-contrast so name/badges pop
-_PREVIEW_FONT_SIZE = 8
-_PREVIEW_LINE_HEIGHT = 10
-_PREVIEW_LINES = 9  # bottom N lines of the snapshot
-_PREVIEW_COLUMNS = 26  # first N columns of each of those lines (bottom-LEFT crop)
+# v2 (real-hardware feedback: v1's size-8 preview was illegible) -- font size
+# doubled, with fewer lines/columns so the larger glyphs still fit under the
+# banner within the 120x120 key. Still "recognize your session by its shape",
+# not "read the text" -- see the fidelity note in `_preview_lines` below.
+_PREVIEW_FONT_SIZE = 16
+_PREVIEW_LINE_HEIGHT = 18
+_PREVIEW_LINES = 5  # bottom N lines of the snapshot
+_PREVIEW_COLUMNS = 13  # first N columns of each of those lines (bottom-LEFT crop)
 _PREVIEW_LEFT_MARGIN = 3
 
 _BANNER_HEIGHT = 20  # translucent strip behind the session name, top of key
 _BANNER_FILL = (0, 0, 0, 170)  # RGBA -- ~two-thirds-opaque black
 
-_ACTIVE_BORDER_COLOR = "#33dd33"  # bright green -- replaces the old full-bg fill
-_ACTIVE_BORDER_WIDTH = 4
+# Brand colors lifted verbatim from muxplex's frontend/style.css so the
+# deck's status language matches the PWA's exactly.
+_ACTIVE_BORDER_COLOR = "#00D9F5"  # muxplex brand cyan -- active session
+_ATTENTION_BORDER_COLOR = "#F1A640"  # muxplex brand amber -- needs attention
+_BORDER_WIDTH = 4  # single-state border thickness
+_DUAL_RING_WIDTH = 3  # each ring's thickness when both states apply at once
 
 # Matches ANSI CSI sequences (colors, cursor moves, etc.) -- v1 strips all
 # color/formatting rather than rendering it; see module docstring. Covers
@@ -100,13 +116,36 @@ def _preview_lines(snapshot: str) -> list[str]:
     return [line[:_PREVIEW_COLUMNS] for line in tail]
 
 
+def _draw_border(
+    draw: ImageDraw.ImageDraw,
+    image: Image.Image,
+    color: str,
+    width: int,
+    *,
+    inset: int = 0,
+) -> None:
+    """Draw a `width`-px rectangular outline, `inset` px in from the key's edge.
+
+    Used for both the single-state active/attention border and, when both
+    states apply, two concentric rings (an `inset=0` outer ring and an
+    `inset=<outer width>` inner ring) -- see `render_session_key`.
+    """
+    for w in range(width):
+        offset = inset + w
+        draw.rectangle(
+            [(offset, offset), (image.width - 1 - offset, image.height - 1 - offset)],
+            outline=color,
+        )
+
+
 def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> bytes:
-    """Render one key: mini terminal preview, name banner, active border, bell dot.
+    """Render one key: mini terminal preview, name banner, status border(s).
 
     Layering (bottom to top): near-black background -> preview text ->
-    translucent name banner + name -> bell dot -> active border. The last
-    three stay legible no matter what's scrolling in the preview beneath
-    them.
+    translucent name banner + name -> status border(s) (cyan for active,
+    amber for needs-attention, both as concentric rings if both apply). The
+    banner and border stay legible no matter what's scrolling in the
+    preview beneath them.
     """
     image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_PREVIEW_BG)
     draw = ImageDraw.Draw(image)
@@ -143,19 +182,22 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
     )
     draw.text(name_position, label, fill=_TEXT_COLOR, font=name_font)
 
-    if session.bell.needs_attention:
-        radius = 8
-        cx, cy = image.width - radius - 6, radius + 6
-        draw.ellipse(
-            (cx - radius, cy - radius, cx + radius, cy + radius), fill=_BELL_COLOR
+    needs_attention = session.bell.needs_attention
+    if active and needs_attention:
+        # Both states at once: amber outer ring + cyan inner ring, each
+        # legible on its own -- neither status gets silently dropped.
+        _draw_border(draw, image, _ATTENTION_BORDER_COLOR, _DUAL_RING_WIDTH)
+        _draw_border(
+            draw,
+            image,
+            _ACTIVE_BORDER_COLOR,
+            _DUAL_RING_WIDTH,
+            inset=_DUAL_RING_WIDTH,
         )
-
-    if active:
-        for w in range(_ACTIVE_BORDER_WIDTH):
-            draw.rectangle(
-                [(w, w), (image.width - 1 - w, image.height - 1 - w)],
-                outline=_ACTIVE_BORDER_COLOR,
-            )
+    elif active:
+        _draw_border(draw, image, _ACTIVE_BORDER_COLOR, _BORDER_WIDTH)
+    elif needs_attention:
+        _draw_border(draw, image, _ATTENTION_BORDER_COLOR, _BORDER_WIDTH)
 
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
@@ -163,6 +205,40 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
 def render_empty_key(deck: DeckDevice) -> bytes:
     """Render a blank (unused) key slot -- no session mapped to it."""
     image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_EMPTY_BG)
+    return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
+
+
+_PICKER_BG = "#101036"  # dark indigo -- visually distinct from the session preview bg
+_PICKER_TEXT_COLOR = "#ffffff"
+_PICKER_FONT_SIZE = 20
+_PICKER_LABEL_CHARS = 12
+_PICKER_CURRENT_BORDER_COLOR = _ACTIVE_BORDER_COLOR  # same cyan as the active session
+_PICKER_CURRENT_BORDER_WIDTH = _BORDER_WIDTH
+
+
+def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
+    """Render one picker-mode key: a centered label on a distinct background.
+
+    Shared by both the view picker (dial 0 press) and the page picker
+    (dial 1 press) -- `label` is a view name or a page number as a string.
+    `current` draws the same cyan border used for the active session,
+    marking whichever option matches today's actual active view/page.
+    """
+    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_PICKER_BG)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=_PICKER_FONT_SIZE)
+    text = _truncate(label, limit=_PICKER_LABEL_CHARS)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    position = (
+        (image.width - text_w) / 2 - bbox[0],
+        (image.height - text_h) / 2 - bbox[1],
+    )
+    draw.text(position, text, fill=_PICKER_TEXT_COLOR, font=font)
+    if current:
+        _draw_border(
+            draw, image, _PICKER_CURRENT_BORDER_COLOR, _PICKER_CURRENT_BORDER_WIDTH
+        )
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 

@@ -68,7 +68,7 @@ from .device import (
     DialEventType,
     TouchscreenEventType,
 )
-from .interaction import Pager, ViewCycler
+from .interaction import Pager, PickerController, PickerMode, ViewCycler
 
 logger = logging.getLogger("muxplex_deck")
 
@@ -79,6 +79,11 @@ HEALTH_CHECK_TICK_SECONDS = 1.0
 INITIAL_BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 30.0
 AUTH_RETRY_SECONDS = 30.0
+
+# Real hardware powers on at a dim firmware default; the sidecar always
+# asserts full brightness itself on every bring-up (fresh connect or
+# replug) rather than trusting whatever the deck inherited.
+FULL_BRIGHTNESS_PERCENT = 100
 
 _MAX_VIEW_LABEL_CHARS = 20
 
@@ -161,13 +166,34 @@ def _build_strip_message(
     """Compose the touch-strip headline: view (+ live turn echo) + page + host + status."""
     view_part = _truncate_view(view_label)
     if turning:
-        view_part = f"\u2192 {view_part}"
+        # ASCII, not "\u2192" (RIGHTWARDS ARROW): the real device's default
+        # PIL font has no glyph for it and renders a .notdef box instead
+        # (real-hardware feedback). The middot separator below renders fine.
+        view_part = f"> {view_part}"
     parts = [view_part]
     if page_count > 1:
         parts.append(f"p{page}/{page_count}")
     parts.append(hostname)
     parts.append(f"{total} sessions")
     parts.append(f"ACTIVE: {active_session or 'none'}")
+    return " \u00b7 ".join(parts)
+
+
+def _build_picker_strip_message(
+    *, kind: str, start: int, total: int, page_size: int
+) -> str:
+    """Compose the touch-strip headline while a picker (view/page) is open.
+
+    `kind` is "VIEW" or "PAGE". A "start-stop/total" range is only shown
+    once there are more options than fit in one window (matching the
+    session strip's own "only show page info when there's more than one
+    page" convention).
+    """
+    parts = [f"{kind} PICKER -- tap to choose"]
+    if total > page_size:
+        first = start + 1
+        last = min(start + page_size, total)
+        parts.append(f"{first}-{last}/{total}")
     return " \u00b7 ".join(parts)
 
 
@@ -205,6 +231,7 @@ class _ActiveRuntime:
 
         self.view_cycler = ViewCycler()
         self.pager = Pager(page_size=deck.key_count())
+        self.picker = PickerController()
 
         self.ordered: list[Session] = []
         self.active_session: str | None = None
@@ -281,11 +308,17 @@ class _ActiveRuntime:
     # --- painting ------------------------------------------------------
 
     def repaint(self) -> None:
-        """Repaint keys (page slice, diffed per key) and the strip (diffed as a whole).
+        """Repaint the keys (session page, or an open picker's options) and the strip.
 
         Safe to call frequently and from any thread: a call that changes
         nothing costs a slice + a few tuple comparisons, no device I/O.
         """
+        if self.picker.mode == PickerMode.NONE:
+            self._repaint_sessions()
+        else:
+            self._repaint_picker(self.picker.mode)
+
+    def _repaint_sessions(self) -> None:
         with self.paint_lock:
             start, stop = self.pager.slice_bounds()
             key_count = self.deck.key_count()
@@ -310,6 +343,60 @@ class _ActiveRuntime:
                 if message != self.last_strip:
                     rendering.paint_status_strip(self.deck, message)
                     self.last_strip = message
+
+    def _repaint_picker(self, mode: PickerMode) -> None:
+        """Repaint the keys as a picker (view names, or page numbers).
+
+        `mode` is passed in (rather than re-read) so a mode change between
+        `repaint()`'s dispatch and here can't leave this method confused
+        about which picker it's rendering.
+        """
+        with self.paint_lock:
+            key_count = self.deck.key_count()
+            if mode == PickerMode.VIEW:
+                options = self.view_cycler.names()
+                current = self.active_view
+                kind = "VIEW"
+            else:
+                options = [str(n) for n in range(1, self.pager.page_count + 1)]
+                current = str(self.pager.page)
+                kind = "PAGE"
+
+            total = len(options)
+            # ticks=0 is a pure re-clamp: keeps the stored window valid if
+            # `total` shrank (e.g. a view was deleted) since it was last set.
+            start = self.picker.scroll(0, total=total, page_size=key_count)
+            window = options[start : start + key_count]
+            message = _build_picker_strip_message(
+                kind=kind, start=start, total=total, page_size=key_count
+            )
+            with self.deck:
+                self._paint_picker_keys(window, current)
+                if message != self.last_strip:
+                    rendering.paint_status_strip(self.deck, message)
+                    self.last_strip = message
+
+    def _paint_picker_keys(self, options: list[str], current: str) -> None:
+        """Paint the picker's key window -- one option label per key, diffed.
+
+        `current` marks whichever option matches today's actual active
+        view/page with the same cyan border used for the active session.
+        """
+        key_count = self.deck.key_count()
+        for index in range(key_count):
+            label = options[index] if index < len(options) else None
+            is_current = label is not None and label == current
+            identity: object = None if label is None else ("picker", label, is_current)
+            if self.last_key_state[index] == identity:
+                continue
+            if label is None:
+                self.deck.set_key_image(index, rendering.render_empty_key(self.deck))
+            else:
+                self.deck.set_key_image(
+                    index,
+                    rendering.render_picker_key(self.deck, label, current=is_current),
+                )
+            self.last_key_state[index] = identity
 
     def _paint_keys(
         self, page_sessions: list[Session], active_session: str | None
@@ -353,10 +440,18 @@ class _ActiveRuntime:
 
     def handle_view_dial(self, event_type: DialEventType, value: object) -> None:
         if event_type == DialEventType.TURN:
-            self.view_cycler.turn(int(value), self._commit_view)  # type: ignore[arg-type]
+            ticks = int(value)  # type: ignore[arg-type]
+            if self.picker.mode == PickerMode.VIEW:
+                total = len(self.view_cycler.names())
+                self.picker.scroll(ticks, total=total, page_size=self.deck.key_count())
+            elif self.picker.mode == PickerMode.NONE:
+                # Normal-mode turn behavior is unchanged -- only PRESS
+                # changes meaning (see `PickerController`'s docstring).
+                self.view_cycler.turn(int(value), self._commit_view)  # type: ignore[arg-type]
+            # else: PAGE picker is open -- dial 0 isn't its owner, ignore the turn.
             self.repaint()
         elif event_type == DialEventType.PUSH and value:
-            self.view_cycler.press(self._commit_view)
+            logger.info("dial[0] pressed -> %s", self.picker.press_view_dial())
             self.repaint()
 
     def _commit_view(self, view: str) -> None:
@@ -375,31 +470,97 @@ class _ActiveRuntime:
 
     def handle_page_dial(self, event_type: DialEventType, value: object) -> None:
         if event_type == DialEventType.TURN:
-            self.pager.turn(int(value))  # type: ignore[arg-type]
+            ticks = int(value)  # type: ignore[arg-type]
+            if self.picker.mode == PickerMode.PAGE:
+                total = self.pager.page_count
+                self.picker.scroll(ticks, total=total, page_size=self.deck.key_count())
+            elif self.picker.mode == PickerMode.NONE:
+                # Normal-mode turn behavior is unchanged -- only PRESS
+                # changes meaning (see `PickerController`'s docstring).
+                self.pager.turn(int(value))  # type: ignore[arg-type]
+            # else: VIEW picker is open -- dial 1 isn't its owner, ignore the turn.
             self.repaint()
         elif event_type == DialEventType.PUSH and value:
-            self.pager.press()
+            logger.info("dial[1] pressed -> %s", self.picker.press_page_dial())
             self.repaint()
 
     # --- key handling ------------------------------------------------------
 
     def connect(self, key: int) -> None:
+        mode = self.picker.mode
+        if mode == PickerMode.VIEW:
+            self._select_view_option(key)
+            return
+        if mode == PickerMode.PAGE:
+            self._select_page_option(key)
+            return
+
         with self.paint_lock:
             names = list(self.session_names)
         if key >= len(names):
             logger.info("key[%d] pressed (empty slot, ignoring)", key)
             return
         name = names[key]
-        logger.info("key[%d] pressed -> connect session %r", key, name)
+        logger.info(
+            "key[%d] pressed -> connect session %r (optimistic highlight)", key, name
+        )
+        # Move the highlight NOW (don't wait for the next poll tick) and run
+        # the actual HTTP connect on a background thread -- real-hardware
+        # feedback showed the old synchronous-on-the-callback-thread call
+        # (server-side ttyd kill+respawn, ~2.6s) blocked further device
+        # input and delayed the highlight by up to a full poll interval. The
+        # PWA already does this optimistically; this mirrors it.
+        with self.paint_lock:
+            self.active_session = name
+        self.repaint()
+        threading.Thread(target=self._do_connect, args=(name,), daemon=True).start()
+
+    def _do_connect(self, name: str) -> None:
+        """Background-thread body for a key-press connect (see `connect`).
+
+        On failure, logs loudly and shows it on the strip -- but does not
+        try to revert the optimistic highlight itself: the next poll's
+        `refresh()` re-reads `/api/state` and repaints whatever the server
+        actually has, which self-heals a wrong guess without this method
+        needing to know anything about polling.
+        """
         try:
             with self.client_lock:
                 self.client.connect_session(name)
         except MuxplexError:
             logger.exception("failed to switch to session %r", name)
-            with self.deck:
-                rendering.paint_status_strip(self.deck, f"switch failed: {name}")
-        # The next poll (or dial-driven refresh) re-reads /api/state and
-        # repaints the active highlight.
+            with self.paint_lock, self.deck:
+                message = f"switch failed: {name}"
+                rendering.paint_status_strip(self.deck, message)
+                self.last_strip = message
+
+    def _select_view_option(self, key: int) -> None:
+        names = self.view_cycler.names()
+        start = self.picker.window_start
+        index = start + key
+        self.picker.exit()
+        if index >= len(names):
+            logger.info("view picker: key[%d] pressed (empty slot, ignoring)", key)
+            self.repaint()
+            return
+        view = names[index]
+        logger.info("view picker: key[%d] selected -> view %r", key, view)
+        self._commit_view(view)
+        self.repaint()
+
+    def _select_page_option(self, key: int) -> None:
+        total = self.pager.page_count
+        start = self.picker.window_start
+        index = start + key
+        self.picker.exit()
+        if index >= total:
+            logger.info("page picker: key[%d] pressed (empty slot, ignoring)", key)
+            self.repaint()
+            return
+        page = index + 1
+        logger.info("page picker: key[%d] selected -> page %d", key, page)
+        self.pager.go_to(page)
+        self.repaint()
 
 
 def _make_key_callback(ctx: _ActiveRuntime):
@@ -444,6 +605,14 @@ def _run_active(
     expected, recoverable conditions, not device errors.
     """
     _log_device_info(deck)
+    try:
+        deck.set_brightness(FULL_BRIGHTNESS_PERCENT)
+    except Exception:
+        # Real hardware defaults to a dim power-on brightness; this always
+        # asserts full brightness on bring-up (real-hardware feedback) --
+        # but a device that just went away mid-open shouldn't be fatal here,
+        # the outer loop's is_open()/connected() checks handle that.
+        logger.exception("failed to set brightness to %d%%", FULL_BRIGHTNESS_PERCENT)
     ctx = _ActiveRuntime(deck, client, hostname, sort_mode)
     _paint_status_only(deck, "connecting to muxplex...")
 

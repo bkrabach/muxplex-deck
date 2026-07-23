@@ -45,7 +45,13 @@ DIAL_COUNT = 4
 KEY_SIZE = (120, 120)
 STRIP_SIZE = (800, 100)
 DEFAULT_PORT = 8484
-DEFAULT_BRIGHTNESS_PERCENT = 100
+# Simulates real hardware's dim firmware power-on default (real-hardware
+# feedback: the deck never asserted brightness itself and stayed dim) --
+# NOT the sidecar's target brightness. `main._run_active` calls
+# `deck.set_brightness(FULL_BRIGHTNESS_PERCENT)` on every bring-up; starting
+# the emulator below that value makes the call's effect observable via
+# `snapshot_state()["brightness"]`.
+INITIAL_BRIGHTNESS_PERCENT = 40
 
 
 def _encode_jpeg(image: Image.Image) -> bytes:
@@ -77,7 +83,7 @@ class EmulatorDevice:
         self._lock = threading.RLock()
         self._is_open = False
         self.plugged = False
-        self._brightness = DEFAULT_BRIGHTNESS_PERCENT
+        self._brightness = INITIAL_BRIGHTNESS_PERCENT
         self._key_images: list[bytes] = [_blank_key_jpeg() for _ in range(KEY_COUNT)]
         self._strip_image: bytes = _blank_strip_jpeg()
         self._key_callback: KeyCallback | None = None

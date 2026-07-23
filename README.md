@@ -177,26 +177,48 @@ PWA. Keys show the sessions belonging to the server's current view
 (`active_view` from `GET /api/state`) -- `all`, `hidden`, or a user-defined
 view -- filtered the same way the PWA does. An unknown/deleted view name
 shows honestly as zero sessions rather than silently falling back to `all`.
-The bell/attention dot uses the exact predicate the PWA uses: a session
+The needs-attention predicate is the exact one the PWA uses: a session
 needs attention iff `unseen_count > 0` and either it has never been seen or
 the most recent fire is newer than the last time it was seen
 (`Bell.needs_attention` in `client.py`) -- so an old, acknowledged bell
-doesn't keep glowing forever.
+doesn't keep glowing forever. See "Key previews" below for how this and the
+active-session state are shown (colored borders, matched to muxplex's own
+brand palette).
 
 **Dial 0 -- view cycling:** turning steps through `["all"] + <your named
 views>` (wraps at the ends); the strip immediately echoes the candidate
 view name while turning, and after ~400ms of no further ticks it commits
 via `PATCH /api/state` -- so a fast spin sends exactly one request, not one
-per tick. Pressing jumps straight to `all`. `active_view` is *global*
-server-side state (last writer wins across every device/tab watching the
-server), so turning the dial changes what the PWA shows too, exactly like
-switching views there would.
+per tick. `active_view` is *global* server-side state (last writer wins
+across every device/tab watching the server), so turning the dial changes
+what the PWA shows too, exactly like switching views there would.
+**Pressing** opens the **view picker** (see "Dial-press picker mode"
+below) instead of jumping straight to `all`.
 
 **Dial 1 -- paging:** turning moves ±1 page within the current view (8
-sessions/page, clamped at the first/last page -- no wrap); pressing jumps
-back to page 1. Purely local -- no server writes. The strip shows a
-`pN/M` indicator whenever a view has more than one page. Paging resets to
-page 1 whenever the active view changes (from either dial 0 or the PWA).
+sessions/page, clamped at the first/last page -- no wrap). Purely local --
+no server writes. The strip shows a `pN/M` indicator whenever a view has
+more than one page. Paging resets to page 1 whenever the active view
+changes (from either dial 0 or the PWA). **Pressing** opens the **page
+picker** (see "Dial-press picker mode" below) instead of resetting to page 1.
+
+**Dial-press picker mode:** pressing either dial hands the 8 keys over to
+a chooser instead of performing an immediate action -- useful once there
+are more views or pages than there are keys (e.g. 9 views, or 9 pages of
+sessions). Pressing **dial 0** opens the **view picker**: each key shows
+one view name (`["all"] + <your named views>`, same list dial 0 cycles
+through); tapping a key switches to that view (`PATCH /api/state`) and
+returns to the normal session display. Pressing **dial 1** opens the
+**page picker**: each key shows a page number for the current view; tapping
+one jumps straight there. While a picker is open: turning its *own* dial
+scrolls the window if there are more than 8 options (the strip shows e.g.
+`VIEW PICKER -- tap to choose · 1-8/9`); pressing the *same* dial again
+closes the picker with no change; pressing the *other* dial switches
+straight to that dial's picker. The option matching today's actual active
+view/page is marked with the same cyan border used for the active session,
+so it's obvious what you'd be leaving. A session key's normal connect
+behavior is suspended while a picker is open -- key taps select a picker
+option, not a session, until you pick one or back out.
 
 **Sort order -- `"sort"` config field (`"attention"` default, or
 `"server"`):** in `"attention"` mode the view's sessions are reordered
@@ -212,9 +234,14 @@ behavior.
 **Key previews:** each occupied key renders a small monospace crop of the
 session's live pane (bottom-left corner, ANSI colors stripped in this first
 pass -- see `rendering.py`'s docstring for the honest fidelity tradeoff),
-with the session name banner, active-session border, and bell dot always
-layered on top so identity stays legible regardless of what's scrolling
-underneath.
+with the session name banner and status border(s) always layered on top so
+identity stays legible regardless of what's scrolling underneath. Status is
+shown as a colored border rather than a background fill or dot, using the
+exact brand colors from muxplex's own frontend (`frontend/style.css`):
+**cyan `#00D9F5`** for the active session, **amber `#F1A640`** for
+needs-attention. A session that's both active and needs attention gets both
+rings at once (amber outer, cyan inner) rather than losing one status to
+the other.
 
 ### Config
 
@@ -289,13 +316,17 @@ device handle closed before the process exits.
    poll loop only starts once a device is open).
 2. **Plug in, server reachable** -- keys populate with your first 8
    session names within `poll_interval`; the touch strip shows
-   `<hostname> · N sessions · ACTIVE: <name>`.
+   `<hostname> · N sessions · ACTIVE: <name>`; the deck is at full
+   brightness (100%) even if it powered on dim.
 3. **Bell indicator** -- trigger a bell in one of your tmux sessions
-   (e.g. `printf '\a'`); its key should grow an amber dot within one poll
-   tick.
+   (e.g. `printf '\a'`); its key should grow an amber (`#F1A640`) border
+   within one poll tick.
 4. **Press a key** -- switches muxplex's active session (confirm in the
-   PWA or by reconnecting a terminal); the highlight (green background)
-   moves to the pressed key's session on the next poll tick.
+   PWA or by reconnecting a terminal). The cyan (`#00D9F5`) active border
+   moves to the pressed key **immediately**, before the server round-trip
+   completes -- it does not wait for the next poll tick, and a second key
+   press is accepted right away rather than blocking on the first one's
+   connect.
 5. **Server down** -- stop muxplex (or block the URL) while the sidecar
    is running: strip shows `<hostname> UNREACHABLE -- retrying`, keys go
    blank, and it recovers automatically (repainting sessions) once the
@@ -305,7 +336,13 @@ device handle closed before the process exits.
    retries slowly (every 30s) rather than spinning.
 7. **Unplug/replug** -- same hotplug behavior as the probe: unplug stops
    all server traffic and returns to waiting; replug brings up a fresh
-   ACTIVE session.
+   ACTIVE session (at full brightness again).
+8. **Dial-press picker mode** -- press dial 0: keys switch to a list of
+   view names (strip reads `VIEW PICKER -- tap to choose`); tap one to
+   switch views and return to the session display. Press dial 1: keys
+   switch to page numbers; tap one to jump there. Pressing the same dial
+   again exits without changing anything; pressing the other dial while a
+   picker is open switches straight to that dial's picker.
 
 ### Troubleshooting
 

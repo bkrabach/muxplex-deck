@@ -18,6 +18,15 @@ server-side state -- one value, last writer wins, shared by every
 device/browser tab watching the server. `ViewCycler` mirrors that: turning
 the dial changes what *everyone* sees, exactly like a browser tab switching
 views would. There is no per-device view.
+
+`PickerController` (dial-press picker mode): pressing dial 0 or dial 1 no
+longer performs an immediate action (jump to "all" / reset to page 1) --
+instead it hands the 8 keys over to a chooser listing that dial's options
+(views, or page numbers), so a spin-then-tap sequence can jump straight to
+a specific target on a server with more options than there are keys. This
+class only tracks *which* picker (if any) owns the keys and its scroll
+window -- it has no idea what the actual view names or page count are
+(that's server-derived state `main.py` supplies at render/select time).
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable
+from enum import Enum
 
 DEFAULT_DEBOUNCE_SECONDS = 0.4
 
@@ -47,6 +57,11 @@ class ViewCycler:
         self._committed_view = "all"
         self._pending_ticks = 0
         self._timer: threading.Timer | None = None
+
+    def names(self) -> list[str]:
+        """The current cycle list (`["all"] + <named views>`), a fresh copy."""
+        with self._lock:
+            return list(self._names)
 
     def sync(self, view_names: list[str], active_view: str) -> None:
         """Refresh the cycle list and the known server view from a fresh poll.
@@ -177,6 +192,12 @@ class Pager:
             self._page = 1
             return self._page
 
+    def go_to(self, page: int) -> int:
+        """Jump directly to `page` (1-indexed), clamped -- used by the page picker."""
+        with self._lock:
+            self._page = min(max(1, page), self._page_count)
+            return self._page
+
     @property
     def page(self) -> int:
         with self._lock:
@@ -192,3 +213,87 @@ class Pager:
         with self._lock:
             start = (self._page - 1) * self.page_size
             return start, start + self.page_size
+
+
+class PickerMode(Enum):
+    """Which dial-press picker (if any) currently owns the 8 keys."""
+
+    NONE = "none"
+    VIEW = "view"
+    PAGE = "page"
+
+
+class PickerController:
+    """Dial-press picker state machine: NONE / VIEW / PAGE + a scroll window.
+
+    Replaces the old "press dial 0 -> jump to all" / "press dial 1 -> reset
+    to page 1" immediate actions with a chooser mode: pressing a dial hands
+    the 8 keys over to a list of that dial's options (view names, or page
+    numbers) so a spin-then-tap sequence can jump straight to a specific
+    target -- useful once there are more views or pages than there are keys.
+
+    Transition rules (all pure, no I/O):
+    - Press the dial that owns the *current* picker -> exit to NONE.
+    - Press the *other* dial while a picker is open -> switch straight to
+      that dial's picker (no intermediate NONE).
+    - Press either dial from NONE -> open that dial's picker.
+    A session-key tap while a picker is open means "select this option", not
+    "connect" -- that dispatch lives in `main.py` (it needs live server
+    state this class deliberately doesn't carry).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._mode = PickerMode.NONE
+        self._window_start = 0
+
+    @property
+    def mode(self) -> PickerMode:
+        with self._lock:
+            return self._mode
+
+    @property
+    def window_start(self) -> int:
+        with self._lock:
+            return self._window_start
+
+    def press_view_dial(self) -> PickerMode:
+        """Dial-0 press: open the VIEW picker, or close it if already open."""
+        with self._lock:
+            self._mode = (
+                PickerMode.NONE if self._mode == PickerMode.VIEW else PickerMode.VIEW
+            )
+            self._window_start = 0
+            return self._mode
+
+    def press_page_dial(self) -> PickerMode:
+        """Dial-1 press: open the PAGE picker, or close it if already open."""
+        with self._lock:
+            self._mode = (
+                PickerMode.NONE if self._mode == PickerMode.PAGE else PickerMode.PAGE
+            )
+            self._window_start = 0
+            return self._mode
+
+    def exit(self) -> None:
+        """Close whichever picker is open (e.g. after a key-tap selection)."""
+        with self._lock:
+            self._mode = PickerMode.NONE
+            self._window_start = 0
+
+    def scroll(self, ticks: int, *, total: int, page_size: int) -> int:
+        """Move the scroll window by `ticks` pages of `page_size` options.
+
+        Clamped to `[0, last page start]`, no wrap -- matching `Pager.turn`'s
+        clamping style. `ticks=0` is a no-op *move* but still re-clamps the
+        stored window against a possibly-changed `total` (e.g. the view list
+        or page count changed since the window was last set) -- callers use
+        this to keep the window valid before every repaint.
+        """
+        with self._lock:
+            max_start = (
+                0 if total <= page_size else ((total - 1) // page_size) * page_size
+            )
+            new_start = self._window_start + ticks * page_size
+            self._window_start = min(max(0, new_start), max_start)
+            return self._window_start
