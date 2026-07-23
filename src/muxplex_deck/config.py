@@ -19,6 +19,8 @@ from pathlib import Path
 DEFAULT_CONFIG_PATH = Path("~/.config/muxplex-deck/config.json").expanduser()
 DEFAULT_KEY_FILE = Path("~/.config/muxplex-deck/federation_key").expanduser()
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_SORT_MODE = "attention"
+VALID_SORT_MODES = ("attention", "server")
 
 
 class ConfigError(Exception):
@@ -33,6 +35,13 @@ class Config:
     federation_key: str
     ca_file: Path | None
     poll_interval: float
+    sort: str
+    """"attention" (default): needs-attention sessions first, then the active
+    session, then everything else by recent activity. "server": exactly the
+    pre-existing behavior -- honor muxplex's own `sort_order` (alphabetical
+    vs server/manual order) with no client-side reordering. See `.attention`
+    for the "attention" mode's tie-break rules.
+    """
 
 
 def _resolve_config_path(explicit: str | None) -> Path:
@@ -115,9 +124,16 @@ def load_config(config_path: str | None = None) -> Config:
             f"Config field 'poll_interval' must be a positive number, got {poll_interval!r}"
         )
 
+    sort = raw.get("sort", DEFAULT_SORT_MODE)
+    if sort not in VALID_SORT_MODES:
+        raise ConfigError(
+            f"Config field 'sort' must be one of {VALID_SORT_MODES}, got {sort!r}"
+        )
+
     return Config(
         server_url=server_url.rstrip("/"),
         federation_key=federation_key,
         ca_file=ca_file,
         poll_interval=float(poll_interval),
+        sort=sort,
     )

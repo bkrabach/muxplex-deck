@@ -12,7 +12,12 @@ Endpoint shapes below were read directly from the muxplex server source
 - GET  /api/sessions              -> [{"name": str, "snapshot": str,
                                         "bell": {"last_fired_at": float|None,
                                                  "seen_at": float|None,
-                                                 "unseen_count": int}}, ...]
+                                                 "unseen_count": int},
+                                        "last_activity_at": float|None}, ...]
+                                        (last_activity_at is absent/None on
+                                        servers that predate the
+                                        feat/session-activity branch --
+                                        `.attention` handles that gap)
 - GET  /api/state                 -> {"active_session": str|None,
                                        "active_view": str, ...}
                                        (active_view defaults to "all" server-side)
@@ -24,6 +29,8 @@ Endpoint shapes below were read directly from the muxplex server source
                                         server; irrelevant to view resolution)
 - POST /api/sessions/{name}/connect -> {"active_session": str, "ttyd_port": int}
                                         (404 if name is not a known session)
+- PATCH /api/state {"active_view": str} -> updated state (used by dial-0
+                                        view cycling; see `.interaction`)
 
 Auth: every request (except the public /api/instance-info, which we don't
 use) must carry `Authorization: Bearer <federation_key>`; the server checks
@@ -79,11 +86,21 @@ class Bell:
 
 @dataclass(frozen=True)
 class Session:
-    """One tmux session as returned by GET /api/sessions."""
+    """One tmux session as returned by GET /api/sessions.
+
+    `last_activity_at` is unix epoch seconds of the session's last pane
+    output (tmux's `#{window_activity}`, tracked regardless of client
+    attachment), or `None` on servers that predate the
+    `feat/session-activity` branch, or for a session tmux reported no
+    activity value for. `.attention.apply_attention_sort` treats an
+    entirely-absent field (every session `None`) as "server doesn't support
+    this yet" and falls back to base ordering for its recency tier.
+    """
 
     name: str
     snapshot: str
     bell: Bell
+    last_activity_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +150,7 @@ def _parse_session(raw: dict) -> Session:
         name=raw["name"],
         snapshot=raw.get("snapshot", ""),
         bell=_parse_bell(raw.get("bell", {})),
+        last_activity_at=raw.get("last_activity_at"),
     )
 
 
@@ -173,9 +191,11 @@ class MuxplexClient:
     ) -> None:
         self.close()
 
-    def _request(self, method: str, path: str) -> httpx.Response:
+    def _request(
+        self, method: str, path: str, json: dict | None = None
+    ) -> httpx.Response:
         try:
-            response = self._client.request(method, path)
+            response = self._client.request(method, path, json=json)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -232,3 +252,12 @@ class MuxplexClient:
         Raises `MuxplexError` (404 wrapped) if *name* is not a known session.
         """
         self._request("POST", f"/api/sessions/{name}/connect")
+
+    def set_active_view(self, view: str) -> None:
+        """PATCH /api/state {"active_view": view} -- used by dial-0 view cycling.
+
+        `active_view` is global server-side state (last writer wins across
+        every device/browser tab watching this server) -- see `.interaction`
+        module docstring for the consequence of that.
+        """
+        self._request("PATCH", "/api/state", json={"active_view": view})

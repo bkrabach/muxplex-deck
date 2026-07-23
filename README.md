@@ -164,27 +164,57 @@ timestamp; watch both the terminal and the physical device.
 
 ## muxplex sidecar (`muxplex-deck`)
 
-Shows your muxplex tmux sessions on the deck's 8 keys and switches the
-active session on key press. Polls `GET /api/sessions` + `GET /api/state` +
-`GET /api/settings` on the muxplex server every `poll_interval` seconds;
-repaints only when something render-relevant changed (no flicker). Dials
-and touch-strip gestures are logged only in v1 -- unassigned, pending
-interaction design.
+Shows your muxplex tmux sessions on the deck's 8 keys -- each key rendered
+as a mini terminal preview of that session -- and switches the active
+session on key press. Dial 0 cycles views; dial 1 pages within the current
+view. Polls `GET /api/sessions` + `GET /api/state` + `GET /api/settings` on
+the muxplex server every `poll_interval` seconds; repaints only the keys
+(and strip) whose content actually changed (no flicker, no wasted JPEG
+encodes for an idle session).
 
 **View-following:** the deck mirrors whatever view is active in the muxplex
 PWA. Keys show the sessions belonging to the server's current view
 (`active_view` from `GET /api/state`) -- `all`, `hidden`, or a user-defined
-view -- filtered and ordered the same way the PWA does (`sort_order` in
-settings; `alphabetical` sorts by name, anything else preserves server
-order). The touch strip leads with the view name (truncated to ~20 chars),
-followed by hostname, session count, and the active session. Switching
-views in the PWA is picked up within one poll cycle. An unknown/deleted
-view name shows honestly as zero sessions rather than silently falling
-back to `all`. The bell/attention dot uses the exact predicate the PWA
-uses: a session needs attention iff `unseen_count > 0` and either it has
-never been seen or the most recent fire is newer than the last time it was
-seen (`Bell.needs_attention` in `client.py`) -- so an old, acknowledged
-bell doesn't keep glowing forever.
+view -- filtered the same way the PWA does. An unknown/deleted view name
+shows honestly as zero sessions rather than silently falling back to `all`.
+The bell/attention dot uses the exact predicate the PWA uses: a session
+needs attention iff `unseen_count > 0` and either it has never been seen or
+the most recent fire is newer than the last time it was seen
+(`Bell.needs_attention` in `client.py`) -- so an old, acknowledged bell
+doesn't keep glowing forever.
+
+**Dial 0 -- view cycling:** turning steps through `["all"] + <your named
+views>` (wraps at the ends); the strip immediately echoes the candidate
+view name while turning, and after ~400ms of no further ticks it commits
+via `PATCH /api/state` -- so a fast spin sends exactly one request, not one
+per tick. Pressing jumps straight to `all`. `active_view` is *global*
+server-side state (last writer wins across every device/tab watching the
+server), so turning the dial changes what the PWA shows too, exactly like
+switching views there would.
+
+**Dial 1 -- paging:** turning moves ±1 page within the current view (8
+sessions/page, clamped at the first/last page -- no wrap); pressing jumps
+back to page 1. Purely local -- no server writes. The strip shows a
+`pN/M` indicator whenever a view has more than one page. Paging resets to
+page 1 whenever the active view changes (from either dial 0 or the PWA).
+
+**Sort order -- `"sort"` config field (`"attention"` default, or
+`"server"`):** in `"attention"` mode the view's sessions are reordered
+before paging so the most urgent land on page 1: sessions needing
+attention first (newest bell fire first), then the active session, then
+everything else by most-recent activity (`last_activity_at`, when the
+server exposes it -- older muxplex servers get a one-time INFO log and a
+graceful fallback to server order for that tier). `"server"` mode disables
+all of this and shows exactly what the PWA's own `sort_order` setting
+(`alphabetical` or manual/server order) produces -- the pre-existing
+behavior.
+
+**Key previews:** each occupied key renders a small monospace crop of the
+session's live pane (bottom-left corner, ANSI colors stripped in this first
+pass -- see `rendering.py`'s docstring for the honest fidelity tradeoff),
+with the session name banner, active-session border, and bell dot always
+layered on top so identity stays legible regardless of what's scrolling
+underneath.
 
 ### Config
 
@@ -195,7 +225,8 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
 {
   "server_url": "https://spark-1:8088",
   "key_file": "~/.config/muxplex-deck/federation_key",
-  "poll_interval": 2.0
+  "poll_interval": 2.0,
+  "sort": "attention"
 }
 ```
 
@@ -211,6 +242,11 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   Troubleshooting below.
 - `poll_interval` (optional, default `2.0`) -- seconds between session
   polls while active.
+- `sort` (optional, default `"attention"`) -- `"attention"` reorders each
+  view's sessions before paging (attention first, then active, then most
+  recently active); `"server"` disables that reordering and shows exactly
+  what the PWA's own `sort_order` setting produces. See "Dial 0 / Dial 1 /
+  Sort order" above for the full behavior.
 
 Any missing/invalid config or unreadable key file produces a clear,
 actionable message on stderr and a non-zero exit -- there is no default
