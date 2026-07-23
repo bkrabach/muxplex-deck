@@ -56,14 +56,15 @@ MAX_SESSION_LABEL_CHARS = 10
 
 _PREVIEW_BG = "#0a0a0a"  # near-black -- the preview's own background
 _PREVIEW_TEXT_COLOR = "#a8a8a8"  # light gray -- low-contrast so name/badges pop
-# v2 (real-hardware feedback: v1's size-8 preview was illegible) -- font size
-# doubled, with fewer lines/columns so the larger glyphs still fit under the
-# banner within the 120x120 key. Still "recognize your session by its shape",
-# not "read the text" -- see the fidelity note in `_preview_lines` below.
-_PREVIEW_FONT_SIZE = 16
-_PREVIEW_LINE_HEIGHT = 18
-_PREVIEW_LINES = 5  # bottom N lines of the snapshot
-_PREVIEW_COLUMNS = 13  # first N columns of each of those lines (bottom-LEFT crop)
+# v3 (real-hardware feedback: v1's size-8 was illegible, v2's size-16 too
+# zoomed-in) -- split the difference at ~12, with line/column counts scaled to
+# match so the crop still fits under the banner within the 120x120 key. Still
+# "recognize your session by its shape", not "read the text" -- see the fidelity
+# note in `_preview_lines` below.
+_PREVIEW_FONT_SIZE = 12
+_PREVIEW_LINE_HEIGHT = 14
+_PREVIEW_LINES = 7  # bottom N lines of the snapshot
+_PREVIEW_COLUMNS = 19  # first N columns of each of those lines (bottom-LEFT crop)
 _PREVIEW_LEFT_MARGIN = 3
 
 _BANNER_HEIGHT = 20  # translucent strip behind the session name, top of key
