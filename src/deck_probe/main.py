@@ -1,4 +1,11 @@
-"""Stream Deck+ hardware probe: entry point and hotplug state machine.
+"""Stream Deck hardware probe (any model): entry point and hotplug state machine.
+
+The probe is capability-driven: it reports what the connected deck can do
+(model, keys, layout, dials, touchscreen, touch keys) and exercises only
+the controls that exist -- one probe for the 15-key Original/MK2, the
+Plus, the XL, the Mini, the Neo, and whatever ships next. Branching is on
+numeric/boolean capabilities (`key_count()`, `dial_count()`, `is_touch()`),
+never on `deck_type()` model-name strings.
 
 This state machine (DEVICE_ABSENT <-> DEVICE_ACTIVE) is the seed of the
 future muxplex sidecar's core loop, so it's kept clean and self-contained:
@@ -27,7 +34,7 @@ from StreamDeck.DeviceManager import DeviceManager, ProbeError
 from StreamDeck.Devices.StreamDeck import StreamDeck
 from StreamDeck.Transport.Transport import TransportError
 
-from . import events
+from . import capabilities, events
 
 logger = logging.getLogger("deck_probe")
 
@@ -55,19 +62,35 @@ def _explain_missing_hidapi() -> str:
     )
 
 
+def _no_device_guidance() -> str:
+    return (
+        "No Stream Deck found. Things to check:\n"
+        "  - All platforms: close the official Elgato Stream Deck app -- it holds\n"
+        "    exclusive HID access, so this probe cannot open the device while it runs.\n"
+        "  - Linux (incl. WSL): a udev rule must grant access to Elgato devices\n"
+        "    (vendor id 0x0fd9). Create /etc/udev/rules.d/70-streamdeck.rules with:\n"
+        '      SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"\n'
+        "    then: sudo udevadm control --reload-rules && replug the device.\n"
+        "  - WSL specifically: USB devices are not visible until attached from\n"
+        "    Windows via usbipd -- in an admin PowerShell:\n"
+        "      usbipd list                        (find the Stream Deck's BUSID)\n"
+        "      usbipd bind --busid <BUSID>        (first time only)\n"
+        "      usbipd attach --wsl --busid <BUSID>\n"
+        "    (and remember the Elgato app on the Windows side must be closed).\n"
+    )
+
+
 def _find_deck(manager: DeviceManager) -> StreamDeck | None:
     decks = manager.enumerate()
     return decks[0] if decks else None
 
 
 def _log_device_info(deck: StreamDeck) -> None:
-    logger.info("connected: %s", deck.deck_type())
-    logger.info("  serial number:      %s", deck.get_serial_number())
-    logger.info("  firmware version:   %s", deck.get_firmware_version())
-    logger.info("  key count:          %d", deck.key_count())
-    logger.info("  dial count:         %d", deck.dial_count())
-    logger.info("  key image format:   %s", deck.key_image_format())
-    logger.info("  touch strip format: %s", deck.touchscreen_image_format())
+    """Print the capability report: which deck this is and what it can do."""
+    for line in capabilities.format_capability_report(
+        capabilities.describe_capabilities(deck)
+    ).splitlines():
+        logger.info("%s", line)
 
 
 def _safe_close(deck: StreamDeck) -> None:
@@ -96,14 +119,14 @@ def _run_active(deck: StreamDeck, shutting_down: threading.Event) -> None:
     _log_device_info(deck)
     state = events.paint_initial_state(deck)
     events.attach_callbacks(deck, state)
-    logger.info("Stream Deck+ active -- waiting for input (Ctrl+C to exit)")
+    logger.info("%s active -- waiting for input (Ctrl+C to exit)", deck.deck_type())
 
     try:
         while True:
             if shutting_down.wait(ACTIVE_HEALTH_CHECK_SECONDS):
                 return
             if not deck.is_open() or not deck.connected():
-                logger.warning("Stream Deck+ disconnected")
+                logger.warning("Stream Deck disconnected")
                 return
     finally:
         _safe_close(deck)
@@ -131,6 +154,7 @@ def run() -> int:
 
     shutting_down = _install_signal_handler()
     logged_waiting = False
+    guidance_shown = False
     last_heartbeat = 0.0
 
     logger.info("deck-probe starting")
@@ -148,14 +172,18 @@ def run() -> int:
             if deck is None:
                 now = time.monotonic()
                 if not logged_waiting:
+                    if not guidance_shown:
+                        for line in _no_device_guidance().splitlines():
+                            logger.info("%s", line)
+                        guidance_shown = True
                     logger.info(
-                        "waiting for Stream Deck+ (polling every %.0fs)...",
+                        "waiting for a Stream Deck (polling every %.0fs)...",
                         POLL_INTERVAL_SECONDS,
                     )
                     logged_waiting = True
                     last_heartbeat = now
                 elif now - last_heartbeat >= ABSENT_HEARTBEAT_SECONDS:
-                    logger.info("still waiting for Stream Deck+...")
+                    logger.info("still waiting for a Stream Deck...")
                     last_heartbeat = now
                 shutting_down.wait(POLL_INTERVAL_SECONDS)
                 continue
@@ -164,7 +192,7 @@ def run() -> int:
             try:
                 deck.open()
             except Exception:
-                logger.exception("Failed to open Stream Deck+ device; will retry")
+                logger.exception("Failed to open Stream Deck device; will retry")
                 shutting_down.wait(POLL_INTERVAL_SECONDS)
                 continue
 

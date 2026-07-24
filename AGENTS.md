@@ -9,6 +9,19 @@ machine the deck is plugged into (macOS today; Windows/Linux planned).
 `src/deck_probe/` is the hardware-only PoC; `src/muxplex_deck/` is the
 product. See `README.md` for setup, config, and verification checklists.
 
+## Capability-driven, never model-name-driven
+
+- Adapt to a deck by querying capabilities (`key_count()`, `key_layout()`,
+  `key_image_format()['size']`, `dial_count()`, `is_touch()`,
+  `touch_key_count()`, `is_visual()`) — NEVER by matching `deck_type()`
+  strings (Original vs MK2 collide; new models would need matrix updates).
+- Never assume key pixel size (Plus=120, Neo=96, Original/MK2=72) or that
+  dials/touchscreen exist. Gate each control's paint + callback on its
+  capability and log a "no X on this model" note when skipping.
+- `deck_probe/capabilities.py` owns this: `describe_capabilities(deck)` is
+  a pure dict-builder (testable with fakes, see `tests/`), plus
+  `exercises_*` gating predicates and the report formatter.
+
 ## The device seam — keep HID isolated and pluggable
 
 - `device.py` defines the `DeckDevice`/`DeviceManager` protocols;

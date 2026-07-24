@@ -26,18 +26,27 @@ KEY_COLORS: tuple[str, ...] = (
 )
 
 # The touch strip is divided into one zone per dial: dial 0 shows live
-# brightness (proves set_brightness), dials 1-3 show their tap/turn counters.
-TOUCHSCREEN_ZONE_COUNT = 4
-TOUCHSCREEN_ZONE_LABELS: tuple[str, ...] = (
-    "D0 BRIGHTNESS",
-    "D1 COUNTER",
-    "D2 COUNTER",
-    "D3 COUNTER",
-)
+# brightness (proves set_brightness), the rest show their tap/turn counters.
+# Zone count is derived from the deck's dial_count() -- capability-driven,
+# not hardcoded to the Plus's 4 dials.
+BRIGHTNESS_ZONE_INDEX = 0
 
 _LABEL_FONT_SIZE = 16
 _VALUE_FONT_SIZE = 28
-_KEY_LABEL_FONT_SIZE = 48
+# Key labels scale with the key's pixel size: 120px keys (Plus) get the
+# original 48px font; 72px keys (Original/MK2) get ~28px. Never assume
+# a fixed key resolution.
+_KEY_LABEL_FONT_RATIO = 0.4
+
+
+def zone_labels(dial_count: int) -> tuple[str, ...]:
+    """Touchscreen zone labels for a deck with `dial_count` dials."""
+    if dial_count <= 0:
+        return ()
+    return (
+        "D0 BRIGHTNESS",
+        *(f"D{i} COUNTER" for i in range(1, dial_count)),
+    )
 
 
 def render_key_image(
@@ -56,7 +65,11 @@ def render_key_image(
 
     image = PILHelper.create_key_image(deck, background=background)
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=_KEY_LABEL_FONT_SIZE)
+    # Scale the label to the key's actual pixel size (72px on the 15-key
+    # Original/MK2, 96px on the Neo, 120px on the Plus).
+    font = ImageFont.load_default(
+        size=max(16, int(image.height * _KEY_LABEL_FONT_RATIO))
+    )
 
     label = str(index)
     bbox = draw.textbbox((0, 0), label, font=font)
@@ -103,13 +116,18 @@ def render_touchscreen_full(
     counters: list[int],
     marker_x: int | None = None,
 ) -> bytes:
-    """Render the full touch strip: 4 labeled zones plus an optional tap marker line."""
+    """Render the full touch strip: one labeled zone per dial plus an optional tap marker.
+
+    Only meaningful on touchscreen decks; callers gate on `is_touch()`.
+    Zone count follows the deck's dial count (Plus: 4).
+    """
     image = PILHelper.create_touchscreen_image(deck, background="black")
     draw = ImageDraw.Draw(image)
-    zone_width = image.width // TOUCHSCREEN_ZONE_COUNT
+    labels = zone_labels(deck.dial_count())
+    zone_width = image.width // max(len(labels), 1)
 
     values = [f"{brightness_percent}%", *[str(c) for c in counters]]
-    for zone_index, (label, value) in enumerate(zip(TOUCHSCREEN_ZONE_LABELS, values)):
+    for zone_index, (label, value) in enumerate(zip(labels, values)):
         x_offset = zone_index * zone_width
         if zone_index > 0:
             draw.line(
@@ -134,7 +152,7 @@ def render_touchscreen_zone(
     whole 800x100 strip on every dial tick.
     """
     full_width, full_height = deck.touchscreen_image_format()["size"]
-    zone_width = full_width // TOUCHSCREEN_ZONE_COUNT
+    zone_width = full_width // max(deck.dial_count(), 1)
     x_pos = zone_index * zone_width
 
     zone_image = PILHelper.create_touchscreen_image(deck, background="black")

@@ -3,10 +3,17 @@
 This repo has two apps, sharing one `uv` project:
 
 - **`deck-probe`** -- a PoC/spike app that proves we can drive every feature
-  of an Elgato Stream Deck+ (8 LCD keys, 4 push-dial encoders, 800x100
-  touch strip) and capture every input it can produce, including clean
-  hotplug (unplug/replug without restarting the process). Device I/O only,
-  no server/network integration. See "Stream Deck+ hardware probe" below.
+  of **any Elgato Stream Deck model** and capture every input it can
+  produce, including clean hotplug (unplug/replug without restarting the
+  process). It is capability-driven: on connect it prints a capability
+  report (model, serial, firmware, key count/layout/size, dials, touch
+  strip, touch keys) and exercises only the controls the connected deck
+  actually has -- keys always, dials only if `dial_count() > 0`, the touch
+  strip only if `is_touch()`. Verified on the Stream Deck+ (8 keys, 4
+  dials, touch strip); the 15-key Original/MK2 (3x5, 72x72 keys, no
+  dials/touch) runs the same probe with dial/touch exercises skipped.
+  Device I/O only, no server/network integration. See "Stream Deck
+  hardware probe" below.
 - **`muxplex-deck`** -- the actual product: a sidecar that shows your
   muxplex tmux sessions on the deck's 8 keys and switches sessions on key
   press. See "muxplex sidecar" below.
@@ -37,13 +44,38 @@ machine, with no `hidapi` installed. See "Stream Deck+ emulator" below.
    uv sync
    ```
 
-## Stream Deck+ hardware probe
+## Stream Deck hardware probe (any model)
 
 ### Running
 
 ```sh
 uv run deck-probe
 ```
+
+#### Windows + WSL
+
+USB devices are not visible inside WSL until attached from the Windows
+side. In an **admin PowerShell**:
+
+```powershell
+usbipd list                        # find the Stream Deck's BUSID (VID 0fd9)
+usbipd bind --busid <BUSID>        # first time only
+usbipd attach --wsl --busid <BUSID>
+```
+
+Then inside WSL, grant HID access via a udev rule (first time only):
+
+```sh
+sudo tee /etc/udev/rules.d/70-streamdeck.rules >/dev/null \
+  <<< 'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"'
+sudo udevadm control --reload-rules
+# then detach/re-attach the device (usbipd detach + attach)
+sudo apt install libhidapi-libusb0   # native HIDAPI, if not present
+```
+
+**Close the Elgato Stream Deck app on Windows first** -- it holds
+exclusive HID access. The probe prints this same guidance when it finds
+no device.
 
 Or equivalently:
 
@@ -61,13 +93,14 @@ timestamp; watch both the terminal and the physical device.
 
 1. **Cold start, no device connected**
    - Run `uv run deck-probe` with nothing plugged in.
-   - Expect: `waiting for Stream Deck+ (polling every 2s)...` logged once,
+   - Expect: no-device guidance (udev/usbipd/Elgato-app hints) followed by
+     `waiting for a Stream Deck (polling every 2s)...` logged once,
      not repeated every 2 seconds (a "still waiting" heartbeat is fine
      roughly every 30s).
 
 2. **Plug in the Stream Deck+**
-   - Within ~2 seconds, expect a `connected: Stream Deck +` log line
-     followed by serial number, firmware version, key count, dial count,
+   - Within ~2 seconds, expect a `deck capabilities:` report block with
+     model, serial number, firmware version, key count/layout/size, dial count,
      key image format, and touch strip format.
    - Expect all 8 keys to light up immediately, each showing a distinct
      background color and its own index number (0-7).
