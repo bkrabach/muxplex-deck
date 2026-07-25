@@ -81,3 +81,41 @@ product. See `README.md` for setup, config, and verification checklists.
   verification instead.
 - Fail closed: missing/invalid config or key file is a clear stderr message
   and non-zero exit — no default silently skips auth or TLS.
+
+## CLI (cli.py, service.py) -- parity with muxplex's own CLI
+
+- `cli.py` is the console-script entry point (`muxplex-deck = "muxplex_deck.cli:main"`),
+  ported from `muxplex/cli.py`'s shape: `_add_run_flags()` shared between the
+  root parser and `run` subcommand (bare `muxplex-deck` == `muxplex-deck
+  run`, all flags default to `None` for 3-tier CLI>config.json>default
+  resolution), a `config` group backed by `config.py`'s `DEFAULT_CONFIG` +
+  `load_raw_config`/`save_raw_config`/`patch_raw_config`, `doctor`, `update`
+  (alias `upgrade`), and `version`. `main.py`'s own `main()` now just
+  delegates to `cli.main()` -- argument parsing is single-sourced in
+  `cli.py`, not duplicated.
+- **The HID-permission caveat has no muxplex analog.** muxplex is a plain
+  user process; the sidecar needs raw USB HID access a non-root Linux user
+  doesn't have by default (why you've been running `sudo muxplex-deck`). A
+  systemd **user** service runs as your normal user, not root -- so
+  `service.py`'s `_systemd_install()` checks `/etc/udev/rules.d/` +
+  `/usr/lib/udev/rules.d/` for a rule mentioning vendor id `0fd9` and prints
+  a copy-pasteable remediation block (never writes to `/etc` itself) when
+  none exists, rather than silently installing a service that can't open
+  the device.
+- **Restart policy differs from muxplex on purpose**: `Restart=always` (not
+  muxplex's `on-failure`) plus a best-effort `loginctl enable-linger` on
+  install -- this is a headless, always-on sidecar meant to survive logout,
+  not a server a human restarts interactively.
+- `doctor` additionally verifies `ca_file` is actually a CA (`openssl x509
+  -noout -ext basicConstraints`, warns loudly on `CA:FALSE`) -- this is the
+  exact real-world mistake (pointing `ca_file` at the server's *leaf* cert,
+  `muxplex.crt`, instead of its CA, `ca/muxplex-ca.crt`) that cost real
+  debugging time earlier in this project. It also probes the Stream Deck
+  via the real `DeviceManager` and reports detected/openable status
+  separately, since "detected but can't open" is exactly the
+  udev-rule-missing symptom.
+- `update` is git-only (no PyPI release) -- always reinstalls from `main`
+  via `uv tool install --force git+...` (pip fallback), unlike muxplex's
+  own upgrade which has PyPI/uv-tool-managed detection and a
+  version-already-current skip gate. Simplified deliberately: there's only
+  one install path for this project today.

@@ -15,7 +15,7 @@ dependencies = [
 
 [project.scripts]
 deck-probe = "deck_probe.main:main"
-muxplex-deck = "muxplex_deck.main:main"
+muxplex-deck = "muxplex_deck.cli:main"
 
 [dependency-groups]
 dev = [

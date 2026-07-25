@@ -48,10 +48,8 @@ backend-agnostic.
 
 from __future__ import annotations
 
-import argparse
 import logging
 import signal
-import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -66,11 +64,10 @@ from .client import (
     Settings,
     UnreachableError,
 )
-from .config import Config, ConfigError, load_config
+from .config import Config
 from .device import (
     DeckDevice,
     DeviceManager,
-    DeviceProbeError,
     DialEventType,
     TouchscreenEventType,
 )
@@ -1026,44 +1023,17 @@ def _build_manager(*, emulator: bool, emulator_port: int) -> DeviceManager:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="muxplex-deck",
-        description="Drive an Elgato Stream Deck+ against a muxplex server.",
-    )
-    parser.add_argument(
-        "--config",
-        help="Path to config JSON file (overrides MUXPLEX_DECK_CONFIG and the default "
-        "~/.config/muxplex-deck/config.json)",
-    )
-    parser.add_argument(
-        "--emulator",
-        action="store_true",
-        help="Run against the in-process Stream Deck+ emulator (localhost web UI) "
-        "instead of real hardware -- no device, no hidapi required.",
-    )
-    parser.add_argument(
-        "--emulator-port",
-        type=int,
-        default=8484,
-        help="Port for the emulator's web UI (default: 8484). Ignored without --emulator.",
-    )
-    args = parser.parse_args()
+    """Legacy direct entry point (`python -m muxplex_deck.main`).
 
-    try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+    The actual CLI (subcommands, argument parsing, default-action dispatch)
+    lives in `cli.py` now -- delegating here keeps argument parsing
+    single-sourced instead of drifting across two copies. The console-script
+    entry point (`muxplex-deck`) points at `cli:main` directly; this
+    function exists only for anyone still invoking this module by path.
+    """
+    from .cli import main as cli_main
 
-    try:
-        manager = _build_manager(
-            emulator=args.emulator, emulator_port=args.emulator_port
-        )
-    except DeviceProbeError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
-
-    sys.exit(run(config, manager))
+    cli_main()
 
 
 if __name__ == "__main__":

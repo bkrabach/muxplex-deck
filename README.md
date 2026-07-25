@@ -26,6 +26,72 @@ means the whole sidecar -- state machine, muxplex client, rendering,
 interaction flow -- can be developed and tested with zero hardware, on any
 machine, with no `hidapi` installed. See "Stream Deck+ emulator" below.
 
+## CLI
+
+`muxplex-deck` has the same command shape as its sibling `muxplex` server
+tool: a default action, a `config` group, a `service` group (systemd on
+Linux, launchd on macOS), `doctor`, `update`, and `version`. Bare
+`muxplex-deck` and `muxplex-deck run` do exactly the same thing.
+
+| Command | What it does |
+|---|---|
+| `muxplex-deck` / `muxplex-deck run` | Run the sidecar (the default action) |
+| `muxplex-deck --emulator` | Run against the in-process emulator instead of real hardware |
+| `muxplex-deck config` / `config list` | Show all config keys and their current values |
+| `muxplex-deck config get <key>` | Show one config value |
+| `muxplex-deck config set <key> <value>` | Set a config value (type auto-detected) |
+| `muxplex-deck config reset [key]` | Reset one key, or all keys, to defaults |
+| `muxplex-deck service install` | Install + enable + start the background service |
+| `muxplex-deck service uninstall` | Stop + disable + remove the service |
+| `muxplex-deck service start` / `stop` / `restart` | Control the service |
+| `muxplex-deck service status` | Show service status |
+| `muxplex-deck service logs` | Tail service logs |
+| `muxplex-deck doctor` | Check Python version, install source, config, federation key permissions, `ca_file` validity, Stream Deck detection, HID openability, server reachability, and service status |
+| `muxplex-deck update` (alias `upgrade`) | Update to the latest `main` and restart the service |
+| `muxplex-deck version` / `--version` | Show the installed version |
+
+Every `config` key maps 1:1 to a `config.json` field: `server_url`,
+`key_file`, `ca_file`, `poll_interval`, `sort`, `focus_app`. See "Config"
+under "muxplex sidecar" below for what each one means.
+
+### The HID-permission caveat (why `service install` prints a udev block)
+
+Unlike the muxplex *server* (a plain user process), the sidecar needs raw
+USB HID access to the Stream Deck -- which a non-root Linux user does not
+have by default. This is why you've been running `sudo muxplex-deck`. A
+systemd **user** service, however, runs as your normal user, not root -- so
+without a udev rule granting your user access to the device (vendor id
+`0fd9`), the installed service will start but fail to open the deck.
+
+`muxplex-deck service install` checks for an existing rule under
+`/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` and, if none is found,
+prints a copy-pasteable remediation block (the same rule shown in
+"Permissions" under the hardware probe section above) instead of silently
+installing a service that won't work. It never writes to `/etc` itself --
+only detects and reports. Run the printed `sudo tee ... && sudo udevadm
+control --reload-rules && sudo udevadm trigger` commands, then unplug and
+replug the deck (or re-`usbipd attach` under WSL) and `muxplex-deck service
+restart`.
+
+On Linux, `service install` also attempts `loginctl enable-linger
+<you>` (best-effort, non-fatal) so the service keeps running after you log
+out -- appropriate for a headless, always-on sidecar. `muxplex-deck doctor`
+reports both the udev rule and HID-openable status.
+
+### Service install walkthrough (Linux)
+
+```sh
+uv tool install git+https://github.com/bkrabach/muxplex-deck
+muxplex-deck config set server_url https://<your-server>:8088
+muxplex-deck config set ca_file ~/.config/muxplex-deck/muxplex-ca.crt   # if using a local CA
+muxplex-deck doctor          # confirms config, key file, CA, and deck are all in order first
+muxplex-deck service install # writes the systemd user unit, enables linger, warns about udev if needed
+muxplex-deck service status
+```
+
+On macOS the same commands install a launchd agent instead (no udev/linger
+step -- macOS needs no special HID permissions).
+
 ## macOS setup
 
 1. Install [uv](https://docs.astral.sh/uv/) if you don't have it:

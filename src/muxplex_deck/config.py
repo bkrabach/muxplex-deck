@@ -30,6 +30,20 @@ DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_SORT_MODE = "attention"
 VALID_SORT_MODES = ("attention", "server")
 
+# The full set of keys `config.json` supports, with their default values --
+# drives the `muxplex-deck config` CLI group (list/get/set/reset) the same
+# way muxplex's own DEFAULT_SETTINGS drives its `config` group. Unlike
+# muxplex's server settings, `server_url` has no real default (it's a
+# required field per `load_config`) -- "" here means "not configured".
+DEFAULT_CONFIG: dict = {
+    "server_url": "",
+    "key_file": DEFAULT_KEY_FILE,
+    "ca_file": "",
+    "poll_interval": DEFAULT_POLL_INTERVAL_SECONDS,
+    "sort": DEFAULT_SORT_MODE,
+    "focus_app": "",
+}
+
 
 class ConfigError(Exception):
     """Raised for any config problem. The message is written to stderr as-is."""
@@ -191,3 +205,63 @@ def load_config(config_path: str | None = None) -> Config:
         sort=sort,
         focus_app=focus_app.strip(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Raw config file access -- drives `muxplex-deck config` (list/get/set/reset)
+# ---------------------------------------------------------------------------
+#
+# These operate on the *unvalidated* JSON dict, unlike `load_config()` above
+# (which returns a fully-validated `Config`, fails loud on any problem, and
+# is what `run()` actually uses). The CLI's config commands intentionally
+# tolerate a missing/partial file -- `config list` on a fresh install should
+# show defaults, not crash -- mirroring muxplex's own
+# load_settings/save_settings/patch_settings pattern (defaults-merge-overlay,
+# known-keys-only filtering).
+
+
+def load_raw_config(config_path: str | None = None) -> dict:
+    """Load the config file, merging saved values over `DEFAULT_CONFIG`.
+
+    Returns `DEFAULT_CONFIG` (a copy) if the file does not exist or contains
+    corrupt JSON. Unknown keys in the file are ignored.
+    """
+    import copy
+
+    result = copy.deepcopy(DEFAULT_CONFIG)
+    path = _resolve_config_path(config_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            for key in DEFAULT_CONFIG:
+                if key in data:
+                    result[key] = data[key]
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return result
+
+
+def save_raw_config(data: dict, config_path: str | None = None) -> None:
+    """Save `data` to the config file, merging with `DEFAULT_CONFIG` first.
+
+    Only known keys are written; creates parent directories as needed.
+    """
+    import copy
+
+    merged = copy.deepcopy(DEFAULT_CONFIG)
+    for key in DEFAULT_CONFIG:
+        if key in data:
+            merged[key] = data[key]
+    path = _resolve_config_path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+
+
+def patch_raw_config(patch: dict, config_path: str | None = None) -> dict:
+    """Merge known keys from `patch` into the current config, save, and return the result."""
+    current = load_raw_config(config_path)
+    for key in DEFAULT_CONFIG:
+        if key in patch:
+            current[key] = patch[key]
+    save_raw_config(current, config_path)
+    return current
