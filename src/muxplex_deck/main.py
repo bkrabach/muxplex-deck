@@ -28,7 +28,9 @@ debounces the actual `PATCH /api/state` -- and dial 1 pages the current
 view locally (no server writes); see `.interaction` for both state
 machines. On a deck with neither (Original/MK2/XL/Mini), three reserved
 keys play those roles instead: VIEW (top-left; shows view + server, tap
-cycles views with the same debounce), PREV/NEXT (bottom corners; paging). All of this
+opens a paged view picker on the session-slot keys -- VIEW becomes BACK,
+PREV/NEXT page the list, tapping a view PATCHes the server-global
+`active_view`), PREV/NEXT (bottom corners; paging). All of this
 plus the poll loop's own GETs share one `MuxplexClient`, so every actual
 HTTP call (poll-loop GETs, a dial-0 commit's PATCH+refresh, a key press's
 connect) is serialized through `_ActiveRuntime.client_lock` -- dial/key
@@ -54,7 +56,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from . import attention, focus, layout, rendering, views
+from . import attention, focus, interaction, layout, rendering, views
 from .client import (
     AuthError,
     MuxplexClient,
@@ -380,9 +382,21 @@ class _ActiveRuntime:
         `mode` is passed in (rather than re-read) so a mode change between
         `repaint()`'s dispatch and here can't leave this method confused
         about which picker it's rendering.
+
+        FULL mode spreads the options across every key (the dial scrolls);
+        REDUCED mode shows them on the session-slot keys only, with the
+        reserved keys repurposed as BACK / PREV / NEXT (the picker's own
+        paging) -- see `_paint_reduced_picker`.
         """
         with self.paint_lock:
-            key_count = self.deck.key_count()
+            reduced = (
+                self.plan.mode == layout.MODE_REDUCED and self.plan.view_key is not None
+            )
+            page_size = (
+                max(1, self.plan.sessions_per_page)
+                if reduced
+                else self.deck.key_count()
+            )
             if mode == PickerMode.VIEW:
                 options = self.view_cycler.names()
                 current = self.active_view
@@ -395,13 +409,18 @@ class _ActiveRuntime:
             total = len(options)
             # ticks=0 is a pure re-clamp: keeps the stored window valid if
             # `total` shrank (e.g. a view was deleted) since it was last set.
-            start = self.picker.scroll(0, total=total, page_size=key_count)
-            window = options[start : start + key_count]
+            start = self.picker.scroll(0, total=total, page_size=page_size)
+            window = options[start : start + page_size]
             message = _build_picker_strip_message(
-                kind=kind, start=start, total=total, page_size=key_count
+                kind=kind, start=start, total=total, page_size=page_size
             )
             with self.deck:
-                self._paint_picker_keys(window, current)
+                if reduced:
+                    self._paint_reduced_picker(
+                        window, current, start=start, total=total, page_size=page_size
+                    )
+                else:
+                    self._paint_picker_keys(window, current)
                 if self.plan.use_strip and message != self.last_strip:
                     rendering.paint_status_strip(self.deck, message)
                     self.last_strip = message
@@ -427,6 +446,64 @@ class _ActiveRuntime:
                     rendering.render_picker_key(self.deck, label, current=is_current),
                 )
             self.last_key_state[index] = identity
+
+    def _paint_reduced_picker(
+        self,
+        window: list[str],
+        current: str,
+        *,
+        start: int,
+        total: int,
+        page_size: int,
+    ) -> None:
+        """Paint the reduced-layout picker: options on session slots, controls reserved.
+
+        The session-slot keys show the current window of options (one view
+        name per key, the active one marked with the same cyan border the
+        active session tile uses); the reserved keys are repurposed as
+        BACK (the VIEW key) and PREV/NEXT (the picker's own paging, with a
+        pN/M footer only when there is more than one page -- the same
+        convention the session grid's controls use). Same per-key diffing
+        as every other paint path.
+        """
+        for slot, key_index in enumerate(self.plan.session_slots):
+            label = window[slot] if slot < len(window) else None
+            is_current = label is not None and label == current
+            identity: object = None if label is None else ("picker", label, is_current)
+            if self.last_key_state[key_index] == identity:
+                continue
+            if label is None:
+                self.deck.set_key_image(
+                    key_index, rendering.render_empty_key(self.deck)
+                )
+            else:
+                self.deck.set_key_image(
+                    key_index,
+                    rendering.render_picker_key(self.deck, label, current=is_current),
+                )
+            self.last_key_state[key_index] = identity
+
+        page = start // page_size + 1
+        page_count = max(1, (total + page_size - 1) // page_size)
+        page_text = f"p{page}/{page_count}" if page_count > 1 else ""
+        specs: list[tuple[int | None, str, str, str]] = [
+            (self.plan.view_key, "VIEW", "< BACK", ""),
+            (self.plan.prev_key, "", "< PREV", page_text),
+            (self.plan.next_key, "", "NEXT >", page_text),
+        ]
+        for key_index, title, body, footer in specs:
+            if key_index is None:
+                continue
+            control_identity: object = ("control", title, body, footer)
+            if self.last_key_state[key_index] == control_identity:
+                continue
+            self.deck.set_key_image(
+                key_index,
+                rendering.render_control_key(
+                    self.deck, title=title, body=body, footer=footer
+                ),
+            )
+            self.last_key_state[key_index] = control_identity
 
     def _paint_keys(
         self, page_sessions: list[Session], active_session: str | None
@@ -561,12 +638,18 @@ class _ActiveRuntime:
         In FULL mode every key is a session slot (`classify_key` maps key N
         to slot N), so this is the pre-existing connect path unchanged. In
         REDUCED mode the reserved VIEW/PREV/NEXT keys perform their control
-        action and never connect. Picker mode (FULL mode only -- pickers
-        open via dial presses) takes priority: a tap selects an option.
+        action and never connect. Picker mode takes priority: in FULL mode
+        (pickers open via dial presses) a tap selects an option; in REDUCED
+        mode (the VIEW key opens the view picker) taps dispatch through the
+        pure `interaction.handle_picker_key` -- BACK cancels, PREV/NEXT
+        page, a view-slot tap selects.
         """
         mode = self.picker.mode
         if mode == PickerMode.VIEW:
-            self._select_view_option(key)
+            if self.plan.mode == layout.MODE_REDUCED and self.plan.view_key is not None:
+                self._handle_reduced_picker_key(key)
+            else:
+                self._select_view_option(key)
             return
         if mode == PickerMode.PAGE:
             self._select_page_option(key)
@@ -574,11 +657,12 @@ class _ActiveRuntime:
 
         kind, slot = layout.classify_key(self.plan, key)
         if kind == layout.KEY_VIEW:
-            # The dial-0 role on a key: each tap advances one view, with the
-            # same debounced commit a dial turn gets -- a quick multi-tap
-            # sends exactly one PATCH. The VIEW key echoes the candidate.
-            label = self.view_cycler.turn(1, self._commit_view)
-            logger.info("key[%d] VIEW pressed -> cycling to %r", key, label)
+            # Open the paged view picker (replaces the old tap-to-cycle):
+            # the session-slot keys become view choices, VIEW becomes BACK,
+            # PREV/NEXT page the list. Selection PATCHes the server-global
+            # `active_view` -- same effect a dial-0 pick has on the Deck+.
+            self.picker.press_view_dial()
+            logger.info("key[%d] VIEW pressed -> view picker opened", key)
             self.repaint()
             return
         if kind == layout.KEY_PREV:
@@ -664,6 +748,43 @@ class _ActiveRuntime:
         view = names[index]
         logger.info("view picker: key[%d] selected -> view %r", key, view)
         self._commit_view(view)
+        self.repaint()
+
+    def _handle_reduced_picker_key(self, key: int) -> None:
+        """Dispatch a key press while the reduced-layout view picker is open.
+
+        The *decision* (cancel/select/page/ignore) is the pure
+        `interaction.handle_picker_key`; this method only applies its side
+        effects. A selection PATCHes the server-global `active_view` (via
+        `_commit_view` -> `MuxplexClient.set_active_view`), so every device
+        watching this server -- other decks, the PWA -- follows on its next
+        poll, exactly like a session connect.
+        """
+        kind, slot = layout.classify_key(self.plan, key)
+        options = self.view_cycler.names()
+        result = interaction.handle_picker_key(
+            kind=kind,
+            slot=slot,
+            options=options,
+            window_start=self.picker.window_start,
+            page_size=max(1, self.plan.sessions_per_page),
+        )
+        if result.action == interaction.ACTION_CANCEL:
+            self.picker.exit()
+            logger.info("view picker: key[%d] BACK -> cancelled", key)
+        elif result.action == interaction.ACTION_SELECT and result.view is not None:
+            self.picker.exit()
+            logger.info("view picker: key[%d] selected -> view %r", key, result.view)
+            self._commit_view(result.view)
+        elif result.action == interaction.ACTION_PAGE:
+            self.picker.set_window(result.window_start)
+            logger.info(
+                "view picker: key[%d] page -> window start %d",
+                key,
+                result.window_start,
+            )
+        else:
+            logger.info("view picker: key[%d] pressed (empty slot, ignoring)", key)
         self.repaint()
 
     def _select_page_option(self, key: int) -> None:

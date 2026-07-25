@@ -18,8 +18,9 @@ Two layout modes:
   position* (computed from `key_layout` rows x cols, never hardcoded)
   for the roles the dials/strip played:
     * VIEW  = top-left     (index 0): shows the current view name +
-      server label (what the strip showed); a tap cycles views (dial-0's
-      role), debounced exactly like a dial turn.
+      server label (what the strip showed); a tap opens a paged view
+      picker on the session-slot keys (dial-0's picker role) -- VIEW
+      becomes BACK, PREV/NEXT page the list, tapping a view selects it.
     * PREV  = bottom-left  (index (rows-1)*cols): previous page.
     * NEXT  = bottom-right (index rows*cols-1): next page (dial-1's role).
   Every remaining key is a session tile in reading order, so
@@ -205,6 +206,6 @@ def describe_plan(plan: LayoutPlan) -> str:
         )
     return (
         f"reduced layout: {plan.sessions_per_page} session keys/page, "
-        f"key[{plan.view_key}]=VIEW (tap cycles), key[{plan.prev_key}]=PREV, "
+        f"key[{plan.view_key}]=VIEW (tap opens picker), key[{plan.prev_key}]=PREV, "
         f"key[{plan.next_key}]=NEXT" + ("" if not plan.use_strip else ", strip=status")
     )

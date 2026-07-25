@@ -33,8 +33,11 @@ from __future__ import annotations
 
 import math
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from enum import Enum
+
+from .layout import KEY_NEXT, KEY_PREV, KEY_VIEW
 
 DEFAULT_DEBOUNCE_SECONDS = 0.4
 
@@ -174,8 +177,7 @@ class Pager:
         """
         with self._lock:
             self._page_count = max(1, math.ceil(count / self.page_size))
-            if self._page > self._page_count:
-                self._page = self._page_count
+            self._page = min(self._page, self._page_count)
 
     def reset(self) -> None:
         """Back to page 1 -- called on every detected view change."""
@@ -291,9 +293,108 @@ class PickerController:
         this to keep the window valid before every repaint.
         """
         with self._lock:
-            max_start = (
-                0 if total <= page_size else ((total - 1) // page_size) * page_size
+            self._window_start = clamp_window_start(
+                self._window_start + ticks * page_size, total=total, page_size=page_size
             )
-            new_start = self._window_start + ticks * page_size
-            self._window_start = min(max(0, new_start), max_start)
             return self._window_start
+
+    def set_window(self, start: int) -> None:
+        """Set the scroll window directly (already-clamped values only).
+
+        Used by the reduced-layout key picker, whose paging math lives in
+        the pure `handle_picker_key` -- the value it supplies came through
+        `clamp_window_start`, and every repaint re-clamps via `scroll(0)`
+        anyway, so a stale value can never paint out of range.
+        """
+        with self._lock:
+            self._window_start = start
+
+
+def clamp_window_start(start: int, *, total: int, page_size: int) -> int:
+    """Clamp a picker scroll-window start to `[0, last page start]`.
+
+    The one home for the picker's window math, shared by
+    `PickerController.scroll` (dial-driven scrolling, FULL layout) and
+    `handle_picker_key` (key-driven paging, REDUCED layout).
+    """
+    max_start = 0 if total <= page_size else ((total - 1) // page_size) * page_size
+    return min(max(0, start), max_start)
+
+
+# --- Reduced-layout view picker (key-driven) ---------------------------------
+#
+# On dial-less decks the VIEW key opens a paged view picker on the session
+# grid itself: the session-slot keys show view names, the VIEW key becomes
+# BACK, and PREV/NEXT page the list. The *dispatch* -- what a physical key
+# press means while the picker is open -- is this pure function; `main.py`
+# owns the side effects (PATCH active_view, repaint) and `PickerController`
+# owns which picker is open.
+
+ACTION_CANCEL = "cancel"  # BACK key: close the picker, change nothing
+ACTION_SELECT = "select"  # a view was chosen: PATCH it (server-global), close
+ACTION_PAGE = "page"  # PREV/NEXT: move the window, stay open
+ACTION_IGNORE = "ignore"  # empty slot / unknown key: do nothing, stay open
+
+
+@dataclass(frozen=True)
+class PickerKeyResult:
+    """Outcome of one key press while the reduced-layout picker is open.
+
+    `view` is the chosen option's exact name (ACTION_SELECT only).
+    `window_start` is the (clamped) scroll window after this press --
+    unchanged except for ACTION_PAGE.
+    """
+
+    action: str
+    view: str | None = None
+    window_start: int = 0
+
+
+def handle_picker_key(
+    *,
+    kind: str,
+    slot: int | None,
+    options: Sequence[str],
+    window_start: int,
+    page_size: int,
+) -> PickerKeyResult:
+    """Pure dispatch: map a classified key press to a picker action.
+
+    Args:
+        kind: the key's role from `layout.classify_key` (KEY_VIEW is the
+            BACK key while the picker is open; KEY_PREV/KEY_NEXT page).
+        slot: the session-slot position from `classify_key` (option index
+            within the current window), or None for a reserved/unknown key.
+        options: the full option list (view names, in the same order the
+            rest of the app uses -- `ViewCycler.names()`).
+        window_start: the picker's current scroll-window start.
+        page_size: options per page (the layout's `sessions_per_page`).
+
+    Returns:
+        A `PickerKeyResult`; never raises, even for empty `options`.
+    """
+    page_size = max(1, page_size)
+    total = len(options)
+    window_start = clamp_window_start(window_start, total=total, page_size=page_size)
+
+    if kind == KEY_VIEW:
+        return PickerKeyResult(ACTION_CANCEL, window_start=window_start)
+    if kind == KEY_PREV:
+        new_start = clamp_window_start(
+            window_start - page_size, total=total, page_size=page_size
+        )
+        return PickerKeyResult(ACTION_PAGE, window_start=new_start)
+    if kind == KEY_NEXT:
+        new_start = clamp_window_start(
+            window_start + page_size, total=total, page_size=page_size
+        )
+        return PickerKeyResult(ACTION_PAGE, window_start=new_start)
+
+    if slot is None:
+        return PickerKeyResult(ACTION_IGNORE, window_start=window_start)
+    index = window_start + slot
+    if index >= total:
+        return PickerKeyResult(ACTION_IGNORE, window_start=window_start)
+    return PickerKeyResult(
+        ACTION_SELECT, view=options[index], window_start=window_start
+    )

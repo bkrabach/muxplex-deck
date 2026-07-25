@@ -30,7 +30,7 @@ from muxplex_deck.client import (
     View,
 )
 from muxplex_deck.device import DeckDevice, DialEventType
-from muxplex_deck.interaction import ViewCycler
+from muxplex_deck.interaction import PickerMode, ViewCycler
 from muxplex_deck.layout import MODE_FULL, MODE_REDUCED
 from muxplex_deck.main import _ActiveRuntime
 
@@ -281,11 +281,12 @@ class TestReducedRuntime:
         assert client.connect_event.wait(_WAIT_SECONDS)
         assert client.connected_names == ["session-12"]
 
-    def test_view_key_cycles_view_and_never_connects(self, reduced) -> None:
+    def test_view_key_opens_picker_and_never_connects(self, reduced) -> None:
         _deck, client, ctx = reduced
-        ctx.handle_key(0)  # VIEW tap -> next view after "all" is "focus"
-        assert client.view_patch_event.wait(_WAIT_SECONDS)
-        assert client.view_patches == ["focus"]
+        ctx.handle_key(0)  # VIEW tap -> opens the view picker (no cycle, no PATCH)
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert ctx.picker.window_start == 0
+        assert client.view_patches == []
         assert client.connected_names == []
 
     def test_page_resets_on_view_change(self, reduced) -> None:
@@ -295,6 +296,132 @@ class TestReducedRuntime:
         client.active_view = "focus"  # server-side view change (e.g. the PWA)
         ctx.refresh()
         assert ctx.pager.page == 1
+
+
+class TestReducedViewPicker:
+    """Reduced-layout paged view picker: VIEW opens, BACK cancels, tap selects."""
+
+    def _open_picker(self, ctx: _ActiveRuntime) -> None:
+        ctx.handle_key(0)
+        assert ctx.picker.mode == PickerMode.VIEW
+
+    def test_select_view_patches_global_active_view_and_exits(self, reduced) -> None:
+        _deck, client, ctx = reduced
+        self._open_picker(ctx)
+        # options are ["all", "focus"]; key 2 is session slot 1 -> "focus"
+        ctx.handle_key(2)
+        assert client.view_patches == ["focus"]  # PATCH /api/state active_view
+        assert ctx.picker.mode == PickerMode.NONE
+        assert client.connected_names == []  # a picker tap never connects
+
+    def test_back_key_cancels_without_patch(self, reduced) -> None:
+        _deck, client, ctx = reduced
+        self._open_picker(ctx)
+        ctx.handle_key(0)  # VIEW key is BACK while the picker is open
+        assert ctx.picker.mode == PickerMode.NONE
+        assert client.view_patches == []
+        assert client.connected_names == []
+
+    def test_picker_slots_show_views_with_active_highlighted(self, reduced) -> None:
+        _deck, _client, ctx = reduced
+        self._open_picker(ctx)
+        # session-slot keys 1 and 2 carry the two options; "all" is active
+        assert ctx.last_key_state[1] == ("picker", "all", True)
+        assert ctx.last_key_state[2] == ("picker", "focus", False)
+        assert ctx.last_key_state[3] is None  # empty option slot
+        # reserved keys repurposed: BACK on the VIEW key, pagers inert (1 page)
+        assert ctx.last_key_state[0] == ("control", "VIEW", "< BACK", "")
+        assert ctx.last_key_state[10] == ("control", "", "< PREV", "")
+        assert ctx.last_key_state[14] == ("control", "", "NEXT >", "")
+
+    def test_empty_option_slot_tap_ignored_keeps_picker_open(self, reduced) -> None:
+        _deck, client, ctx = reduced
+        self._open_picker(ctx)
+        ctx.handle_key(5)  # slot 4 -- past the 2 options
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert client.view_patches == []
+        assert client.connected_names == []
+
+    def test_poll_does_not_repaint_grid_over_picker(self, reduced) -> None:
+        _deck, _client, ctx = reduced
+        self._open_picker(ctx)
+        ctx.refresh()  # a poll tick while the picker is open
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert ctx.last_key_state[1] == ("picker", "all", True)  # still the picker
+
+    def test_grid_restored_after_cancel(self, reduced) -> None:
+        deck, _client, ctx = reduced
+        before = dict(deck.key_images)
+        self._open_picker(ctx)
+        assert deck.key_images != before  # picker painted over the grid
+        ctx.handle_key(0)  # BACK
+        assert deck.key_images == before  # exact same session tiles repainted
+
+
+MANY_VIEWS_SETTINGS = Settings(
+    # 15 named views + the implicit "all" = 16 options -> 2 picker pages of 12.
+    views=tuple(View(name=f"view-{i:02d}", sessions=frozenset()) for i in range(15)),
+    hidden_sessions=frozenset(),
+    sort_order="manual",
+)
+
+
+@pytest.fixture
+def reduced_many_views() -> tuple[FakeDeck, FakeClient, _ActiveRuntime]:
+    deck = FakeDeck(
+        key_count=15,
+        key_layout=(3, 5),
+        key_size=(72, 72),
+        dial_count=0,
+        is_touch=False,
+    )
+    client = FakeClient(_make_sessions(3), MANY_VIEWS_SETTINGS)
+    ctx = _make_runtime(deck, client)
+    ctx.refresh()
+    return deck, client, ctx
+
+
+class TestReducedViewPickerPaging:
+    """>12 views: PREV/NEXT page the picker window, clamped, reset on re-entry."""
+
+    def test_next_pages_and_second_page_maps_correct_names(
+        self, reduced_many_views
+    ) -> None:
+        _deck, client, ctx = reduced_many_views
+        ctx.handle_key(0)  # open picker: window 0 shows options[0:12]
+        assert ctx.last_key_state[1] == ("picker", "all", True)
+        ctx.handle_key(14)  # NEXT -> window 12 shows options[12:16]
+        assert ctx.picker.window_start == 12
+        # options = ["all"] + view-00..view-14; options[12] == "view-11"
+        assert ctx.last_key_state[1] == ("picker", "view-11", False)
+        assert ctx.last_key_state[4] == ("picker", "view-14", False)  # slot 3 = last
+        assert ctx.last_key_state[5] is None  # slot 4 -- past the end
+        # pagers show the picker's own page footer on page 2 of 2
+        assert ctx.last_key_state[14] == ("control", "", "NEXT >", "p2/2")
+        # slot tap on page 2 selects the right (windowed) view
+        ctx.handle_key(2)  # slot 1 -> options[13] == "view-12"
+        assert client.view_patches == ["view-12"]
+        assert ctx.picker.mode == PickerMode.NONE
+
+    def test_paging_clamps_at_both_ends(self, reduced_many_views) -> None:
+        _deck, client, ctx = reduced_many_views
+        ctx.handle_key(0)
+        ctx.handle_key(10)  # PREV on first page -- clamped
+        assert ctx.picker.window_start == 0
+        ctx.handle_key(14)  # NEXT -> second page
+        ctx.handle_key(14)  # NEXT again -- clamped at last page
+        assert ctx.picker.window_start == 12
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert client.view_patches == []
+
+    def test_reentering_picker_resets_to_first_page(self, reduced_many_views) -> None:
+        _deck, _client, ctx = reduced_many_views
+        ctx.handle_key(0)
+        ctx.handle_key(14)  # NEXT -> window 12
+        ctx.handle_key(0)  # BACK -> closed
+        ctx.handle_key(0)  # reopen
+        assert ctx.picker.window_start == 0
+        assert ctx.last_key_state[1] == ("picker", "all", True)
 
 
 class TestFullRuntime:
