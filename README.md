@@ -26,6 +26,32 @@ means the whole sidecar -- state machine, muxplex client, rendering,
 interaction flow -- can be developed and tested with zero hardware, on any
 machine, with no `hidapi` installed. See "Stream Deck+ emulator" below.
 
+## Quickstart (recommended)
+
+```sh
+uv tool install git+https://github.com/bkrabach/muxplex-deck
+muxplex-deck init https://your-server:8088
+muxplex-deck service install
+```
+
+`muxplex-deck init` is a turnkey setup wizard: it validates the server URL,
+auto-fetches the server's CA certificate when one is needed (no `scp`/SSH
+required -- and no risk of grabbing the *leaf* cert by mistake, a real
+gotcha this project has hit before), walks you through pasting the
+federation key, writes `config.json`, and re-verifies the server, CA, and
+Stream Deck before handing off. It's idempotent -- re-run it anytime;
+existing values become the defaults, nothing is clobbered.
+
+**`uv sync` is for developing this repo, not installing the tool.** It only
+builds `muxplex-deck`'s own `.venv` and does **not** put `muxplex-deck` on
+your `PATH` -- this exact confusion has already cost real setup time. Use
+`uv tool install` (above) to actually install and run the sidecar; reach
+for `uv sync` only if you're hacking on muxplex-deck's source.
+
+The manual/advanced setup (hand-editing `config.json`, `scp`-ing files
+yourself) is still documented further down for anyone who wants it --
+see "Service install walkthrough" and "muxplex sidecar" -> "Config" below.
+
 ## CLI
 
 `muxplex-deck` has the same command shape as its sibling `muxplex` server
@@ -82,8 +108,7 @@ reports both the udev rule and HID-openable status.
 
 ```sh
 uv tool install git+https://github.com/bkrabach/muxplex-deck
-muxplex-deck config set server_url https://<your-server>:8088
-muxplex-deck config set ca_file ~/.config/muxplex-deck/muxplex-ca.crt   # if using a local CA
+muxplex-deck init https://<your-server>:8088   # sets server_url, ca_file, federation key
 muxplex-deck doctor          # confirms config, key file, CA, and deck are all in order first
 muxplex-deck service install # writes the systemd user unit, enables linger, warns about udev if needed
 muxplex-deck service status
@@ -415,9 +440,13 @@ that silently skips auth or TLS verification.
 
 ### Getting the federation key onto the Mac
 
-The muxplex server already has a federation key generated
-(`~/.config/muxplex/federation_key` on the server, federation enabled).
-Copy it over:
+**Easiest:** `muxplex-deck init` (see "Quickstart" above) prompts you to
+paste the key directly -- no SSH access to the server required, and it's
+never echoed back or logged.
+
+**Manual method**, if you'd rather not use the wizard: the muxplex server
+already has a federation key generated (`~/.config/muxplex/federation_key`
+on the server, federation enabled). Copy it over:
 
 ```sh
 mkdir -p ~/.config/muxplex-deck

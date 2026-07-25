@@ -467,6 +467,59 @@ def check_hid_openable() -> tuple[str, str]:
     return "warn", f"HID: could not open device ({status['error']}).{hint}"
 
 
+def _is_tls_error(exc: Exception) -> bool:
+    """Best-effort detection of a TLS/certificate-verification failure.
+
+    httpx surfaces cert failures as a plain `httpx.ConnectError` with the
+    underlying SSL error text in the message -- there's no dedicated
+    exception type to catch, so string-sniffing is the only option. Shared
+    by `check_server_reachable` and the `init` wizard so both agree on what
+    counts as "this needs a CA file" versus "server is just unreachable".
+    """
+    msg = str(exc).lower()
+    return "certificate" in msg or "ssl" in msg
+
+
+def fetch_instance_info(server_url: str, *, verify: bool | str = True) -> dict:
+    """GET /api/instance-info and return the parsed JSON body.
+
+    Raises the underlying httpx exception on any failure (timeout, connect
+    error, non-2xx status) -- unlike `check_server_reachable`, this is a raw
+    data-fetch primitive for callers (like the `init` wizard) that need the
+    actual response fields (name, version, federation_enabled), not just a
+    doctor-style (status, message) verdict.
+    """
+    import httpx
+
+    url = f"{server_url.rstrip('/')}/api/instance-info"
+    with httpx.Client(verify=verify, timeout=5.0) as client:
+        resp = client.get(url)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_ca_cert(server_url: str) -> bytes | None:
+    """GET /api/ca (TLS verification disabled for this one bootstrap fetch).
+
+    A CA public certificate is a trust anchor, not a secret -- disabling
+    verification only for this single unauthenticated request is safe and
+    is what makes self-serving the CA possible at all (the chicken-and-egg
+    problem: you can't verify the server until you have its CA). Returns
+    the raw cert bytes on 200, or None on 404 (the server has no local CA
+    to expose -- e.g. it uses Tailscale/mkcert/a publicly trusted cert,
+    which is fine). Any other HTTP or network error is raised.
+    """
+    import httpx
+
+    url = f"{server_url.rstrip('/')}/api/ca"
+    with httpx.Client(verify=False, timeout=5.0) as client:
+        resp = client.get(url)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.content
+
+
 def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, str]:
     """GET /api/instance-info -- the one public, unauthenticated endpoint."""
     if not server_url:
@@ -475,12 +528,8 @@ def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, 
     import httpx
 
     verify: bool | str = str(ca_file) if ca_file else True
-    url = f"{server_url.rstrip('/')}/api/instance-info"
     try:
-        with httpx.Client(verify=verify, timeout=5.0) as client:
-            resp = client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
+        data = fetch_instance_info(server_url, verify=verify)
         return (
             "ok",
             f"Server reachable: {data.get('name', '?')} (muxplex {data.get('version', '?')})",
@@ -488,8 +537,7 @@ def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, 
     except httpx.TimeoutException as exc:
         return "warn", f"Server check timed out: {exc}"
     except httpx.ConnectError as exc:
-        msg = str(exc)
-        if "certificate" in msg.lower() or "ssl" in msg.lower():
+        if _is_tls_error(exc):
             return "warn", (
                 f"TLS verification failed: {exc} -- check ca_file points at "
                 "the server's CA, not its leaf certificate"
@@ -532,13 +580,28 @@ def check_service_status() -> tuple[str, str]:
     return "warn", "Service: not installed -- run: muxplex-deck service install"
 
 
+_CHECK_MARKS: dict[str, str] = {
+    "ok": "\033[32m\u2713\033[0m",
+    "fail": "\033[31m\u2717\033[0m",
+    "warn": "\033[33m!\033[0m",
+}
+
+
+def print_check(status: str, message: str) -> None:
+    """Print one doctor-style check line: colored mark, 2-space indent.
+
+    Continuation lines (multi-line messages) are indented 4 spaces with no
+    mark. Shared by `doctor()` and the `init` wizard so both surfaces present
+    checks identically.
+    """
+    mark = _CHECK_MARKS.get(status, _CHECK_MARKS["warn"])
+    for i, line in enumerate(message.splitlines()):
+        prefix = f"  {mark} " if i == 0 else "    "
+        print(f"{prefix}{line}")
+
+
 def doctor(config_path: str | None = None) -> int:
     """Run diagnostic checks and report system status. Always returns 0 (informational)."""
-    ok_mark = "\033[32m\u2713\033[0m"
-    fail_mark = "\033[31m\u2717\033[0m"
-    warn_mark = "\033[33m!\033[0m"
-    marks = {"ok": ok_mark, "fail": fail_mark, "warn": warn_mark}
-
     print("\nmuxplex-deck doctor\n")
 
     checks: list[tuple[str, str]] = []
@@ -569,10 +632,7 @@ def doctor(config_path: str | None = None) -> int:
     checks.append(check_service_status())
 
     for status, message in checks:
-        mark = marks.get(status, warn_mark)
-        for i, line in enumerate(message.splitlines()):
-            prefix = f"  {mark} " if i == 0 else "    "
-            print(f"{prefix}{line}")
+        print_check(status, message)
 
     print()
     return 0
@@ -778,6 +838,22 @@ def main() -> None:
         help="Update muxplex-deck to the latest version and restart the service",
     )
 
+    init_parser = sub.add_parser(
+        "init",
+        help="Interactive setup wizard: server URL, CA certificate, federation key",
+    )
+    init_parser.add_argument(
+        "server_url",
+        nargs="?",
+        default=None,
+        help="muxplex server URL, e.g. https://your-server:8088 (prompted if omitted)",
+    )
+    init_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Fail with a clear message instead of prompting when input is needed (for scripting)",
+    )
+
     config_parser = sub.add_parser("config", help="View and manage config")
     config_sub = config_parser.add_subparsers(dest="config_command")
     config_sub.add_parser("list", help="Show all config keys (default)")
@@ -821,6 +897,16 @@ def main() -> None:
         doctor(getattr(args, "config", None))
     elif args.command in ("update", "upgrade"):
         update()
+    elif args.command == "init":
+        from .init_wizard import run_init  # noqa: PLC0415
+
+        sys.exit(
+            run_init(
+                getattr(args, "config", None),
+                getattr(args, "server_url", None),
+                non_interactive=getattr(args, "non_interactive", False),
+            )
+        )
     elif args.command == "config":
         config_path = getattr(args, "config", None)
         cmd = getattr(args, "config_command", None)
