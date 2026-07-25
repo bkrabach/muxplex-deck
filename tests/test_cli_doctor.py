@@ -354,6 +354,63 @@ class TestCheckDeckDetectedAndHidOpenable:
         status, message = cli.check_hid_openable()
         assert status == "ok"
 
+    def test_no_device_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _FakeManager(None)
+        )
+        status, message = cli.check_hid_openable()
+        assert status == "warn"
+        assert "no Stream Deck detected" in message
+
+    def test_open_fails_but_our_own_service_is_running_is_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exclusive HID access: once our service holds the device, a second
+
+        open() attempt (this very check) is EXPECTED to fail -- that must be
+        reported as ok, not a warning, and must be keyed off service state
+        (not the error string, which is unverifiable across platforms).
+        """
+        import muxplex_deck.device_real as device_real_mod
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=False)),
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        status, message = cli.check_hid_openable()
+        assert status == "ok"
+        assert "in use by the muxplex-deck service" in message
+        assert "expected" in message
+
+    def test_open_fails_and_service_not_running_is_unchanged_warn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without our own service holding it, a failed open is a genuine
+
+        HID-permission problem -- behavior here must be byte-for-byte the
+        pre-existing warn + udev hint, not silently downgraded.
+        """
+        import muxplex_deck.device_real as device_real_mod
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=False)),
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        status, message = cli.check_hid_openable()
+        assert status == "warn"
+        assert "could not open device" in message
+        assert "service install" in message
+
 
 # ---------------------------------------------------------------------------
 # check_server_reachable

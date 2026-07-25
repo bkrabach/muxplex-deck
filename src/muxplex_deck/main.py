@@ -72,6 +72,7 @@ from .device import (
     TouchscreenEventType,
 )
 from .interaction import Pager, PickerController, PickerMode, ViewCycler
+from .statusfile import StatusReporter
 
 logger = logging.getLogger("muxplex_deck")
 
@@ -825,6 +826,26 @@ def _on_touch(_deck: DeckDevice, event_type: TouchscreenEventType, value: dict) 
     logger.info("touch %s %r (unassigned in v1)", event_type, value)
 
 
+def _describe_deck_caps(deck: DeckDevice) -> dict | None:
+    """Best-effort capability dict for the status file (never fatal).
+
+    Same shape `deck_probe.capabilities.describe_capabilities` produces
+    (model, serial, firmware, key_count, key_rows/cols, dial_count,
+    has_touchscreen, is_visual, ...) -- both production `DeckDevice`
+    backends (`RealDeckDevice`, `EmulatorDevice`) satisfy the wider
+    `DeckCapabilitySource` protocol it needs (see
+    `test_device_protocol_contract.py`). A failure here must never take
+    down the active session -- it only degrades what `status` can show.
+    """
+    try:
+        from deck_probe.capabilities import describe_capabilities  # noqa: PLC0415
+
+        return describe_capabilities(deck)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("failed to describe deck capabilities for status file")
+        return None
+
+
 def _run_active(
     deck: DeckDevice,
     client: MuxplexClient,
@@ -833,6 +854,7 @@ def _run_active(
     hostname: str,
     sort_mode: str,
     focus_app_name: str,
+    reporter: StatusReporter,
 ) -> None:
     """Run one connected-device session against the muxplex server.
 
@@ -853,6 +875,8 @@ def _run_active(
     ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name)
     logger.info("%s", layout.describe_plan(ctx.plan))
     _paint_status_only(deck, "connecting to muxplex...", ctx.plan)
+
+    reporter.update(device_connected=True, device_caps=_describe_deck_caps(deck))
 
     deck.set_key_callback(_make_key_callback(ctx))
     if ctx.plan.use_dials:
@@ -883,6 +907,7 @@ def _run_active(
             try:
                 ctx.refresh()
             except AuthError as exc:
+                reporter.update(server_connected=False, last_error=str(exc))
                 logger.critical(
                     "muxplex auth rejected -- check the federation key file: %s", exc
                 )
@@ -894,6 +919,7 @@ def _run_active(
                     return
                 continue
             except UnreachableError as exc:
+                reporter.update(server_connected=False, last_error=str(exc))
                 logger.warning(
                     "muxplex unreachable: %s -- retrying in %.0fs", exc, backoff
                 )
@@ -907,7 +933,8 @@ def _run_active(
                     return
                 backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
                 continue
-            except MuxplexError:
+            except MuxplexError as exc:
+                reporter.update(server_connected=False, last_error=str(exc))
                 logger.exception(
                     "unexpected muxplex API error; treating as unreachable"
                 )
@@ -922,9 +949,20 @@ def _run_active(
 
             backoff = INITIAL_BACKOFF_SECONDS
             shown_error_state = None
+            reporter.update(
+                server_connected=True,
+                last_poll_at=time.time(),
+                last_error=None,
+                active_session=ctx.active_session,
+                active_view=ctx.active_view,
+                page=ctx.pager.page,
+            )
             if _interruptible_wait(deck, shutting_down, poll_interval):
                 return
     finally:
+        reporter.update(
+            device_connected=False, device_caps=None, server_connected=False
+        )
         _safe_close(deck)
 
 
@@ -947,6 +985,11 @@ def run(config: Config, manager: DeviceManager) -> int:
     logged_waiting = False
     last_heartbeat = 0.0
 
+    # Published for `muxplex-deck status` to read -- see `.statusfile`'s
+    # docstring for why a running sidecar publishes its own status instead
+    # of `status` probing the (possibly exclusively-held) device directly.
+    reporter = StatusReporter(config.server_url)
+
     logger.info("muxplex-deck starting (server=%s)", config.server_url)
     try:
         while not shutting_down.is_set():
@@ -960,6 +1003,9 @@ def run(config: Config, manager: DeviceManager) -> int:
                 continue
 
             if deck is None:
+                reporter.update(
+                    device_connected=False, device_caps=None, server_connected=False
+                )
                 now = time.monotonic()
                 if not logged_waiting:
                     logger.info(
@@ -994,9 +1040,13 @@ def run(config: Config, manager: DeviceManager) -> int:
                         hostname,
                         config.sort,
                         config.focus_app,
+                        reporter,
                     )
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")
+                reporter.update(
+                    device_connected=False, device_caps=None, server_connected=False
+                )
                 _safe_close(deck)
                 shutting_down.wait(DEVICE_POLL_SECONDS)
     finally:

@@ -12,6 +12,11 @@ Ported near 1:1 from muxplex's own `service.py` (see that repo's
    run via ``sudo``), so `service_install()` warns loudly with a
    copy-pasteable remediation block when no matching rule exists, rather
    than silently installing a service that will fail to open the device.
+
+`service_install()`/`service_uninstall()` narrate every step they take
+(unit/plist path, enable/start, resulting status) using the same ✓/!
+2-space-indent style as `cli.doctor()` -- a silent success path left a real
+user unsure whether `service install` had done anything at all.
 """
 
 from __future__ import annotations
@@ -104,6 +109,20 @@ _UDEV_REMEDIATION = f"""\
     Then unplug and replug the Stream Deck (or re-run `usbipd attach` under WSL).
 """
 
+# Same ✓/! 2-space-indent style as `cli.doctor()`'s `print_check` -- kept as
+# a small local duplicate (rather than importing from `cli.py`) to avoid a
+# circular import: `cli.py` already imports from this module at call time.
+_MARK_OK = "\033[32m\u2713\033[0m"
+_MARK_WARN = "\033[33m!\033[0m"
+
+
+def _step_ok(message: str) -> None:
+    print(f"  {_MARK_OK} {message}")
+
+
+def _step_warn(message: str) -> None:
+    print(f"  {_MARK_WARN} {message}")
+
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -187,6 +206,39 @@ def _warn_if_no_udev_rule() -> None:
         print(_UDEV_REMEDIATION)
 
 
+def service_is_active() -> bool:
+    """Best-effort: is the muxplex-deck service currently active/running?
+
+    Public (moved here from `cli._service_is_active`) so both `cli.update()`
+    and `cli.check_hid_openable()` share one implementation -- the latter
+    needs it to distinguish "our own service holds the device" (expected,
+    not a failure) from a genuine HID-permission problem. Never raises:
+    a missing service manager or a not-installed service both read as
+    "not active", which is the correct doctor/status answer either way.
+    """
+    if _is_darwin():
+        uid = os.getuid()
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return False
+        return result.returncode == 0
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "muxplex-deck"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
 def _enable_linger() -> None:
     """Best-effort `loginctl enable-linger` so the service survives logout.
 
@@ -215,7 +267,17 @@ def _enable_linger() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _print_next_steps() -> None:
+    print()
+    print("  Next:")
+    print("    muxplex-deck status        -- see connected hardware + connection state")
+    print("    muxplex-deck service logs  -- tail live logs")
+    print()
+
+
 def _systemd_install() -> None:
+    print("\nmuxplex-deck service install (systemd --user)\n")
+
     bin_path = _resolve_muxplex_deck_bin()
     safe_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     exec_start = f"{bin_path} run"
@@ -224,19 +286,53 @@ def _systemd_install() -> None:
     )
     _SYSTEMD_UNIT_DIR.mkdir(parents=True, exist_ok=True)
     _SYSTEMD_UNIT_PATH.write_text(unit_content)
+    _step_ok(f"Wrote unit file: {_SYSTEMD_UNIT_PATH}")
+
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    _step_ok("Reloaded the systemd user daemon")
+
     subprocess.run(
         ["systemctl", "--user", "enable", "--now", "muxplex-deck"], check=True
     )
+    _step_ok("Enabled + started the service")
+
     _enable_linger()
     _warn_if_no_udev_rule()
 
+    if service_is_active():
+        _step_ok("Service is running")
+    else:
+        _step_warn(
+            "Service was started but is not reporting active -- check: "
+            "muxplex-deck service logs"
+        )
+
+    _print_next_steps()
+
 
 def _systemd_uninstall() -> None:
-    subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"])
+    print("\nmuxplex-deck service uninstall (systemd --user)\n")
+
+    result = subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"])
+    if result.returncode == 0:
+        _step_ok("Stopped the service")
+    else:
+        _step_warn("Service was not running (nothing to stop)")
+
     subprocess.run(["systemctl", "--user", "disable", "muxplex-deck"])
+    _step_ok("Disabled the service")
+
+    had_unit = _SYSTEMD_UNIT_PATH.exists()
     _SYSTEMD_UNIT_PATH.unlink(missing_ok=True)
+    _step_ok(
+        f"Removed unit file: {_SYSTEMD_UNIT_PATH}"
+        if had_unit
+        else "Unit file already absent"
+    )
+
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    _step_ok("Reloaded the systemd user daemon")
+    print()
 
 
 def _systemd_start() -> None:
@@ -268,6 +364,8 @@ def _systemd_logs() -> None:
 
 
 def _launchd_install() -> None:
+    print("\nmuxplex-deck service install (launchd)\n")
+
     bin_args = _resolve_bin_for_launchd()
     argv = [*bin_args, "run"]
     # Each argv token is its own <string> element. launchd does NOT
@@ -283,16 +381,43 @@ def _launchd_install() -> None:
     )
     _LAUNCHD_PLIST_DIR.mkdir(parents=True, exist_ok=True)
     _LAUNCHD_PLIST_PATH.write_text(plist_content)
+    _step_ok(f"Wrote plist: {_LAUNCHD_PLIST_PATH}")
+
     uid = os.getuid()
     subprocess.run(
         ["launchctl", "bootstrap", f"gui/{uid}", str(_LAUNCHD_PLIST_PATH)], check=True
     )
+    _step_ok("Loaded + started the service (launchctl bootstrap)")
+
+    if service_is_active():
+        _step_ok("Service is running")
+    else:
+        _step_warn(
+            "Service was started but is not reporting active -- check: "
+            "muxplex-deck service logs"
+        )
+
+    _print_next_steps()
 
 
 def _launchd_uninstall() -> None:
+    print("\nmuxplex-deck service uninstall (launchd)\n")
+
     uid = os.getuid()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"])
+    result = subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"])
+    if result.returncode == 0:
+        _step_ok("Stopped + unloaded the service")
+    else:
+        _step_warn("Service was not loaded (nothing to unload)")
+
+    had_plist = _LAUNCHD_PLIST_PATH.exists()
     _LAUNCHD_PLIST_PATH.unlink(missing_ok=True)
+    _step_ok(
+        f"Removed plist: {_LAUNCHD_PLIST_PATH}"
+        if had_plist
+        else "Plist file already absent"
+    )
+    print()
 
 
 def _launchd_start() -> None:

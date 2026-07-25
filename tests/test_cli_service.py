@@ -309,6 +309,226 @@ class TestUdevRuleDetection:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# service_is_active
+# ---------------------------------------------------------------------------
+
+
+class TestServiceIsActive:
+    def test_systemd_active_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0),
+        )
+        assert service_mod.service_is_active() is True
+
+    def test_systemd_active_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(3),
+        )
+        assert service_mod.service_is_active() is False
+
+    def test_launchd_active_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0),
+        )
+        assert service_mod.service_is_active() is True
+
+    def test_missing_service_manager_is_false_not_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+
+        def _raise(*a: Any, **k: Any) -> Any:
+            raise FileNotFoundError("no systemctl")
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _raise)
+        assert service_mod.service_is_active() is False
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+# ---------------------------------------------------------------------------
+# Narration -- service install/uninstall must print step-by-step progress,
+# not succeed silently (a real user reported `service install` gave no
+# feedback at all).
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdInstallNarration:
+    def test_install_narrates_every_step(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod, "_SYSTEMD_UNIT_DIR", tmp_path / "systemd" / "user"
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_SYSTEMD_UNIT_PATH",
+            tmp_path / "systemd" / "user" / "muxplex-deck.service",
+        )
+        monkeypatch.setattr(
+            service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
+        )
+        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
+        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        service_mod._systemd_install()
+
+        out = capsys.readouterr().out
+        assert "service install (systemd" in out
+        assert "Wrote unit file" in out
+        assert "Reloaded the systemd user daemon" in out
+        assert "Enabled + started the service" in out
+        assert "Service is running" in out
+        assert "muxplex-deck status" in out
+        assert "muxplex-deck service logs" in out
+
+    def test_install_warns_when_not_reporting_active(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod, "_SYSTEMD_UNIT_DIR", tmp_path / "systemd" / "user"
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_SYSTEMD_UNIT_PATH",
+            tmp_path / "systemd" / "user" / "muxplex-deck.service",
+        )
+        monkeypatch.setattr(
+            service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
+        )
+        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
+        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+
+        service_mod._systemd_install()
+
+        out = capsys.readouterr().out
+        assert "not reporting active" in out
+
+
+class TestSystemdUninstallNarration:
+    def test_uninstall_narrates_every_step(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        unit_path = tmp_path / "muxplex-deck.service"
+        unit_path.write_text("[Unit]\n")
+        monkeypatch.setattr(service_mod, "_SYSTEMD_UNIT_PATH", unit_path)
+
+        service_mod._systemd_uninstall()
+
+        out = capsys.readouterr().out
+        assert "service uninstall (systemd" in out
+        assert "Stopped the service" in out
+        assert "Disabled the service" in out
+        assert "Removed unit file" in out
+        assert "Reloaded the systemd user daemon" in out
+        assert not unit_path.exists()
+
+    def test_uninstall_reports_not_running_gracefully(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        unit_path = tmp_path / "muxplex-deck.service"
+        monkeypatch.setattr(service_mod, "_SYSTEMD_UNIT_PATH", unit_path)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:3] == ["systemctl", "--user", "stop"]:
+                return _FakeCompletedProcess(1)
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        service_mod._systemd_uninstall()
+
+        out = capsys.readouterr().out
+        assert "not running (nothing to stop)" in out
+        assert "already absent" in out
+
+
+class TestLaunchdInstallNarration:
+    def test_install_narrates_every_step(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_DIR", tmp_path)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_PLIST_PATH", tmp_path / "com.muxplex-deck.plist"
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_resolve_bin_for_launchd",
+            lambda: ["/opt/homebrew/bin/muxplex-deck"],
+        )
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        service_mod._launchd_install()
+
+        out = capsys.readouterr().out
+        assert "service install (launchd)" in out
+        assert "Wrote plist" in out
+        assert "Loaded + started the service" in out
+        assert "Service is running" in out
+        assert "muxplex-deck status" in out
+        assert "muxplex-deck service logs" in out
+
+
+class TestLaunchdUninstallNarration:
+    def test_uninstall_narrates_every_step(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        plist_path = tmp_path / "com.muxplex-deck.plist"
+        plist_path.write_text("<plist></plist>\n")
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_PATH", plist_path)
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+
+        service_mod._launchd_uninstall()
+
+        out = capsys.readouterr().out
+        assert "service uninstall (launchd)" in out
+        assert "Stopped + unloaded the service" in out
+        assert "Removed plist" in out
+        assert not plist_path.exists()
+
+
 class TestUnsupportedPlatform:
     def test_service_install_reports_clear_error(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

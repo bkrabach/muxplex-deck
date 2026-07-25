@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -225,7 +227,6 @@ def _get_install_info() -> dict:
     Same shape/logic as muxplex's own `_get_install_info()`, targeting the
     `muxplex-deck` distribution instead.
     """
-    import json
     from importlib.metadata import PackageNotFoundError, distribution
 
     info: dict = {"source": "unknown", "version": "0.0.0", "commit": None, "url": None}
@@ -440,11 +441,24 @@ def check_deck_detected(config_path: str | None = None) -> tuple[str, str]:
 
 
 def check_hid_openable() -> tuple[str, str]:
-    """Whether the detected Stream Deck can actually be opened (HID permission)."""
+    """Whether the detected Stream Deck can actually be opened (HID permission).
+
+    HID access is exclusive: once the muxplex-deck *service* is running, it
+    holds the device's handle for the whole time it's active, so ANY second
+    process (including this very check) will fail to open it -- that is
+    correct, expected behavior, not a bug. The robust way to tell "someone
+    else has it because our own service is healthy" apart from a genuine
+    permission problem is to check SERVICE STATE, not the open() error text:
+    hidapi/libusb error strings vary by platform, library version, and
+    locale, so pattern-matching on them is unreliable and unverifiable
+    without hardware on every platform. Do NOT "fix" this back into a plain
+    warning by reintroducing string-matching -- that regresses the exact
+    false-positive this check exists to avoid.
+    """
     try:
         from .device import DeviceProbeError  # noqa: PLC0415
         from .device_real import RealDeviceManager  # noqa: PLC0415
-        from .service import udev_rule_exists  # noqa: PLC0415
+        from .service import service_is_active, udev_rule_exists  # noqa: PLC0415
     except ImportError as exc:
         return "warn", f"Could not import Stream Deck backend: {exc}"
 
@@ -458,6 +472,12 @@ def check_hid_openable() -> tuple[str, str]:
         return "warn", "n/a -- no Stream Deck detected"
     if status["openable"]:
         return "ok", "HID: device opened successfully"
+
+    # Open failed. Check service state BEFORE treating this as an error --
+    # see the docstring above for why this must key off service state, not
+    # the error string.
+    if service_is_active():
+        return "ok", "HID: device in use by the muxplex-deck service (expected)"
 
     hint = ""
     if sys.platform not in ("darwin", "win32") and not udev_rule_exists():
@@ -639,6 +659,132 @@ def doctor(config_path: str | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# status -- hardware + connection view, read from the running sidecar's
+# published status file (see .statusfile). Never contends with the sidecar
+# for the exclusive HID handle: `doctor`'s check_hid_openable() probes the
+# device directly and can produce an expected false failure once the
+# service holds it (see that function's docstring); `status` avoids the
+# problem entirely by reading what the running process already knows.
+# ---------------------------------------------------------------------------
+
+# A "small multiple" of the sidecar's default 2s poll interval -- generous
+# enough to absorb scheduling jitter, but tight enough that a genuinely
+# stuck/dead sidecar is flagged well before a human would otherwise notice.
+_STATUS_STALE_THRESHOLD_SECONDS = 15.0
+
+
+def _format_device_line(device: dict[str, Any]) -> tuple[str, str]:
+    if not device.get("connected"):
+        return "warn", "Device: not connected"
+    caps = device.get("capabilities") or {}
+    if not caps:
+        return "ok", "Device: connected (capabilities unavailable)"
+    touchscreen = "yes" if caps.get("has_touchscreen") else "no"
+    return "ok", (
+        f"Device: {caps.get('model', '?')} -- {caps.get('key_count', '?')} keys "
+        f"({caps.get('key_rows', '?')}x{caps.get('key_cols', '?')}), "
+        f"{caps.get('dial_count', '?')} dials, touchscreen={touchscreen}"
+    )
+
+
+def _format_server_line(server: dict[str, Any]) -> tuple[str, str]:
+    url = server.get("url") or "(not configured)"
+    if server.get("connected"):
+        return "ok", f"Server: {url} (reachable)"
+    err = server.get("last_error")
+    message = f"Server: {url} (unreachable)"
+    if err:
+        message += f" -- {err}"
+    return "warn", message
+
+
+def _format_state_line(state: dict[str, Any]) -> str:
+    session = state.get("active_session") or "none"
+    view = state.get("active_view") or "all"
+    page = state.get("page")
+    page_text = str(page) if page is not None else "-"
+    return f"Active session: {session} | view: {view} | page: {page_text}"
+
+
+def _print_direct_probe(config_path: str | None) -> None:
+    """Fallback when the service isn't running -- nothing holds the device."""
+    print_check(*check_deck_detected(config_path))
+
+
+def status(config_path: str | None = None, *, as_json: bool = False) -> int:
+    """Print the sidecar's hardware + connection status.
+
+    Reads the status file the running sidecar publishes (see
+    `.statusfile`) rather than probing the device directly -- HID access is
+    exclusive, so a direct probe would produce a false "could not open"
+    failure whenever the service is healthy and already holds the device
+    (exactly the false-failure `check_hid_openable` now also avoids). When
+    the service is NOT running, nothing holds the device, so it's safe to
+    fall back to a direct probe -- this keeps `status` useful even before
+    the service has ever been installed.
+    """
+    from .service import service_is_active  # noqa: PLC0415
+    from .statusfile import read_status  # noqa: PLC0415
+
+    running = service_is_active()
+    data = read_status()
+
+    if as_json:
+        payload: dict[str, Any] = {"service_running": running, "status": data}
+        print(json.dumps(payload, indent=2))
+        return 0 if data is not None else 1
+
+    print("\nmuxplex-deck status\n")
+    print_check(
+        "ok" if running else "warn",
+        f"Service: {'running' if running else 'not running'}",
+    )
+
+    if not running:
+        if data is None:
+            print_check(
+                "warn",
+                "No status file found -- probing the device directly instead "
+                "(safe: nothing holds it while the service is stopped).",
+            )
+        else:
+            print_check(
+                "warn",
+                "Service not running -- probing the device directly instead "
+                "of trusting the (possibly stale) status file.",
+            )
+        _print_direct_probe(config_path)
+        print()
+        return 0
+
+    if data is None:
+        print_check(
+            "warn",
+            "No status file found even though the service is running -- it "
+            "may have just started. Try: muxplex-deck service logs",
+        )
+        print()
+        return 0
+
+    age = time.time() - data.get("updated_at", 0)
+    if age > _STATUS_STALE_THRESHOLD_SECONDS:
+        print_check(
+            "warn",
+            f"Status file is stale (last updated {age:.0f}s ago) -- the "
+            "sidecar may be stuck. Try: muxplex-deck service logs",
+        )
+    else:
+        print_check("ok", f"Status updated {age:.0f}s ago (pid {data.get('pid', '?')})")
+
+    print_check(*_format_device_line(data.get("device", {})))
+    print_check(*_format_server_line(data.get("server", {})))
+    print_check("ok", _format_state_line(data.get("state", {})))
+
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # update / upgrade
 # ---------------------------------------------------------------------------
 
@@ -691,23 +837,18 @@ def _find_pip() -> str | None:
 
 
 def _service_is_active() -> bool:
-    """Best-effort: is the muxplex-deck service currently running?"""
-    if sys.platform == "darwin":
-        import os
+    """Best-effort: is the muxplex-deck service currently running?
 
-        uid = os.getuid()
-        result = subprocess.run(
-            ["launchctl", "print", f"gui/{uid}/com.muxplex-deck"],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
-    result = subprocess.run(
-        ["systemctl", "--user", "is-active", "muxplex-deck"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+    Thin wrapper around `service.service_is_active` -- the real
+    implementation now lives there (shared with `check_hid_openable`, which
+    needs it to tell "our own service holds the device" apart from a
+    genuine HID-permission failure). Kept as a module-level name here so
+    existing call sites/tests can monkeypatch `cli._service_is_active`
+    directly without needing to know it delegates.
+    """
+    from .service import service_is_active  # noqa: PLC0415
+
+    return service_is_active()
 
 
 def update() -> None:
@@ -832,6 +973,13 @@ def main() -> None:
 
     sub.add_parser("doctor", help="Check dependencies and system status")
 
+    status_parser = sub.add_parser(
+        "status", help="Show connected hardware + connection state"
+    )
+    status_parser.add_argument(
+        "--json", action="store_true", help="Emit raw status as JSON"
+    )
+
     sub.add_parser(
         "update",
         aliases=["upgrade"],
@@ -895,6 +1043,10 @@ def main() -> None:
         print_version()
     elif args.command == "doctor":
         doctor(getattr(args, "config", None))
+    elif args.command == "status":
+        sys.exit(
+            status(getattr(args, "config", None), as_json=getattr(args, "json", False))
+        )
     elif args.command in ("update", "upgrade"):
         update()
     elif args.command == "init":

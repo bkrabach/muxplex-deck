@@ -72,6 +72,7 @@ Linux, launchd on macOS), `doctor`, `update`, and `version`. Bare
 | `muxplex-deck service start` / `stop` / `restart` | Control the service |
 | `muxplex-deck service status` | Show service status |
 | `muxplex-deck service logs` | Tail service logs |
+| `muxplex-deck status` / `status --json` | Show connected hardware, server reachability, and active session/view/page -- read from the running sidecar's published status, so it never contends with a running service for the (exclusive) HID handle |
 | `muxplex-deck doctor` | Check Python version, install source, config, federation key permissions, `ca_file` validity, Stream Deck detection, HID openability, server reachability, and service status |
 | `muxplex-deck update` (alias `upgrade`) | Update to the latest `main` and restart the service |
 | `muxplex-deck version` / `--version` | Show the installed version |
