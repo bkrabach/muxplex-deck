@@ -255,6 +255,51 @@ class TestProbeDeckStatus:
         assert "usb bus error" in result["error"]
 
 
+# ---------------------------------------------------------------------------
+# Regression: describe_capabilities() calls is_visual()/touch_key_count()/
+# vendor_id()/product_id() -- RealDeckDevice didn't implement them, so any
+# real Stream Deck+ crashed `muxplex-deck doctor` with an AttributeError.
+# This exercises the exact probe_deck_status -> describe_capabilities path
+# check_deck_detected uses, and pins that EVERY key the capability dict
+# promises actually comes back populated -- not just "caps is not None".
+# ---------------------------------------------------------------------------
+
+_EXPECTED_CAPABILITY_KEYS = {
+    "model",
+    "serial",
+    "firmware",
+    "vendor_id",
+    "product_id",
+    "key_count",
+    "key_rows",
+    "key_cols",
+    "key_image_size",
+    "key_image_format",
+    "dial_count",
+    "touch_key_count",
+    "has_touchscreen",
+    "touchscreen_size",
+    "is_visual",
+}
+
+
+class TestProbeDeckStatusFullCapabilityDict:
+    def test_capability_dict_has_every_expected_key_populated(self) -> None:
+        result = cli.probe_deck_status(_FakeManager(_FakeDeck(openable=True)))
+        assert result["found"] is True
+        assert result["openable"] is True
+        caps = result["caps"]
+        assert caps is not None
+        assert set(caps.keys()) == _EXPECTED_CAPABILITY_KEYS
+        # Spot-check the four fields that were the actual crash: a missing
+        # method would raise AttributeError before this dict ever got
+        # built, so simply reaching these assertions is the proof.
+        assert caps["is_visual"] is True
+        assert caps["touch_key_count"] == 0
+        assert caps["vendor_id"] == 0x0FD9
+        assert caps["product_id"] == 0x0060
+
+
 class TestCheckDeckDetectedAndHidOpenable:
     def test_no_device_warns_with_guidance(
         self, monkeypatch: pytest.MonkeyPatch
@@ -422,3 +467,67 @@ class TestDoctorNeverRaises:
         cli.doctor(str(tmp_path / "nonexistent-config.json"))
         out = capsys.readouterr().out
         assert "muxplex-deck doctor" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor() end-to-end through the REAL check_deck_detected/check_hid_openable
+# (unlike TestDoctorNeverRaises above, which stubs those two out) -- this is
+# the path a user with hardware attached actually takes, and the one that
+# crashed with AttributeError before the RealDeckDevice fix.
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorDeckIntegrationEndToEnd:
+    def test_device_present_does_not_raise_and_reports_found_and_openable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=True)),
+        )
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        # The real assertion: doctor() must not raise. Before the fix this
+        # AttributeError'd inside check_deck_detected -> probe_deck_status ->
+        # describe_capabilities(RealDeckDevice-shaped deck).is_visual().
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "Stream Deck Original" in out
+        assert "15 keys" in out
+        assert "HID: device opened successfully" in out
+
+    def test_no_device_present_still_reports_not_found_guidance(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: the fix must not disturb the no-hardware path."""
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _FakeManager(None)
+        )
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "No Stream Deck found" in out

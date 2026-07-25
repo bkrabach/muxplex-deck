@@ -46,6 +46,13 @@ DIAL_COUNT = 4
 KEY_SIZE = (120, 120)
 STRIP_SIZE = (800, 100)
 DEFAULT_PORT = 8484
+# Real Elgato vendor id + the real Stream Deck+ USB product id (from the
+# `streamdeck` library's own `USBVendorIDs`/`USBProductIDs`), so a capability
+# report against the emulator shows the same "usb id" a real Stream Deck+
+# would -- there's no meaningful "emulated" vendor/product id to invent, and
+# this keeps `describe_capabilities()` output consistent between backends.
+VENDOR_ID_ELGATO = 0x0FD9
+PRODUCT_ID_STREAMDECK_PLUS = 0x84
 # Simulates real hardware's dim firmware power-on default (real-hardware
 # feedback: the deck never asserted brightness itself and stayed dim) --
 # NOT the sidecar's target brightness. `main._run_active` calls
@@ -123,6 +130,21 @@ class EmulatorDevice:
 
     def is_touch(self) -> bool:
         return True
+
+    def touch_key_count(self) -> int:
+        # The Plus's touch surface is the 800x100 touchscreen strip, not
+        # discrete touch buttons (that's the Neo) -- zero, same as the
+        # real Stream Deck+ reports.
+        return 0
+
+    def is_visual(self) -> bool:
+        return True
+
+    def vendor_id(self) -> int:
+        return VENDOR_ID_ELGATO
+
+    def product_id(self) -> int:
+        return PRODUCT_ID_STREAMDECK_PLUS
 
     def deck_type(self) -> str:
         return "Stream Deck + (emulated)"

@@ -79,6 +79,18 @@ class RealDeckDevice:
     def is_touch(self) -> bool:
         return self._deck.is_touch()
 
+    def touch_key_count(self) -> int:
+        return self._deck.touch_key_count()
+
+    def is_visual(self) -> bool:
+        return self._deck.is_visual()
+
+    def vendor_id(self) -> int:
+        return self._deck.vendor_id()
+
+    def product_id(self) -> int:
+        return self._deck.product_id()
+
     def deck_type(self) -> str:
         return self._deck.deck_type()
 
