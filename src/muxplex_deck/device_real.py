@@ -70,6 +70,15 @@ class RealDeckDevice:
     def key_count(self) -> int:
         return self._deck.key_count()
 
+    def key_layout(self) -> tuple[int, int]:
+        return self._deck.key_layout()
+
+    def dial_count(self) -> int:
+        return self._deck.dial_count()
+
+    def is_touch(self) -> bool:
+        return self._deck.is_touch()
+
     def deck_type(self) -> str:
         return self._deck.deck_type()
 
@@ -85,7 +94,7 @@ class RealDeckDevice:
     def touchscreen_image_format(self) -> dict:
         return self._deck.touchscreen_image_format()
 
-    def set_brightness(self, percent: int | float) -> None:
+    def set_brightness(self, percent: float) -> None:
         self._deck.set_brightness(percent)
 
     def set_key_image(self, key: int, image: bytes) -> None:

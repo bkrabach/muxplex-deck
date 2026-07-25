@@ -63,8 +63,11 @@ _PREVIEW_TEXT_COLOR = "#a8a8a8"  # light gray -- low-contrast so name/badges pop
 # note in `_preview_lines` below.
 _PREVIEW_FONT_SIZE = 11
 _PREVIEW_LINE_HEIGHT = 13
-_PREVIEW_LINES = 8  # bottom N lines of the snapshot
-_PREVIEW_COLUMNS = 21  # first N columns of each of those lines (bottom-LEFT crop)
+# Approximate advance width of one monospace character at _PREVIEW_FONT_SIZE,
+# used to derive how many columns fit the key's real width (see
+# `_preview_geometry`). 5.5 is anchored so a 120px key yields exactly the 21
+# columns the hardware-verified Stream Deck+ path always used.
+_PREVIEW_CHAR_WIDTH = 5.5
 _PREVIEW_LEFT_MARGIN = 3
 
 _BANNER_HEIGHT = 20  # translucent strip behind the session name, top of key
@@ -95,15 +98,31 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
-def _preview_lines(snapshot: str) -> list[str]:
+def _preview_geometry(width: int, height: int) -> tuple[int, int]:
+    """(lines, columns) of preview crop that fit a key of the given real size.
+
+    Derived from the deck's actual `key_image_format()['size']` at render
+    time -- never assumes 120px. The formulas are anchored so the
+    hardware-verified 120x120 Stream Deck+ path yields exactly the 8 lines
+    x 21 columns the previous fixed constants produced (no Deck+ regression),
+    while a 72x72 Original/MK2 key scales down (4 lines x 12 columns)
+    instead of overflowing the key.
+    """
+    lines = max(1, (height - _BANNER_HEIGHT - 2) // _PREVIEW_LINE_HEIGHT + 1)
+    columns = max(1, int((width - _PREVIEW_LEFT_MARGIN) / _PREVIEW_CHAR_WIDTH))
+    return lines, columns
+
+
+def _preview_lines(snapshot: str, max_lines: int, max_columns: int) -> list[str]:
     """Bottom-left crop of a session's snapshot, ready to draw line-by-line.
 
     Strips ANSI escapes, trims trailing blank lines (the snapshot is a
     fixed-height `tmux capture-pane` and commonly ends with several once a
     session's actual output is shorter than the capture window), then keeps
-    the last `_PREVIEW_LINES` lines and the first `_PREVIEW_COLUMNS`
-    columns of each -- bottom-left, chosen over the PWA's bottom-anchored
-    *full-width* preview because a square 120px key has no width to spare.
+    the last `max_lines` lines and the first `max_columns` columns of each
+    -- bottom-left, chosen over the PWA's bottom-anchored *full-width*
+    preview because a square key has no width to spare. `max_lines` /
+    `max_columns` come from `_preview_geometry` (the key's real pixels).
 
     Honest fidelity note: at ~5px/character this crop is "recognize your
     session by its shape and color" (well, grayscale in v1), not "read the
@@ -113,8 +132,27 @@ def _preview_lines(snapshot: str) -> list[str]:
     lines = plain.splitlines()
     while lines and not lines[-1].strip():
         lines.pop()
-    tail = lines[-_PREVIEW_LINES:] if _PREVIEW_LINES else []
-    return [line[:_PREVIEW_COLUMNS] for line in tail]
+    tail = lines[-max_lines:] if max_lines else []
+    return [line[:max_columns] for line in tail]
+
+
+def _fit_label(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: float,
+) -> str:
+    """Shorten `text` (with an ellipsis) until it fits `max_width` pixels.
+
+    Complements the fixed character-count `_truncate` caps: those were
+    tuned on 120px keys, so on smaller keys (72px Original) a 10-char name
+    could still overflow. Measures the real rendered width instead.
+    """
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while text and draw.textlength(text + "\u2026", font=font) > max_width:
+        text = text[:-1]
+    return text + "\u2026"
 
 
 def _draw_border(
@@ -152,7 +190,8 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
     draw = ImageDraw.Draw(image)
     preview_font = ImageFont.load_default(size=_PREVIEW_FONT_SIZE)
 
-    lines = _preview_lines(session.snapshot)
+    max_lines, max_columns = _preview_geometry(image.width, image.height)
+    lines = _preview_lines(session.snapshot, max_lines, max_columns)
     base_y = image.height - len(lines) * _PREVIEW_LINE_HEIGHT - 2
     for row, line in enumerate(lines):
         if not line:
@@ -174,7 +213,7 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
     draw = ImageDraw.Draw(image)
 
     name_font = ImageFont.load_default(size=_KEY_LABEL_FONT_SIZE)
-    label = _truncate(session.name)
+    label = _fit_label(draw, _truncate(session.name), name_font, image.width - 4)
     bbox = draw.textbbox((0, 0), label, font=name_font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     name_position = (
@@ -228,7 +267,9 @@ def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
     image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_PICKER_BG)
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default(size=_PICKER_FONT_SIZE)
-    text = _truncate(label, limit=_PICKER_LABEL_CHARS)
+    text = _fit_label(
+        draw, _truncate(label, limit=_PICKER_LABEL_CHARS), font, image.width - 4
+    )
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     position = (
@@ -240,6 +281,120 @@ def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
         _draw_border(
             draw, image, _PICKER_CURRENT_BORDER_COLOR, _PICKER_CURRENT_BORDER_WIDTH
         )
+    return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
+
+
+# --- Reserved control keys (dial-less decks) --------------------------------
+#
+# On decks with no dials/touch strip (Original/MK2/XL/Mini), three keys are
+# reserved for the roles the dials and strip played -- see `layout.py`. They
+# reuse the picker's indigo background so "control chrome" is visually
+# distinct from session tiles, and their labels are ASCII-only: the default
+# PIL font has no glyphs for arrows and renders .notdef boxes instead
+# (proven on real hardware with U+2192).
+
+_CONTROL_BG = _PICKER_BG
+_CONTROL_TEXT_COLOR = "#ffffff"
+_CONTROL_DIM_COLOR = "#8888aa"
+_CONTROL_TITLE_FONT_SIZE = 11
+_CONTROL_BODY_FONT_SIZE = 15
+_CONTROL_FOOTER_FONT_SIZE = 11
+
+
+def render_control_key(
+    deck: DeckDevice, *, title: str, body: str, footer: str = ""
+) -> bytes:
+    """Render one reserved control key (VIEW / PREV / NEXT).
+
+    Three stacked rows on the control background, each fit to the key's
+    *real* width (72px Original and 120px Plus both work):
+    - `title`: small dim caption at the top (e.g. "VIEW").
+    - `body`: the prominent centered label (view name, "< PREV", "NEXT >").
+    - `footer`: small dim line at the bottom (server label, or "pN/M").
+    """
+    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_CONTROL_BG)
+    draw = ImageDraw.Draw(image)
+    max_width = image.width - 4
+
+    if title:
+        font = ImageFont.load_default(size=_CONTROL_TITLE_FONT_SIZE)
+        text = _fit_label(draw, title, font, max_width)
+        width = draw.textlength(text, font=font)
+        draw.text(
+            ((image.width - width) / 2, 2), text, fill=_CONTROL_DIM_COLOR, font=font
+        )
+
+    body_font = ImageFont.load_default(size=_CONTROL_BODY_FONT_SIZE)
+    text = _fit_label(draw, body, body_font, max_width)
+    bbox = draw.textbbox((0, 0), text, font=body_font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(
+        ((image.width - text_w) / 2 - bbox[0], (image.height - text_h) / 2 - bbox[1]),
+        text,
+        fill=_CONTROL_TEXT_COLOR,
+        font=body_font,
+    )
+
+    if footer:
+        font = ImageFont.load_default(size=_CONTROL_FOOTER_FONT_SIZE)
+        text = _fit_label(draw, footer, font, max_width)
+        width = draw.textlength(text, font=font)
+        draw.text(
+            (
+                (image.width - width) / 2,
+                image.height - _CONTROL_FOOTER_FONT_SIZE - 4,
+            ),
+            text,
+            fill=_CONTROL_DIM_COLOR,
+            font=font,
+        )
+
+    return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
+
+
+_STATUS_KEY_FONT_SIZE = 11
+_STATUS_KEY_LINE_HEIGHT = 13
+_STATUS_KEY_MARGIN = 3
+
+
+def render_status_key(deck: DeckDevice, message: str) -> bytes:
+    """Render a status message word-wrapped onto a single key.
+
+    Decks without a touch strip have nowhere else to show AUTH FAILED /
+    UNREACHABLE states, so the message is wrapped onto one key (the VIEW
+    key's position) at small size -- honest signal over polish; the log
+    carries the full detail.
+    """
+    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_EMPTY_BG)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=_STATUS_KEY_FONT_SIZE)
+    max_width = image.width - 2 * _STATUS_KEY_MARGIN
+    max_lines = max(
+        1, (image.height - 2 * _STATUS_KEY_MARGIN) // _STATUS_KEY_LINE_HEIGHT
+    )
+
+    lines: list[str] = []
+    current = ""
+    for word in message.split():
+        candidate = f"{current} {word}".strip()
+        if not current or draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    for row, line in enumerate(lines):
+        draw.text(
+            (_STATUS_KEY_MARGIN, _STATUS_KEY_MARGIN + row * _STATUS_KEY_LINE_HEIGHT),
+            _fit_label(draw, line, font, max_width),
+            fill=_TEXT_COLOR,
+            font=font,
+        )
+
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 

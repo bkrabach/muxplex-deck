@@ -21,10 +21,14 @@ with a second layer of state nested inside DEVICE_ACTIVE:
 Unplug at any point drops straight back to DEVICE_ABSENT (server traffic
 stops entirely). Ctrl+C/SIGTERM blanks the deck (if present) and exits 0.
 
-Dial 0 cycles the server's (global) `active_view` -- turning locally echoes
-the candidate on the strip and debounces the actual `PATCH /api/state`;
-pressing jumps straight to "all". Dial 1 pages the current view locally (no
-server writes). See `.interaction` for both state machines. All of this
+Controls are capability-driven (see `.layout`): on a deck with dials and a
+touch strip (Stream Deck+), dial 0 cycles the server's (global)
+`active_view` -- turning locally echoes the candidate on the strip and
+debounces the actual `PATCH /api/state` -- and dial 1 pages the current
+view locally (no server writes); see `.interaction` for both state
+machines. On a deck with neither (Original/MK2/XL/Mini), three reserved
+keys play those roles instead: VIEW (top-left; shows view + server, tap
+cycles views with the same debounce), PREV/NEXT (bottom corners; paging). All of this
 plus the poll loop's own GETs share one `MuxplexClient`, so every actual
 HTTP call (poll-loop GETs, a dial-0 commit's PATCH+refresh, a key press's
 connect) is serialized through `_ActiveRuntime.client_lock` -- dial/key
@@ -50,7 +54,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from . import attention, focus, rendering, views
+from . import attention, focus, layout, rendering, views
 from .client import (
     AuthError,
     MuxplexClient,
@@ -197,10 +201,20 @@ def _build_picker_strip_message(
     return " \u00b7 ".join(parts)
 
 
-def _paint_status_only(deck: DeckDevice, message: str) -> None:
+def _paint_status_only(deck: DeckDevice, message: str, plan: layout.LayoutPlan) -> None:
+    """Blank the keys and show `message` wherever this deck can show status.
+
+    Decks with a touch strip get the message there (pre-existing behavior);
+    strip-less decks get it word-wrapped onto the VIEW key's position (or
+    key 0 on a degenerate grid) -- the log always carries the full detail.
+    """
     with deck:
         rendering.paint_blank_keys(deck)
-        rendering.paint_status_strip(deck, message)
+        if plan.use_strip:
+            rendering.paint_status_strip(deck, message)
+        else:
+            status_key = plan.view_key if plan.view_key is not None else 0
+            deck.set_key_image(status_key, rendering.render_status_key(deck, message))
 
 
 class _ActiveRuntime:
@@ -237,8 +251,13 @@ class _ActiveRuntime:
         # Guards the live session/view/page state and the paint-diff caches.
         self.paint_lock = threading.Lock()
 
+        # Capability-driven layout: FULL (Stream Deck+: dials + strip) keeps
+        # the pre-existing behavior; REDUCED (Original/MK2/XL/Mini: no
+        # dials/strip) reserves VIEW/PREV/NEXT keys instead. See `.layout`.
+        self.plan = layout.plan_layout(layout.read_capabilities(deck))
+
         self.view_cycler = ViewCycler()
-        self.pager = Pager(page_size=deck.key_count())
+        self.pager = Pager(page_size=max(1, self.plan.sessions_per_page))
         self.picker = PickerController()
 
         self.ordered: list[Session] = []
@@ -329,28 +348,31 @@ class _ActiveRuntime:
     def _repaint_sessions(self) -> None:
         with self.paint_lock:
             start, stop = self.pager.slice_bounds()
-            key_count = self.deck.key_count()
-            page_sessions = self.ordered[start:stop][:key_count]
+            slots = self.plan.session_slots
+            page_sessions = self.ordered[start:stop][: len(slots)]
             self.session_names = [s.name for s in page_sessions]
             active_session = self.active_session
             turning = self.view_cycler.is_turning()
             view_label = (
                 self.view_cycler.candidate_view() if turning else self.active_view
             )
-            message = _build_strip_message(
-                view_label=view_label,
-                turning=turning,
-                page=self.pager.page,
-                page_count=self.pager.page_count,
-                hostname=self.hostname,
-                total=len(self.ordered),
-                active_session=active_session,
-            )
             with self.deck:
                 self._paint_keys(page_sessions, active_session)
-                if message != self.last_strip:
-                    rendering.paint_status_strip(self.deck, message)
-                    self.last_strip = message
+                if self.plan.mode == layout.MODE_REDUCED:
+                    self._paint_control_keys(view_label, turning)
+                if self.plan.use_strip:
+                    message = _build_strip_message(
+                        view_label=view_label,
+                        turning=turning,
+                        page=self.pager.page,
+                        page_count=self.pager.page_count,
+                        hostname=self.hostname,
+                        total=len(self.ordered),
+                        active_session=active_session,
+                    )
+                    if message != self.last_strip:
+                        rendering.paint_status_strip(self.deck, message)
+                        self.last_strip = message
 
     def _repaint_picker(self, mode: PickerMode) -> None:
         """Repaint the keys as a picker (view names, or page numbers).
@@ -380,7 +402,7 @@ class _ActiveRuntime:
             )
             with self.deck:
                 self._paint_picker_keys(window, current)
-                if message != self.last_strip:
+                if self.plan.use_strip and message != self.last_strip:
                     rendering.paint_status_strip(self.deck, message)
                     self.last_strip = message
 
@@ -409,19 +431,21 @@ class _ActiveRuntime:
     def _paint_keys(
         self, page_sessions: list[Session], active_session: str | None
     ) -> None:
-        """Paint only the keys whose rendered content actually changed.
+        """Paint only the session-slot keys whose rendered content changed.
 
-        `identity` captures every input that affects a key's pixels (name,
-        active flag, bell flag, and the raw snapshot text driving the mini
-        terminal preview) as a plain tuple, compared by equality against
-        the last-painted identity for that slot. A literal hash isn't
-        needed here -- tuple equality is exactly as correct and simpler --
-        but it serves the same purpose: skip a repaint (and a JPEG encode)
-        for a key whose preview hasn't scrolled since last poll.
+        Iterates the plan's `session_slots` (every key in FULL mode; the
+        non-reserved keys in REDUCED mode), mapping slot position -> the
+        page's session at that position. `identity` captures every input
+        that affects a key's pixels (name, active flag, bell flag, and the
+        raw snapshot text driving the mini terminal preview) as a plain
+        tuple, compared by equality against the last-painted identity for
+        that slot. A literal hash isn't needed here -- tuple equality is
+        exactly as correct and simpler -- but it serves the same purpose:
+        skip a repaint (and a JPEG encode) for a key whose preview hasn't
+        scrolled since last poll.
         """
-        key_count = self.deck.key_count()
-        for index in range(key_count):
-            session = page_sessions[index] if index < len(page_sessions) else None
+        for slot, key_index in enumerate(self.plan.session_slots):
+            session = page_sessions[slot] if slot < len(page_sessions) else None
             active = session is not None and session.name == active_session
             identity: object = (
                 None
@@ -433,16 +457,53 @@ class _ActiveRuntime:
                     session.snapshot,
                 )
             )
-            if self.last_key_state[index] == identity:
+            if self.last_key_state[key_index] == identity:
                 continue
             if session is None:
-                self.deck.set_key_image(index, rendering.render_empty_key(self.deck))
+                self.deck.set_key_image(
+                    key_index, rendering.render_empty_key(self.deck)
+                )
             else:
                 self.deck.set_key_image(
-                    index,
+                    key_index,
                     rendering.render_session_key(self.deck, session, active=active),
                 )
-            self.last_key_state[index] = identity
+            self.last_key_state[key_index] = identity
+
+    def _paint_control_keys(self, view_label: str, turning: bool) -> None:
+        """Paint the reserved VIEW/PREV/NEXT keys (REDUCED mode only), diffed.
+
+        The VIEW key carries what the Deck+'s touch strip showed -- the
+        current view name (with the same "> " turn echo the strip used;
+        ASCII, because the default PIL font renders arrows as .notdef
+        boxes -- real-hardware feedback) plus the server label. PREV/NEXT
+        carry a pN/M footer whenever a view has more than one page,
+        matching the strip's own "only show page info when it matters"
+        convention.
+        """
+        page = self.pager.page
+        page_count = self.pager.page_count
+        page_text = f"p{page}/{page_count}" if page_count > 1 else ""
+        view_body = f"> {view_label}" if turning else view_label
+
+        specs: list[tuple[int | None, str, str, str]] = [
+            (self.plan.view_key, "VIEW", view_body, self.hostname),
+            (self.plan.prev_key, "", "< PREV", page_text),
+            (self.plan.next_key, "", "NEXT >", page_text),
+        ]
+        for key_index, title, body, footer in specs:
+            if key_index is None:
+                continue
+            identity: object = ("control", title, body, footer)
+            if self.last_key_state[key_index] == identity:
+                continue
+            self.deck.set_key_image(
+                key_index,
+                rendering.render_control_key(
+                    self.deck, title=title, body=body, footer=footer
+                ),
+            )
+            self.last_key_state[key_index] = identity
 
     # --- dial handling ------------------------------------------------
 
@@ -494,7 +555,15 @@ class _ActiveRuntime:
 
     # --- key handling ------------------------------------------------------
 
-    def connect(self, key: int) -> None:
+    def handle_key(self, key: int) -> None:
+        """Dispatch a physical key press to its role under the layout plan.
+
+        In FULL mode every key is a session slot (`classify_key` maps key N
+        to slot N), so this is the pre-existing connect path unchanged. In
+        REDUCED mode the reserved VIEW/PREV/NEXT keys perform their control
+        action and never connect. Picker mode (FULL mode only -- pickers
+        open via dial presses) takes priority: a tap selects an option.
+        """
         mode = self.picker.mode
         if mode == PickerMode.VIEW:
             self._select_view_option(key)
@@ -503,12 +572,39 @@ class _ActiveRuntime:
             self._select_page_option(key)
             return
 
+        kind, slot = layout.classify_key(self.plan, key)
+        if kind == layout.KEY_VIEW:
+            # The dial-0 role on a key: each tap advances one view, with the
+            # same debounced commit a dial turn gets -- a quick multi-tap
+            # sends exactly one PATCH. The VIEW key echoes the candidate.
+            label = self.view_cycler.turn(1, self._commit_view)
+            logger.info("key[%d] VIEW pressed -> cycling to %r", key, label)
+            self.repaint()
+            return
+        if kind == layout.KEY_PREV:
+            page = self.pager.turn(-1)
+            logger.info("key[%d] PREV pressed -> page %d", key, page)
+            self.repaint()
+            return
+        if kind == layout.KEY_NEXT:
+            page = self.pager.turn(1)
+            logger.info("key[%d] NEXT pressed -> page %d", key, page)
+            self.repaint()
+            return
+
+        if slot is None:
+            logger.info("key[%d] pressed (unassigned, ignoring)", key)
+            return
+        self.connect_slot(slot, key)
+
+    def connect_slot(self, slot: int, key: int) -> None:
+        """Connect the session shown in `slot` (pressed via physical `key`)."""
         with self.paint_lock:
             names = list(self.session_names)
-        if key >= len(names):
+        if slot >= len(names):
             logger.info("key[%d] pressed (empty slot, ignoring)", key)
             return
-        name = names[key]
+        name = names[slot]
         logger.info(
             "key[%d] pressed -> connect session %r (optimistic highlight)", key, name
         )
@@ -588,7 +684,7 @@ class _ActiveRuntime:
 def _make_key_callback(ctx: _ActiveRuntime):
     def on_key(_deck: DeckDevice, key: int, pressed: bool) -> None:
         if pressed:
-            ctx.connect(key)
+            ctx.handle_key(key)
 
     return on_key
 
@@ -637,14 +733,21 @@ def _run_active(
         # the outer loop's is_open()/connected() checks handle that.
         logger.exception("failed to set brightness to %d%%", FULL_BRIGHTNESS_PERCENT)
     ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name)
-    _paint_status_only(deck, "connecting to muxplex...")
+    logger.info("%s", layout.describe_plan(ctx.plan))
+    _paint_status_only(deck, "connecting to muxplex...", ctx.plan)
 
     deck.set_key_callback(_make_key_callback(ctx))
-    deck.set_dial_callback(_make_dial_callback(ctx))
-    deck.set_touchscreen_callback(_on_touch)
+    if ctx.plan.use_dials:
+        deck.set_dial_callback(_make_dial_callback(ctx))
+    else:
+        logger.info("no dials assigned on this model -- view/page controls on keys")
+    if ctx.plan.use_strip:
+        deck.set_touchscreen_callback(_on_touch)
+    else:
+        logger.info("no touchscreen on this model -- skipping strip")
 
     logger.info(
-        "Stream Deck+ active -- polling %s every %.1fs (sort=%s)",
+        "Stream Deck active -- polling %s every %.1fs (sort=%s)",
         hostname,
         poll_interval,
         sort_mode,
@@ -656,7 +759,7 @@ def _run_active(
     try:
         while True:
             if not deck.is_open() or not deck.connected():
-                logger.warning("Stream Deck+ disconnected")
+                logger.warning("Stream Deck disconnected")
                 return
 
             try:
@@ -666,7 +769,7 @@ def _run_active(
                     "muxplex auth rejected -- check the federation key file: %s", exc
                 )
                 if shown_error_state != "auth":
-                    _paint_status_only(deck, "AUTH FAILED -- check key file")
+                    _paint_status_only(deck, "AUTH FAILED -- check key file", ctx.plan)
                     ctx.invalidate_paint_cache()
                     shown_error_state = "auth"
                 if _interruptible_wait(deck, shutting_down, AUTH_RETRY_SECONDS):
@@ -677,7 +780,9 @@ def _run_active(
                     "muxplex unreachable: %s -- retrying in %.0fs", exc, backoff
                 )
                 if shown_error_state != "unreachable":
-                    _paint_status_only(deck, f"{hostname} UNREACHABLE -- retrying")
+                    _paint_status_only(
+                        deck, f"{hostname} UNREACHABLE -- retrying", ctx.plan
+                    )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
                 if _interruptible_wait(deck, shutting_down, backoff):
@@ -689,7 +794,7 @@ def _run_active(
                     "unexpected muxplex API error; treating as unreachable"
                 )
                 if shown_error_state != "unreachable":
-                    _paint_status_only(deck, f"{hostname} ERROR -- retrying")
+                    _paint_status_only(deck, f"{hostname} ERROR -- retrying", ctx.plan)
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
                 if _interruptible_wait(deck, shutting_down, backoff):
@@ -740,13 +845,13 @@ def run(config: Config, manager: DeviceManager) -> int:
                 now = time.monotonic()
                 if not logged_waiting:
                     logger.info(
-                        "waiting for Stream Deck+ (polling every %.0fs)...",
+                        "waiting for a Stream Deck (polling every %.0fs)...",
                         DEVICE_POLL_SECONDS,
                     )
                     logged_waiting = True
                     last_heartbeat = now
                 elif now - last_heartbeat >= ABSENT_HEARTBEAT_SECONDS:
-                    logger.info("still waiting for Stream Deck+...")
+                    logger.info("still waiting for a Stream Deck...")
                     last_heartbeat = now
                 shutting_down.wait(DEVICE_POLL_SECONDS)
                 continue
@@ -755,7 +860,7 @@ def run(config: Config, manager: DeviceManager) -> int:
             try:
                 deck.open()
             except Exception:
-                logger.exception("Failed to open Stream Deck+ device; will retry")
+                logger.exception("Failed to open Stream Deck device; will retry")
                 shutting_down.wait(DEVICE_POLL_SECONDS)
                 continue
 

@@ -41,6 +41,7 @@ __all__ = ["EmulatorDevice", "EmulatorDeviceManager"]
 logger = logging.getLogger("muxplex_deck")
 
 KEY_COUNT = 8
+KEY_LAYOUT = (2, 4)  # rows x cols, same as the real Stream Deck+
 DIAL_COUNT = 4
 KEY_SIZE = (120, 120)
 STRIP_SIZE = (800, 100)
@@ -114,6 +115,15 @@ class EmulatorDevice:
     def key_count(self) -> int:
         return KEY_COUNT
 
+    def key_layout(self) -> tuple[int, int]:
+        return KEY_LAYOUT
+
+    def dial_count(self) -> int:
+        return DIAL_COUNT
+
+    def is_touch(self) -> bool:
+        return True
+
     def deck_type(self) -> str:
         return "Stream Deck + (emulated)"
 
@@ -139,7 +149,7 @@ class EmulatorDevice:
             "rotation": 0,
         }
 
-    def set_brightness(self, percent: int | float) -> None:
+    def set_brightness(self, percent: float) -> None:
         with self._lock:
             self._brightness = max(0, min(100, int(percent)))
 
@@ -338,7 +348,7 @@ class _EmulatorHandler(BaseHTTPRequestHandler):
     """
 
     device: EmulatorDevice
-    manager: "EmulatorDeviceManager"
+    manager: EmulatorDeviceManager
 
     def log_message(self, format: str, *args: object) -> None:
         pass  # the sidecar's own logger already covers what matters
@@ -364,7 +374,7 @@ class _EmulatorHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         return json.loads(raw) if raw else {}
 
-    def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler convention
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/":
             self._send_bytes(200, "text/html; charset=utf-8", _UI_HTML.encode("utf-8"))
@@ -384,7 +394,7 @@ class _EmulatorHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler convention
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
             if path == "/plug":
@@ -451,7 +461,7 @@ class _EmulatorHandler(BaseHTTPRequestHandler):
 
 
 def _bound_handler_class(
-    device: EmulatorDevice, manager: "EmulatorDeviceManager"
+    device: EmulatorDevice, manager: EmulatorDeviceManager
 ) -> type[_EmulatorHandler]:
     """Create a `_EmulatorHandler` subclass bound to one device+manager pair."""
     return type(
