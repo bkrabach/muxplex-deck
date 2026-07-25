@@ -158,7 +158,7 @@ class MuxplexClient:
     """Thin, typed HTTP client for the sidecar's read/switch operations.
 
     Usage:
-        >>> with MuxplexClient("https://spark-1:8088", "secret") as client:
+        >>> with MuxplexClient("https://<your-server>:8088", "secret") as client:
         ...     sessions = client.get_sessions()
     """
 

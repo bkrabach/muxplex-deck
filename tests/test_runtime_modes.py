@@ -181,7 +181,7 @@ def _make_runtime(deck: FakeDeck, client: FakeClient) -> _ActiveRuntime:
     ctx = _ActiveRuntime(
         deck=cast(DeckDevice, deck),  # satisfies DeckDevice structurally
         client=cast(MuxplexClient, client),
-        hostname="spark-1",
+        hostname="test-server",
         sort_mode="server",  # deterministic ordering for assertions
     )
     ctx.view_cycler = ViewCycler(debounce_seconds=_TEST_DEBOUNCE_SECONDS)

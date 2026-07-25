@@ -3,7 +3,10 @@
 Config is a JSON file (default ``~/.config/muxplex-deck/config.json``,
 overridable via the ``--config`` CLI flag or the ``MUXPLEX_DECK_CONFIG``
 env var) plus a federation-key file referenced from it. All paths support
-``~`` and are expanded eagerly.
+``~``, expanded relative to the *invoking* user's home: the sidecar is
+typically launched as ``sudo muxplex-deck`` (HID access), and under sudo a
+plain ``expanduser()`` would resolve to ``/root`` -- so ``~`` honors
+``SUDO_USER`` when present (see `_expand`).
 
 Any missing/invalid config or unreadable key file is a fail-loud, actionable
 error -- there is no default that silently skips auth or TLS verification.
@@ -16,8 +19,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path("~/.config/muxplex-deck/config.json").expanduser()
-DEFAULT_KEY_FILE = Path("~/.config/muxplex-deck/federation_key").expanduser()
+try:
+    import pwd
+except ImportError:  # non-POSIX (Windows) -- no sudo there, plain expanduser is fine
+    pwd = None  # type: ignore[assignment]
+
+DEFAULT_CONFIG_PATH = "~/.config/muxplex-deck/config.json"
+DEFAULT_KEY_FILE = "~/.config/muxplex-deck/federation_key"
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_SORT_MODE = "attention"
 VALID_SORT_MODES = ("attention", "server")
@@ -25,6 +33,37 @@ VALID_SORT_MODES = ("attention", "server")
 
 class ConfigError(Exception):
     """Raised for any config problem. The message is written to stderr as-is."""
+
+
+def _invoking_user_home() -> Path:
+    """Home directory of the user who launched the process, even under sudo.
+
+    Under ``sudo``, ``$HOME``/``Path.home()`` resolve to ``/root`` -- but the
+    config and key files live in the *invoking* user's home. When ``SUDO_USER``
+    names a non-root user, resolve that user's home via the passwd database;
+    otherwise fall back to the normal home.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if pwd is not None and sudo_user and sudo_user != "root":
+        try:
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass  # unknown user -- fall through to the normal home
+    return Path.home()
+
+
+def _expand(path: str | Path) -> Path:
+    """Expand ``~`` relative to the invoking user's home (sudo-aware).
+
+    Non-tilde paths pass through unchanged (modulo ``expanduser`` for the
+    ``~otheruser`` form, which keeps its standard behavior).
+    """
+    text = str(path)
+    if text == "~":
+        return _invoking_user_home()
+    if text.startswith("~/") or text.startswith("~\\"):
+        return _invoking_user_home() / text[2:]
+    return Path(text).expanduser()
 
 
 @dataclass(frozen=True)
@@ -53,11 +92,11 @@ class Config:
 
 def _resolve_config_path(explicit: str | None) -> Path:
     if explicit:
-        return Path(explicit).expanduser()
+        return _expand(explicit)
     env_value = os.environ.get("MUXPLEX_DECK_CONFIG")
     if env_value:
-        return Path(env_value).expanduser()
-    return DEFAULT_CONFIG_PATH
+        return _expand(env_value)
+    return _expand(DEFAULT_CONFIG_PATH)
 
 
 def _load_federation_key(key_file: Path) -> str:
@@ -66,7 +105,7 @@ def _load_federation_key(key_file: Path) -> str:
             f"Federation key file not found: {key_file}\n"
             "Copy it from the muxplex server, e.g.:\n"
             f"  mkdir -p {key_file.parent}\n"
-            f"  scp spark-1:.config/muxplex/federation_key {key_file}\n"
+            f"  scp <your-server>:.config/muxplex/federation_key {key_file}\n"
             f"  chmod 600 {key_file}"
         )
     try:
@@ -93,7 +132,7 @@ def load_config(config_path: str | None = None) -> Config:
         raise ConfigError(
             f"Config file not found: {path}\n"
             "Create it with at least a 'server_url' field, e.g.:\n"
-            '  {"server_url": "https://spark-1:8088"}\n'
+            '  {"server_url": "https://<your-server>:8088"}\n'
             "See README.md for the full example."
         )
 
@@ -113,11 +152,11 @@ def load_config(config_path: str | None = None) -> Config:
             f"Config file {path} is missing required field 'server_url' (string)"
         )
 
-    key_file = Path(raw.get("key_file", str(DEFAULT_KEY_FILE))).expanduser()
+    key_file = _expand(raw.get("key_file", DEFAULT_KEY_FILE))
     federation_key = _load_federation_key(key_file)
 
     ca_file_value = raw.get("ca_file")
-    ca_file = Path(ca_file_value).expanduser() if ca_file_value else None
+    ca_file = _expand(ca_file_value) if ca_file_value else None
     if ca_file is not None and not ca_file.exists():
         raise ConfigError(f"Config field 'ca_file' does not exist: {ca_file}")
 

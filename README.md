@@ -283,7 +283,7 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
 
 ```json
 {
-  "server_url": "https://spark-1:8088",
+  "server_url": "https://<your-server>:8088",
   "key_file": "~/.config/muxplex-deck/federation_key",
   "poll_interval": 2.0,
   "sort": "attention",
@@ -323,7 +323,7 @@ and otherwise ignored.
 
 ```json
 {
-  "server_url": "https://spark-1:8088",
+  "server_url": "https://<your-server>:8088",
   "focus_app": "muxplex"
 }
 ```
@@ -350,12 +350,12 @@ that silently skips auth or TLS verification.
 ### Getting the federation key onto the Mac
 
 The muxplex server already has a federation key generated
-(`~/.config/muxplex/federation_key` on spark-1, federation enabled). Copy
-it over:
+(`~/.config/muxplex/federation_key` on the server, federation enabled).
+Copy it over:
 
 ```sh
 mkdir -p ~/.config/muxplex-deck
-scp spark-1:.config/muxplex/federation_key ~/.config/muxplex-deck/federation_key
+scp <your-server>:.config/muxplex/federation_key ~/.config/muxplex-deck/federation_key
 chmod 600 ~/.config/muxplex-deck/federation_key
 ```
 
@@ -523,4 +523,4 @@ run a local muxplex server on the same machine as the sidecar:
 4. Run the sidecar in emulator mode as above (`uv run muxplex-deck
    --emulator`) and click "Plug in". You now have a complete, fully offline
    dev loop: virtual deck -> sidecar -> local muxplex -> real tmux sessions
-   -- no hardware, no network, no spark-1 required.
+   -- no hardware, no network, no remote server required.
