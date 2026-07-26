@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.0
+
+### Bug Fixes
+
+- **The Stream Deck key press now foregrounds the PWA on every explicit press.** The previous gate on "did this change the active session" contradicted the actual intended use: the button press *is* the request to bring the window forward. A user pressing an already-active session's key expected the PWA to pop to the foreground; instead nothing happened. The change is mechanical — removed the `changed = self.active_session != name` gate and the conditional wrap around `focus.focus_app()` — so every key press (same session or new session) triggers the focus operation. This is the intended behavior for a dedicated hardware control surface that serves both session selection and window management.
+
+### Internal
+
+- **CI enforcement and toolchain integration.** This release brings the repo's first enforced CI, surfacing the test suite, safety rails, and the ruff/pyright toolchain that every previous commit claimed to run but nothing gated. The 240-test suite (14 of which are meta-tests proving the safety rails stay in place) now runs on every push. Five CI jobs gate all code: Python 3.11/3.12/3.13 plus a latest-deps job (mirrors user install behavior), and a safety-rails meta-verification that confirms four-layer defense against test suite damaging the running service remains intact.
+
+- **66 pre-existing lint violations resolved.** The first CI run against the accumulated code surfaced 66 ruff violations and 2 pyright type errors. All have been resolved. The linter and type checker now pass clean on every commit, making future drift visible immediately.
+
+### Verification
+
+- 240 tests passed via pytest (including 14 meta-tests pinning the test-safety rails).
+- All five CI jobs green: Python 3.11/3.12/3.13, latest-deps, and safety-rails verification.
+- Stream Deck hardware verified: MBP (Stream Deck+ 8 keys, 4 dials, touch strip) and ALIENWARE-R13 WSL (Stream Deck Original V2 `0fd9:006d` 15 keys, 3x5).
+
+### Dependencies
+- streamdeck >= 0.9.5
+- pillow >= 10.0.0
+- httpx >= 0.27.0
+- pytest >= 8.0.0 (dev)
+
+### License & Attribution
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.2.0
 
 ### Major Features
