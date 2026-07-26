@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Tests against uv.lock's pinned versions -- a stable, reproducible dev
+    # baseline. This is NOT a proxy for "what ships to users" -- see the
+    # test-latest-deps job below for why a second job exists for that.
+    #
+    # This job (and the safety-rail suite it runs, see AGENTS.md's Testing
+    # table) is the actual answer to this repo's real hazards -- a live
+    # systemd/launchd service, a real config + federation key, exclusive
+    # HID access. There's no separate "service" or "HID" CI job because
+    # tests/conftest.py's autouse fixtures redirect every one of those paths
+    # to tmp dirs / neutered subprocess calls regardless of where the suite
+    # runs, and GitHub-hosted runners have no real service or Stream Deck
+    # attached to accidentally hit anyway. tests/test_safety_rails.py (part
+    # of this same suite) fails loudly if any rail is silently weakened.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]  # pyproject.toml requires-python = ">=3.11"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # Unlike muxplex, dev deps here live under PEP 735 [dependency-groups]
+        # (pyproject.toml), not [project.optional-dependencies] -- plain
+        # `uv sync` installs the default group already; `--extra dev` is
+        # muxplex's syntax and doesn't apply here (no such extra exists).
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest -v
+
+  test-latest-deps:
+    # Same class of gap as muxplex's identically-named job (see that repo's
+    # AGENTS.md for the incident writeup this pattern is modeled on), and it
+    # applies here for the same underlying reason: this package has no PyPI
+    # release. `uv tool install git+https://github.com/bkrabach/muxplex-deck`
+    # (this repo's actual, only install path -- see AGENTS.md's CLI section
+    # on `update`) does a fresh dependency resolution against pyproject.toml's
+    # version floors (streamdeck>=0.9.5, pillow>=10.0.0, httpx>=0.27.0) --
+    # it never reads uv.lock. The `test` job above, by design, always tests
+    # against the locked/pinned versions, so newer-than-locked transitive
+    # dependencies could silently break the real install path while every
+    # matrix entry above stays green.
+    #
+    # One Python version is enough here too -- this job exists to catch
+    # dependency drift, not to re-run the full support matrix.
+    name: test (latest resolvable deps, mirrors `uv tool install`)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.13
+        run: uv python install 3.13
+
+      - name: Install dependencies (fresh resolve, no lock -- mirrors `uv tool install`)
+        # --group dev (not --extra dev / ".[dev]") for the same PEP 735 reason
+        # as the test job above.
+        run: |
+          uv venv .venv-latest --python 3.13
+          uv pip install --python .venv-latest/bin/python -e . --group dev
+
+      - name: Run tests
+        run: .venv-latest/bin/python -m pytest -v
+
+  lint:
+    # ruff (format + lint) and pyright are how this repo has actually
+    # enforced code quality since day one -- every feature commit in this
+    # repo's history reports "ruff and pyright clean" (see git log), but
+    # until now that was an agent/human discipline applied before pushing,
+    # never a CI gate. That's the same "someone remembers" failure shape
+    # the two jobs above exist to close for tests -- so it closes it here
+    # too, for lint/types.
+    #
+    # Neither tool is a project dependency: there's no [tool.ruff] section
+    # and dependency-groups.dev only lists pytest (see pyproject.toml).
+    # [tool.pyright] does exist, though, pointed at this project's own venv
+    # (venvPath "." / venv ".venv") -- confirming pyright is meant to be run
+    # against this project's environment, just via an externally-installed
+    # toolchain rather than a locked dependency. Installed ad hoc here for
+    # the same reason: adding them to uv.lock would change what "the repo's
+    # own toolchain" means for every contributor, not just CI.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install project (creates the .venv pyright resolves types against)
+        run: uv sync
+
+      - name: Install ruff + pyright
+        run: uv pip install ruff pyright
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: pyright
+        run: uv run pyright
