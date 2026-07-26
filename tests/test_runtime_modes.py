@@ -354,14 +354,29 @@ class TestReducedViewPicker:
     def test_picker_slots_show_views_with_active_highlighted(self, reduced) -> None:
         _deck, _client, ctx = reduced
         self._open_picker(ctx)
-        # session-slot keys 1 and 2 carry the two options; "all" is active
+        # session-slot keys 1, 2, 3 carry the three options: "all", the one
+        # named view, and the trailing "hidden" pseudo-view; "all" is active
         assert ctx.last_key_state[1] == ("picker", "all", True)
         assert ctx.last_key_state[2] == ("picker", "focus", False)
-        assert ctx.last_key_state[3] is None  # empty option slot
+        assert ctx.last_key_state[3] == ("picker", "hidden", False)
+        assert ctx.last_key_state[4] is None  # empty option slot
         # reserved keys repurposed: BACK on the VIEW key, pagers inert (1 page)
         assert ctx.last_key_state[0] == ("control", "VIEW", "< BACK", "")
         assert ctx.last_key_state[10] == ("control", "", "< PREV", "")
         assert ctx.last_key_state[14] == ("control", "", "NEXT >", "")
+
+    def test_hidden_pseudo_view_selectable_like_all(self, reduced) -> None:
+        """Regression: "hidden" is a reserved pseudo-view exactly like "all" --
+        never a member of settings.views, but reachable through the same
+        picker. Selecting it PATCHes active_view="hidden", same as any other
+        option.
+        """
+        _deck, client, ctx = reduced
+        self._open_picker(ctx)
+        ctx.handle_key(3)  # slot 2 -> "hidden" (see test above)
+        assert client.view_patches == ["hidden"]
+        assert ctx.picker.mode == PickerMode.NONE
+        assert client.connected_names == []  # a picker tap never connects
 
     def test_empty_option_slot_tap_ignored_keeps_picker_open(self, reduced) -> None:
         _deck, client, ctx = reduced
@@ -388,7 +403,8 @@ class TestReducedViewPicker:
 
 
 MANY_VIEWS_SETTINGS = Settings(
-    # 15 named views + the implicit "all" = 16 options -> 2 picker pages of 12.
+    # 15 named views + the implicit "all" + the implicit "hidden" = 17
+    # options -> 2 picker pages of 12.
     views=tuple(View(name=f"view-{i:02d}", sessions=frozenset()) for i in range(15)),
     hidden_sessions=frozenset(),
     sort_order="manual",
@@ -419,12 +435,13 @@ class TestReducedViewPickerPaging:
         _deck, client, ctx = reduced_many_views
         ctx.handle_key(0)  # open picker: window 0 shows options[0:12]
         assert ctx.last_key_state[1] == ("picker", "all", True)
-        ctx.handle_key(14)  # NEXT -> window 12 shows options[12:16]
+        ctx.handle_key(14)  # NEXT -> window 12 shows options[12:17]
         assert ctx.picker.window_start == 12
-        # options = ["all"] + view-00..view-14; options[12] == "view-11"
+        # options = ["all"] + view-00..view-14 + ["hidden"]; options[12] == "view-11"
         assert ctx.last_key_state[1] == ("picker", "view-11", False)
-        assert ctx.last_key_state[4] == ("picker", "view-14", False)  # slot 3 = last
-        assert ctx.last_key_state[5] is None  # slot 4 -- past the end
+        assert ctx.last_key_state[4] == ("picker", "view-14", False)  # slot 3
+        # slot 4 -- options[16] == "hidden", the trailing pseudo-view
+        assert ctx.last_key_state[5] == ("picker", "hidden", False)
         # pagers show the picker's own page footer on page 2 of 2
         assert ctx.last_key_state[14] == ("control", "", "NEXT >", "p2/2")
         # slot tap on page 2 selects the right (windowed) view

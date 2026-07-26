@@ -62,7 +62,7 @@ class ViewCycler:
         self._timer: threading.Timer | None = None
 
     def names(self) -> list[str]:
-        """The current cycle list (`["all"] + <named views>`), a fresh copy."""
+        """The current cycle list (`["all"] + <named views> + ["hidden"]`), a fresh copy."""
         with self._lock:
             return list(self._names)
 
@@ -70,8 +70,24 @@ class ViewCycler:
         """Refresh the cycle list and the known server view from a fresh poll.
 
         `view_names` should be `settings.views` names in server order
-        (before the caller prepends "all"; "hidden" is excluded here too,
-        matching the spec's cycle list of ["all"] + named views).
+        (before this method prepends "all" and appends "hidden").
+
+        "hidden" is a reserved pseudo-view, exactly like "all": it is never
+        a member of `settings.views` (the server's `views.RESERVED_VIEW_NAMES`
+        rejects it as a user view name), but `active_view` already accepts it
+        (GET/PATCH /api/state) and both the server's `filter_visible` and
+        this sidecar's own `views.resolve_view` already treat it as a
+        first-class case -- a session's hidden state is a property
+        orthogonal to view membership, not a bucket alongside user views.
+        The only gap was discoverability: this cycle list is the sidecar's
+        sole source of selectable pseudo-view/view names, so appending
+        "hidden" last (mirroring the PWA's own view dropdown, which
+        hardcodes "All Sessions" first and "Hidden" as the always-last
+        system view -- see `renderViewDropdown()` in muxplex's
+        `frontend/app.js`) makes it reachable via dial-0 (FULL layout:
+        normal spin-cycling and the dial-press picker) and the paged
+        VIEW-key picker (REDUCED layout) -- both consume this same
+        `names()` list, so this one change covers both hardware layouts.
 
         Only updates the tracked "committed" view when no turn is currently
         in flight (no pending debounce timer) -- otherwise a poll landing
@@ -83,9 +99,11 @@ class ViewCycler:
         back to the real server value on the very next poll.
         """
         with self._lock:
-            self._names = ["all"] + [
-                n for n in view_names if n not in ("all", "hidden")
-            ]
+            self._names = (
+                ["all"]
+                + [n for n in view_names if n not in ("all", "hidden")]
+                + ["hidden"]
+            )
             if self._timer is None:
                 self._committed_view = active_view
 

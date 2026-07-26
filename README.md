@@ -311,14 +311,18 @@ active-session state are shown (colored borders, matched to muxplex's own
 brand palette).
 
 **Dial 0 -- view cycling:** turning steps through `["all"] + <your named
-views>` (wraps at the ends); the strip immediately echoes the candidate
-view name while turning, and after ~400ms of no further ticks it commits
-via `PATCH /api/state` -- so a fast spin sends exactly one request, not one
-per tick. `active_view` is *global* server-side state (last writer wins
-across every device/tab watching the server), so turning the dial changes
-what the PWA shows too, exactly like switching views there would.
-**Pressing** opens the **view picker** (see "Dial-press picker mode"
-below) instead of jumping straight to `all`.
+views> + ["hidden"]` (wraps at the ends); the strip immediately echoes the
+candidate view name while turning, and after ~400ms of no further ticks it
+commits via `PATCH /api/state` -- so a fast spin sends exactly one request,
+not one per tick. `hidden` is a reserved pseudo-view exactly like `all` --
+never a member of your named views, but reachable the same way -- and
+switching to it shows only the sessions you've hidden in the PWA (a
+property of the session, orthogonal to view membership; a session can be
+both hidden and a member of a named view). `active_view` is *global*
+server-side state (last writer wins across every device/tab watching the
+server), so turning the dial changes what the PWA shows too, exactly like
+switching views there would. **Pressing** opens the **view picker** (see
+"Dial-press picker mode" below) instead of jumping straight to `all`.
 
 **Dial 1 -- paging:** turning moves ±1 page within the current view (8
 sessions/page, clamped at the first/last page -- no wrap). Purely local --
@@ -331,8 +335,8 @@ picker** (see "Dial-press picker mode" below) instead of resetting to page 1.
 a chooser instead of performing an immediate action -- useful once there
 are more views or pages than there are keys (e.g. 9 views, or 9 pages of
 sessions). Pressing **dial 0** opens the **view picker**: each key shows
-one view name (`["all"] + <your named views>`, same list dial 0 cycles
-through); tapping a key switches to that view (`PATCH /api/state`) and
+one view name (`["all"] + <your named views> + ["hidden"]`, same list dial
+0 cycles through); tapping a key switches to that view (`PATCH /api/state`) and
 returns to the normal session display. Pressing **dial 1** opens the
 **page picker**: each key shows a page number for the current view; tapping
 one jumps straight there. While a picker is open: turning its *own* dial
