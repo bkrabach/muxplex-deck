@@ -338,6 +338,7 @@ class TestCheckDeckDetectedAndHidOpenable:
             lambda: _FakeManager(_FakeDeck(openable=False)),
         )
         monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
         monkeypatch.setattr(cli.sys, "platform", "linux")
         status, message = cli.check_hid_openable()
         assert status == "warn"

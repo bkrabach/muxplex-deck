@@ -22,6 +22,12 @@ dev = [
     "pytest>=8.0.0",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "allow_real_subprocess: test intentionally exercises the real subprocess.run (see tests/conftest.py)",
+    "allow_real_hid: test intentionally exercises the real device_real.RealDeviceManager (see tests/conftest.py)",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]
 build-backend = "uv_build"

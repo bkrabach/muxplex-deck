@@ -70,6 +70,45 @@ product. See `README.md` for setup, config, and verification checklists.
 - The muxplex read model is a ~2s poll cache: create/delete aren't visible
   until the next cycle; wait ~3s after writes before asserting.
 
+## Testing
+
+- `uv run pytest` runs the whole suite (`tests/`) -- 240 tests, no
+  hardware, no network, no real service, all in well under a second.
+- `tests/conftest.py` carries safety rails that make it structurally hard
+  for a careless test to touch anything real, applied PREVENTIVELY: this
+  repo's sibling, muxplex, had its own suite SIGTERM a live server and
+  overwrite a real `settings.json` in one day (see that repo's
+  `AGENTS.md`/`tests/conftest.py`) -- muxplex-deck carries the same class
+  of exposure (a real config file + secret federation key, a real
+  systemd/launchd service, exclusive real HID access), just without an
+  incident yet. Read `tests/conftest.py`'s module docstring before changing
+  anything there; `tests/test_safety_rails.py` fails loudly if a rail is
+  removed or weakened.
+
+  | Rail | Stops | Bypass |
+  |---|---|---|
+  | `pytest_sessionstart` guard | Running the suite at all while a real muxplex-deck service is active | `MUXPLEX_DECK_TEST_ALLOW_LIVE_SERVICE=1` |
+  | autouse `MUXPLEX_DECK_CONFIG` -> tmp | A test with no explicit `config_path` reading/writing the real `config.json` or `federation_key` | none (always on; explicit `config_path` still works normally) |
+  | autouse systemd/launchd path redirect | A test writing/removing a real unit file (`~/.config/systemd/user/`) or plist (`~/Library/LaunchAgents/`) | none (always on) |
+  | autouse `XDG_STATE_HOME` -> tmp | A test overwriting a real running sidecar's `status.json` | none (always on) |
+  | autouse `subprocess.run` neutering | A test shelling out to a real `systemctl`/`launchctl`/`loginctl`/`openssl`/`git`/`uv`/`pip` | `@pytest.mark.allow_real_subprocess` |
+  | autouse HID neutering | A test opening/enumerating a real Stream Deck via `device_real.RealDeviceManager` | `@pytest.mark.allow_real_hid` |
+  | `test_safety_rails.py` | Silent removal or weakening of any rail above | n/a |
+
+  The two bypass markers are registered in `pyproject.toml`
+  (`[tool.pytest.ini_options] markers`) and are currently unused by any
+  test in this repo -- every existing test that needs real-ish behavior
+  fakes it explicitly instead (e.g. `test_cli_service.py`'s
+  `recording_run` fixture, `test_cli_doctor.py`'s `_FakeManager`). Reach
+  for a marker only when a test genuinely needs the real implementation;
+  it must be visible in review, not a default.
+  The two path-isolation rails (`MUXPLEX_DECK_CONFIG`, `XDG_STATE_HOME`)
+  are set via environment variable rather than by stubbing the resolver
+  functions directly, so they don't fight `test_config.py`'s and
+  `test_statusfile.py`'s own dedicated tests of those functions' sudo-
+  aware / `XDG_STATE_HOME`-aware fallback logic -- those tests set/delete
+  the env var themselves, which simply overrides the autouse default.
+
 ## Config
 
 - `~/.config/muxplex-deck/config.json` (`--config` / `MUXPLEX_DECK_CONFIG`
