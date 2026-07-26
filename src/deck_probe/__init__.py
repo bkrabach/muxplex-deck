@@ -11,4 +11,4 @@ server/network integration lives in this package, device I/O only.
 from .main import main
 
 __all__ = ["main"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

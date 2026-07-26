@@ -1,6 +1,6 @@
 [project]
 name = "muxplex-deck"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hardware probe/diagnostic app for the Elgato Stream Deck+ (seed of the muxplex sidecar)"
 readme = "README.md"
 authors = [
