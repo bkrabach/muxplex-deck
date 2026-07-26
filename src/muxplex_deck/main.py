@@ -838,7 +838,7 @@ def _describe_deck_caps(deck: DeckDevice) -> dict | None:
     down the active session -- it only degrades what `status` can show.
     """
     try:
-        from deck_probe.capabilities import describe_capabilities  # noqa: PLC0415
+        from deck_probe.capabilities import describe_capabilities
 
         return describe_capabilities(deck)  # type: ignore[arg-type]
     except Exception:

@@ -71,8 +71,8 @@ def run(
     This is the CLI-level entry ("the default action"); the actual hotplug
     state machine lives in `muxplex_deck.main.run(config, manager)`.
     """
-    from . import main as main_mod  # noqa: PLC0415
-    from .device import DeviceProbeError  # noqa: PLC0415
+    from . import main as main_mod
+    from .device import DeviceProbeError
 
     try:
         cfg = config_mod.load_config(config_path)
@@ -99,10 +99,10 @@ def run(
 def get_version() -> str:
     """Return the installed muxplex-deck version, or "dev" if not installed."""
     try:
-        from importlib.metadata import version as pkg_version  # noqa: PLC0415
+        from importlib.metadata import version as pkg_version
 
         return pkg_version("muxplex-deck")
-    except Exception:
+    except Exception:  # noqa: BLE001 -- importlib.metadata can fail in several ways when not installed
         return "dev"
 
 
@@ -267,6 +267,7 @@ def _check_for_update(info: dict) -> tuple[bool, str]:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 return True, "could not check remote -- upgrading to be safe"
@@ -279,7 +280,7 @@ def _check_for_update(info: dict) -> tuple[bool, str]:
             if local_sha == remote_sha:
                 return False, f"up to date (commit {local_sha[:8]})"
             return True, f"update available ({local_sha[:8]} -> {remote_sha[:8]})"
-        except Exception:
+        except Exception:  # noqa: BLE001 -- any git/network failure means "upgrade to be safe"
             return True, "check failed -- upgrading to be safe"
 
     return True, "unknown install source -- could not check"
@@ -345,10 +346,11 @@ def check_ca_file(ca_file: Path | None) -> tuple[str, str]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError:
         return "warn", "openssl not found -- cannot verify ca_file is a CA"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- doctor check must degrade to warn, never raise
         return "warn", f"Could not inspect ca_file {ca_file}: {exc}"
 
     if result.returncode != 0:
@@ -378,16 +380,16 @@ def probe_deck_status(manager: Any) -> dict:
     """
     try:
         deck = manager.find_device()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- HID backends raise varied errors; report, don't crash
         return {"found": False, "openable": False, "caps": None, "error": str(exc)}
     if deck is None:
         return {"found": False, "openable": False, "caps": None, "error": None}
     try:
         deck.open()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- HID backends raise varied errors; report, don't crash
         return {"found": True, "openable": False, "caps": None, "error": str(exc)}
     try:
-        from deck_probe.capabilities import describe_capabilities  # noqa: PLC0415
+        from deck_probe.capabilities import describe_capabilities
 
         caps = describe_capabilities(deck)
         return {"found": True, "openable": True, "caps": caps, "error": None}
@@ -414,8 +416,8 @@ _NO_DEVICE_GUIDANCE = (
 def check_deck_detected(config_path: str | None = None) -> tuple[str, str]:
     """Enumerate + describe the connected Stream Deck (real hardware probe)."""
     try:
-        from .device import DeviceProbeError  # noqa: PLC0415
-        from .device_real import RealDeviceManager  # noqa: PLC0415
+        from .device import DeviceProbeError
+        from .device_real import RealDeviceManager
     except ImportError as exc:
         return "warn", f"Could not import Stream Deck backend: {exc}"
 
@@ -456,9 +458,9 @@ def check_hid_openable() -> tuple[str, str]:
     false-positive this check exists to avoid.
     """
     try:
-        from .device import DeviceProbeError  # noqa: PLC0415
-        from .device_real import RealDeviceManager  # noqa: PLC0415
-        from .service import service_is_active, udev_rule_exists  # noqa: PLC0415
+        from .device import DeviceProbeError
+        from .device_real import RealDeviceManager
+        from .service import service_is_active, udev_rule_exists
     except ImportError as exc:
         return "warn", f"Could not import Stream Deck backend: {exc}"
 
@@ -563,7 +565,7 @@ def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, 
                 "the server's CA, not its leaf certificate"
             )
         return "warn", f"Server unreachable: {exc}"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- catch-all after explicit httpx cases; doctor never raises
         return "warn", f"Server check failed: {exc}"
 
 
@@ -579,6 +581,7 @@ def check_service_status() -> tuple[str, str]:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                check=False,
             )
         except FileNotFoundError:
             return "warn", "Service: launchctl not found"
@@ -592,6 +595,7 @@ def check_service_status() -> tuple[str, str]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError:
         return "warn", "Service: systemctl not found -- run muxplex-deck directly"
@@ -723,8 +727,8 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
     fall back to a direct probe -- this keeps `status` useful even before
     the service has ever been installed.
     """
-    from .service import service_is_active  # noqa: PLC0415
-    from .statusfile import read_status  # noqa: PLC0415
+    from .service import service_is_active
+    from .statusfile import read_status
 
     running = service_is_active()
     data = read_status()
@@ -846,7 +850,7 @@ def _service_is_active() -> bool:
     existing call sites/tests can monkeypatch `cli._service_is_active`
     directly without needing to know it delegates.
     """
-    from .service import service_is_active  # noqa: PLC0415
+    from .service import service_is_active
 
     return service_is_active()
 
@@ -860,7 +864,7 @@ def update() -> None:
     --force`'s own semantics). Reporting style (plain `  ERROR: ...` on
     stderr equivalent) matches muxplex's.
     """
-    from .service import service_install  # noqa: PLC0415
+    from .service import service_install
 
     print("\nmuxplex-deck update\n")
 
@@ -874,10 +878,13 @@ def update() -> None:
             subprocess.run(
                 ["launchctl", "bootout", f"gui/{uid}/com.muxplex-deck"],
                 capture_output=True,
+                check=False,
             )
         else:
             subprocess.run(
-                ["systemctl", "--user", "stop", "muxplex-deck"], capture_output=True
+                ["systemctl", "--user", "stop", "muxplex-deck"],
+                capture_output=True,
+                check=False,
             )
     else:
         print("  No active service found (skipping stop)")
@@ -892,6 +899,7 @@ def update() -> None:
                 [uv_path, "tool", "install", "--force", f"git+{_REPO_URL}"],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if result.returncode != 0:
                 print(f"  ERROR: uv tool install failed:\n{result.stderr}")
@@ -905,6 +913,7 @@ def update() -> None:
                     [pip_path, "install", "--upgrade", f"git+{_REPO_URL}"],
                     capture_output=True,
                     text=True,
+                    check=False,
                 )
                 if result.returncode != 0:
                     print(f"  ERROR: pip install failed:\n{result.stderr}")
@@ -919,16 +928,16 @@ def update() -> None:
             print("  Regenerating service file...")
             try:
                 service_install()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- report and continue; update must still finish
                 print(f"  ERROR: service file regeneration failed: {exc}")
     finally:
         if was_active:
             print("  Restarting service...")
             try:
-                from .service import service_restart  # noqa: PLC0415
+                from .service import service_restart
 
                 service_restart()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- report and continue; update must still finish
                 print(f"  ERROR: service restart failed: {exc}")
                 restart_failed = True
             else:
@@ -1050,7 +1059,7 @@ def main() -> None:
     elif args.command in ("update", "upgrade"):
         update()
     elif args.command == "init":
-        from .init_wizard import run_init  # noqa: PLC0415
+        from .init_wizard import run_init
 
         sys.exit(
             run_init(
@@ -1071,7 +1080,7 @@ def main() -> None:
         else:
             config_list(config_path)
     elif args.command == "service":
-        from .service import (  # noqa: PLC0415
+        from .service import (
             service_install,
             service_logs,
             service_restart,

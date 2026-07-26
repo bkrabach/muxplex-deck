@@ -34,7 +34,7 @@ try:
     import muxplex_deck.device_real as _device_real_mod
 
     _ORIGINAL_REAL_DEVICE_MANAGER: object | None = _device_real_mod.RealDeviceManager
-except Exception:  # pragma: no cover - import shape changed
+except Exception:  # noqa: BLE001 -- pragma: no cover - import shape changed
     _device_real_mod = None  # type: ignore[assignment]
     _ORIGINAL_REAL_DEVICE_MANAGER = None
 
@@ -190,7 +190,7 @@ def test_status_path_isolated_by_default():
 def test_subprocess_run_is_neutralized_by_default():
     """A test that does not opt in must not reach the real subprocess.run."""
     with pytest.raises(AssertionError, match="REFUSING TO RUN"):
-        subprocess.run(["true"])
+        subprocess.run(["true"], check=False)
 
 
 @pytest.mark.allow_real_subprocess

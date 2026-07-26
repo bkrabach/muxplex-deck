@@ -102,7 +102,7 @@ def _validate_server(
         print(f"\nChecking {current} ...")
         try:
             data = cli_mod.fetch_instance_info(current, verify=True)
-        except Exception as exc:  # noqa: BLE001 -- httpx raises several types here
+        except Exception as exc:
             if cli_mod._is_tls_error(exc):
                 print(f"  ! TLS verification failed: {exc}")
                 print(

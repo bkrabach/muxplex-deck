@@ -64,11 +64,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         return
     try:
         from muxplex_deck.service import service_is_active
-    except Exception:  # pragma: no cover - import shape changed
+    except Exception:  # noqa: BLE001 -- pragma: no cover - import shape changed
         return
     try:
         active = service_is_active()
-    except Exception:  # pragma: no cover - never let the guard crash the run
+    except Exception:  # noqa: BLE001 -- pragma: no cover - never let the guard crash the run
         return
     if not active:
         return
@@ -146,7 +146,7 @@ def _isolate_service_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """
     try:
         import muxplex_deck.service as service_mod
-    except Exception:  # pragma: no cover - import shape changed
+    except Exception:  # noqa: BLE001 -- pragma: no cover - import shape changed
         yield
         return
     systemd_dir = tmp_path / "systemd-user"
@@ -289,7 +289,7 @@ def _neutralize_real_hid(
         return
     try:
         import muxplex_deck.device_real as device_real_mod
-    except Exception:  # pragma: no cover - import shape changed
+    except Exception:  # noqa: BLE001 -- pragma: no cover - import shape changed
         yield
         return
     monkeypatch.setattr(

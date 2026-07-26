@@ -75,6 +75,7 @@ def _focus_macos(name: str) -> None:
             capture_output=True,
             text=True,
             timeout=FOCUS_TIMEOUT_SECONDS,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("focus: could not activate %r: %s", name, exc)

@@ -42,6 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
+from typing import Self
 
 import httpx
 
@@ -180,7 +181,7 @@ class MuxplexClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> MuxplexClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(

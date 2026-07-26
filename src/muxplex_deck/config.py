@@ -75,7 +75,7 @@ def _expand(path: str | Path) -> Path:
     text = str(path)
     if text == "~":
         return _invoking_user_home()
-    if text.startswith("~/") or text.startswith("~\\"):
+    if text.startswith(("~/", "~\\")):
         return _invoking_user_home() / text[2:]
     return Path(text).expanduser()
 

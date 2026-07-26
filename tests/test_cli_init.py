@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import pytest
@@ -25,7 +25,6 @@ from muxplex_deck import cli as cli_mod
 from muxplex_deck import config as config_mod
 from muxplex_deck import init_wizard
 from muxplex_deck.config import DEFAULT_CONFIG
-
 
 # ---------------------------------------------------------------------------
 # Fakes: httpx.Client, subprocess.run (openssl)
@@ -60,10 +59,10 @@ class _FakeHttpxClient:
     def __init__(self, responses: dict[str, Any], **_kwargs: Any) -> None:
         self._responses = responses
 
-    def __enter__(self) -> "_FakeHttpxClient":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *_exc: Any) -> None:
+    def __exit__(self, *_exc: object) -> None:
         return None
 
     def get(self, url: str) -> Any:

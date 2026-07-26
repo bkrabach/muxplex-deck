@@ -223,6 +223,7 @@ def service_is_active() -> bool:
                 ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
                 capture_output=True,
                 text=True,
+                check=False,
             )
         except FileNotFoundError:
             return False
@@ -233,6 +234,7 @@ def service_is_active() -> bool:
             ["systemctl", "--user", "is-active", "muxplex-deck"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return False
@@ -253,7 +255,10 @@ def _enable_linger() -> None:
         return
     user = getpass.getuser()
     result = subprocess.run(
-        ["loginctl", "enable-linger", user], capture_output=True, text=True
+        ["loginctl", "enable-linger", user],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode == 0:
         print(f"  Linger enabled for {user} (service survives logout)")
@@ -313,13 +318,15 @@ def _systemd_install() -> None:
 def _systemd_uninstall() -> None:
     print("\nmuxplex-deck service uninstall (systemd --user)\n")
 
-    result = subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"])
+    result = subprocess.run(
+        ["systemctl", "--user", "stop", "muxplex-deck"], check=False
+    )
     if result.returncode == 0:
         _step_ok("Stopped the service")
     else:
         _step_warn("Service was not running (nothing to stop)")
 
-    subprocess.run(["systemctl", "--user", "disable", "muxplex-deck"])
+    subprocess.run(["systemctl", "--user", "disable", "muxplex-deck"], check=False)
     _step_ok("Disabled the service")
 
     had_unit = _SYSTEMD_UNIT_PATH.exists()
@@ -340,7 +347,7 @@ def _systemd_start() -> None:
 
 
 def _systemd_stop() -> None:
-    subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"])
+    subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"], check=False)
 
 
 def _systemd_restart() -> None:
@@ -348,12 +355,16 @@ def _systemd_restart() -> None:
 
 
 def _systemd_status() -> None:
-    subprocess.run(["systemctl", "--user", "status", "muxplex-deck", "--no-pager"])
+    subprocess.run(
+        ["systemctl", "--user", "status", "muxplex-deck", "--no-pager"], check=False
+    )
 
 
 def _systemd_logs() -> None:
     try:
-        subprocess.run(["journalctl", "--user", "-u", "muxplex-deck", "-f"])
+        subprocess.run(
+            ["journalctl", "--user", "-u", "muxplex-deck", "-f"], check=False
+        )
     except KeyboardInterrupt:
         pass
 
@@ -404,7 +415,9 @@ def _launchd_uninstall() -> None:
     print("\nmuxplex-deck service uninstall (launchd)\n")
 
     uid = os.getuid()
-    result = subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"])
+    result = subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False
+    )
     if result.returncode == 0:
         _step_ok("Stopped + unloaded the service")
     else:
@@ -429,7 +442,7 @@ def _launchd_start() -> None:
 
 def _launchd_stop() -> None:
     uid = os.getuid()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"])
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False)
 
 
 def _launchd_restart() -> None:
@@ -439,12 +452,12 @@ def _launchd_restart() -> None:
 
 def _launchd_status() -> None:
     uid = os.getuid()
-    subprocess.run(["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"])
+    subprocess.run(["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False)
 
 
 def _launchd_logs() -> None:
     try:
-        subprocess.run(["tail", "-f", "/tmp/muxplex-deck.log"])
+        subprocess.run(["tail", "-f", "/tmp/muxplex-deck.log"], check=False)
     except KeyboardInterrupt:
         pass
 

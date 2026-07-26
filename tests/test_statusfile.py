@@ -14,7 +14,6 @@ import pytest
 
 from muxplex_deck import statusfile
 
-
 # ---------------------------------------------------------------------------
 # default_status_dir / default_status_path
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+
 from deck_probe.capabilities import DeckCapabilitySource
 from muxplex_deck.device_real import RealDeckDevice
 from muxplex_deck.emulator import EmulatorDevice

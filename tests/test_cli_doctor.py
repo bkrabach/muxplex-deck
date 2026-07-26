@@ -10,12 +10,11 @@ when every single check fails/warns.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
 from muxplex_deck import cli
-
 
 # ---------------------------------------------------------------------------
 # check_python_version
@@ -352,7 +351,7 @@ class TestCheckDeckDetectedAndHidOpenable:
             "RealDeviceManager",
             lambda: _FakeManager(_FakeDeck(openable=True)),
         )
-        status, message = cli.check_hid_openable()
+        status, _message = cli.check_hid_openable()
         assert status == "ok"
 
     def test_no_device_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -433,10 +432,10 @@ class _FakeHttpxClient:
     def __init__(self, response: _FakeResponse | Exception, **_kwargs: Any) -> None:
         self._response = response
 
-    def __enter__(self) -> "_FakeHttpxClient":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         return None
 
     def get(self, url: str) -> _FakeResponse:
