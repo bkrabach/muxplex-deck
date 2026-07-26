@@ -697,14 +697,11 @@ class _ActiveRuntime:
         # input and delayed the highlight by up to a full poll interval. The
         # PWA already does this optimistically; this mirrors it.
         with self.paint_lock:
-            changed = self.active_session != name
             self.active_session = name
         self.repaint()
-        threading.Thread(
-            target=self._do_connect, args=(name, changed), daemon=True
-        ).start()
+        threading.Thread(target=self._do_connect, args=(name,), daemon=True).start()
 
-    def _do_connect(self, name: str, changed: bool) -> None:
+    def _do_connect(self, name: str) -> None:
         """Background-thread body for a key-press connect (see `connect`).
 
         On failure, logs loudly and shows it on the strip -- but does not
@@ -713,17 +710,23 @@ class _ActiveRuntime:
         actually has, which self-heals a wrong guess without this method
         needing to know anything about polling.
 
-        `changed` is whether this press actually moved the active session.
-        It gates the PWA foreground focus: pressing the already-active
-        session's key shouldn't yank a window around, and poll-driven
-        repaints / dial actions never reach this method at all -- focus
-        fires ONLY on an explicit key-press session switch. Focus runs
-        before the connect POST (it's ~100ms vs the server's multi-second
-        ttyd respawn, so the window is forward by the time the switch
-        lands) and is best-effort: `.focus` swallows every failure.
+        Focus fires on EVERY explicit key-press connect, whether or not the
+        press actually changes the active session: the physical button is
+        the user's request to bring the PWA to the foreground with that
+        session showing, and re-pressing the already-active session's key is
+        a legitimate way to reacquire the window (e.g. after alt-tabbing
+        away on the Mac) -- gating focus on a session CHANGE silently
+        dropped that use. Poll-driven repaints / dial actions never reach
+        this method at all, so focus still never fires on anything but an
+        explicit key press. Focus runs before the connect POST (it's ~100ms
+        vs the server's multi-second ttyd respawn, so the window is
+        foreground by the time the switch lands) and is best-effort:
+        `focus_app` swallows every failure. The connect POST itself is
+        unconditional too -- harmless when unchanged: the server already
+        short-circuits a same-session connect (no ttyd kill/respawn, ~2ms)
+        rather than this method needing to skip it.
         """
-        if changed:
-            focus.focus_app(self.focus_app_name)
+        focus.focus_app(self.focus_app_name)
         try:
             with self.client_lock:
                 self.client.connect_session(name)

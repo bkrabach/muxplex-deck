@@ -255,6 +255,35 @@ class TestReducedRuntime:
         assert client.connected_names == ["session-00"]
         assert ctx.active_session == "session-00"  # optimistic highlight
 
+    def test_key_press_focuses_pwa_even_when_session_unchanged(
+        self, reduced, monkeypatch
+    ) -> None:
+        """Regression: re-pressing the already-active session's key must still
+        focus the PWA. `_do_connect` used to gate `focus.focus_app` on whether
+        the press actually changed the active session, so pressing the SAME
+        key twice only focused on the first press -- silently dropping the
+        deck's "bring the window back" use case (e.g. after alt-tabbing away).
+        """
+        _deck, client, ctx = reduced
+        focus_calls: list[str] = []
+        monkeypatch.setattr(
+            "muxplex_deck.main.focus.focus_app",
+            lambda name: focus_calls.append(name),
+        )
+        ctx.focus_app_name = "Muxplex"
+
+        ctx.handle_key(1)  # first press -> connects session-00 (changed)
+        assert client.connect_event.wait(_WAIT_SECONDS)
+        client.connect_event.clear()
+
+        ctx.handle_key(1)  # second press, SAME slot/session -> must still focus
+        assert client.connect_event.wait(_WAIT_SECONDS)
+
+        assert focus_calls == ["Muxplex", "Muxplex"], (
+            "every explicit key press must focus the PWA, whether or not the "
+            f"active session actually changed; got {focus_calls!r}"
+        )
+
     def test_session_slot_after_reserved_key_maps_correctly(self, reduced) -> None:
         _deck, client, ctx = reduced
         ctx.handle_key(11)  # physical key 11 -> slot 9 (10 is reserved PREV)
