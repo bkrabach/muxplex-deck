@@ -123,23 +123,6 @@ _LAUNCHD_PLIST_TEMPLATE = """\
 </plist>
 """
 
-_UDEV_RULE_CONTENT = (
-    'SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0660", TAG+="uaccess"\n'
-    'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0660", TAG+="uaccess"\n'
-)
-
-_UDEV_REMEDIATION = f"""\
-  ! No udev rule found for the Stream Deck (vendor id {_ELGATO_VENDOR_ID}).
-    Without it, the service (running as your user, not root) will fail to
-    open the device. Install a rule once:
-
-      sudo tee /etc/udev/rules.d/70-streamdeck.rules >/dev/null <<'EOF'
-{_UDEV_RULE_CONTENT}EOF
-      sudo udevadm control --reload-rules && sudo udevadm trigger
-
-    Then unplug and replug the Stream Deck (or re-run `usbipd attach` under WSL).
-"""
-
 # Same ✓/! 2-space-indent style as `cli.doctor()`'s `print_check` -- kept as
 # a small local duplicate (rather than importing from `cli.py`) to avoid a
 # circular import: `cli.py` already imports from this module at call time.
@@ -231,10 +214,54 @@ def udev_rule_exists() -> bool:
     return False
 
 
+def _print_guidance_block(message: str) -> None:
+    """Print a multi-line guidance message in `print_check`'s ✓/! style.
+
+    First line gets the warn mark + 2-space indent; continuation lines
+    get a bare 4-space indent -- the same convention `cli.print_check`
+    uses (kept as a small local duplicate here to avoid a circular import
+    with `cli.py`).
+    """
+    for i, line in enumerate(message.splitlines()):
+        prefix = f"  {_MARK_WARN} " if i == 0 else "    "
+        print(f"{prefix}{line}")
+
+
 def _warn_if_no_udev_rule() -> None:
-    """Print the udev remediation block (non-fatal) if no rule is present."""
-    if not udev_rule_exists():
-        print(_UDEV_REMEDIATION)
+    """Print the udev remediation block (non-fatal) if no rule is present.
+
+    Delegates the actual guidance text to `hidhelp.udev_guidance()` -- the
+    single home for this string (see WSL_COLD_START_SPEC.md P6). That
+    function returns `None` when udev isn't actually running (P4: never
+    print a command known to fail here); in that case this prints
+    nothing, and the U-DEAD guidance from `hidhelp.explain_environment()`
+    (surfaced separately by `_print_environment_guidance()` below) takes
+    its place instead.
+    """
+    if udev_rule_exists():
+        return
+    from . import hidhelp
+
+    guidance = hidhelp.udev_guidance()
+    if guidance is None:
+        return
+    _print_guidance_block(guidance.message)
+
+
+def _print_environment_guidance() -> None:
+    """Print any WSL / permission guidance relevant to this environment.
+
+    Read-only: only queries (e.g. `usbipd.exe list`), never mutates --
+    `service install` may observe the environment but must never attach a
+    device (see WSL_COLD_START_SPEC.md section 6.2). Prints nothing on a
+    healthy platform (macOS, or native Linux with udev running) -- this is
+    what keeps output unchanged for those users.
+    """
+    from . import hidhelp
+
+    for guidance in hidhelp.explain_environment():
+        print()
+        _print_guidance_block(guidance.message)
 
 
 def service_is_active() -> bool:
