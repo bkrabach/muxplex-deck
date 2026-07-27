@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.5.0 (2026-07-27)
+
+### Features
+
+- **The CLI now teaches WSL setup instead of assuming it.** A Stream Deck reaches WSL only over USB/IP, and every step of that — sharing the device from Windows, attaching it to the distro, granting access to the resulting device node — happens outside anything the sidecar previously knew about. A new user got a generic "device not found" and was left to discover the rest. Now `doctor`, `status`, `service install`, `init`, and the sidecar itself detect which of those steps is outstanding and print the specific next command, with real values substituted: the actual BUSID discovered from `usbipd.exe list`, the actual device node resolved from sysfs. A new `muxplex-deck wsl attach` wraps the attach step, which matters because attaching is not one-time — it must be repeated after every unplug and every Windows reboot, and it is exactly where the `usbipd` name collision bites. Diagnostics only ever *read* USB/IP state; the single command that mutates the Windows host's device topology is the one explicitly named for it. The tool never invokes `sudo` — privileged steps are printed for you to run.
+
+- **`muxplex-deck wsl attach`.** Resolves the Stream Deck's BUSID itself and attaches it to the current distro, always invoking the Windows binary by absolute path so the identically-named Linux `usbipd` from `linux-tools-common` — which advertises kernel packages that do not exist for the WSL kernel — cannot be selected by accident.
+
+### Bug Fixes
+
+- **The udev remediation was wrong on WSL and is no longer offered there.** Install printed a udev rule unconditionally; on WSL the rule never fires, so a user could follow the instructions exactly and see no change. Remediation is now gated on whether udev is actually running — probed by the presence of its control socket rather than by guessing the platform — which also corrects the same bad advice inside plain Linux containers. The shipped rule additionally carried a `hidraw` line that could never apply, since the device is only ever opened through libusb, and a `uaccess` tag that requires a logind seat WSL does not have.
+
+- **`status` reported a healthy server as unreachable.** When the sidecar failed to open the device it returned to the top of its loop without publishing status, so the status file froze at whatever it last held — showing a stale "unreachable" for a server that was fine. The failure path now publishes state along with a hint naming the actual blocking step.
+
+- **The open failure no longer floods the journal.** A full traceback was logged on every poll cycle for as long as the device stayed unavailable. It is now logged once per failure episode, with the traceback at debug level and a periodic counting heartbeat.
+
+### Verification
+
+- 360 tests passed via pytest (baseline 267 + 93 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.4.1 (2026-07-27)
 
 ### Bug Fixes
