@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.0 (2026-07-26)
+
+### Features
+
+- **First PyPI release.** This package had only ever been installable with `uv tool install git+https://github.com/bkrabach/muxplex-deck.git`, which put upgrades on a path with a sharp edge: an install pinned to a tag reports "Nothing to upgrade" indefinitely, because `uv tool upgrade` resolves strictly within the recorded requirement. Getting a fix onto a machine in that state took a forced reinstall against the git URL. Published releases make `uv tool upgrade muxplex-deck` mean what it says. A `publish.yml` workflow now builds and publishes on any `v*` tag via OIDC Trusted Publishing, matching the sibling repo's release path.
+
+- **Adopts the new `muxplex-client` library.** The 264-line hand-rolled httpx client is deleted in favor of `muxplex-client>=0.19.0`, published from the muxplex repo. The semantics this repo had been re-implementing — attention/bell state, the input key allowlist, capture-depth bounds — now have a single home, with a contract test in the server's own suite asserting the two implementations agree. All 242 tests pass against the published package with no test-body changes beyond the interface rename the adoption required.
+
+### Internal
+
+- **The repository is now public.**
+
+### Verification
+
+- 242 tests passed via pytest.
+- All five CI jobs green on feature push and release push: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+- Verified clean resolution via `uv sync` in an isolated directory (no muxplex sibling on path) — `muxplex-client==0.19.0` resolved from PyPI, not editable path.
+
+### Dependencies
+
+- muxplex-client >= 0.19.0 (new)
+- streamdeck >= 0.9.5
+- pillow >= 10.0.0
+- pytest >= 8.0.0 (dev)
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.3.0
 
 ### Bug Fixes
