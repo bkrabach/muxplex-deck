@@ -65,11 +65,13 @@ class _FakeHttpxClient:
     def __exit__(self, *_exc: object) -> None:
         return None
 
-    def get(self, url: str) -> Any:
+    def get(self, url: str, headers: dict[str, str] | None = None) -> Any:
         for suffix, resp in self._responses.items():
             if url.endswith(suffix):
                 if isinstance(resp, Exception):
                     raise resp
+                if callable(resp):
+                    return resp(headers)
                 return resp
         raise AssertionError(f"unexpected URL requested in test: {url}")
 
@@ -163,6 +165,7 @@ class TestReachableServerWritesConfig:
                     {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
                 ),
                 "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
         rc = init_wizard.run_init(
@@ -204,6 +207,7 @@ class TestCaAutoFetch:
                     {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
                 ),
                 "/api/ca": _FakeCaResponse(200, content=cert_bytes),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
         rc = init_wizard.run_init(
@@ -251,6 +255,7 @@ class TestCaSkippedWhenTlsAlreadyWorks:
                     {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
                 ),
                 "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
         rc = init_wizard.run_init(
@@ -292,6 +297,7 @@ class TestCaPromptRejectsLeafCert:
             {
                 "/api/instance-info": tls_exc,
                 "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
 
@@ -352,6 +358,7 @@ class TestFederationKeyProtection:
                     {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
                 ),
                 "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
         rc = init_wizard.run_init(
@@ -378,6 +385,104 @@ class TestFederationKeyProtection:
 
 
 # ---------------------------------------------------------------------------
+# 5b. Federation key VALIDATION -- the actual bug this round of fixes closes:
+# `init` used to write a pasted key without ever exercising it. `/api/
+# instance-info` (used to verify the server, above) is unauthenticated and
+# proves nothing about the key -- only an authenticated request can.
+# ---------------------------------------------------------------------------
+
+
+def _sessions_route_checking_bearer(accepted_key: str):
+    """Route /api/sessions by the Authorization header actually sent --
+
+    this proves the wizard is validating the REAL key value, not just
+    calling the endpoint and assuming success.
+    """
+
+    def _respond(headers: dict[str, str] | None) -> _FakeCaResponse:
+        token = (headers or {}).get("Authorization", "")
+        if token == f"Bearer {accepted_key}":
+            return _FakeCaResponse(200)
+        return _FakeCaResponse(401)
+
+    return _respond
+
+
+class TestFederationKeyValidation:
+    def test_rejected_key_loops_until_accepted(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _sessions_route_checking_bearer("right-key"),
+            },
+        )
+        getpass_sequence = iter(["wrong-key", "right-key"])
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input(["n"]),
+            getpass_func=lambda _p: next(getpass_sequence),
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "rejected by server" in out.lower()
+        assert "Try again" in out
+        assert "verified against server" in out.lower()
+
+        key_path = deck_home / ".config" / "muxplex-deck" / "federation_key"
+        # The REJECTED key must never be persisted -- only the accepted one.
+        assert key_path.read_text(encoding="utf-8").strip() == "right-key"
+
+    def test_network_error_warns_but_does_not_fabricate_success(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A network hiccup verifying the key is not evidence the key is
+
+        wrong -- must warn honestly (never print a false "verified" check)
+        but must not block init forever on something re-pasting can't fix.
+        """
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": httpx.ConnectError("connection reset"),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input(["n"]),
+            getpass_func=lambda _p: "some-key",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "could not verify federation key" in out.lower()
+        assert "verified against server" not in out.lower()
+
+        key_path = deck_home / ".config" / "muxplex-deck" / "federation_key"
+        assert key_path.read_text(encoding="utf-8").strip() == "some-key"
+
+
+# ---------------------------------------------------------------------------
 # 6. federation_enabled: false -> up-front warning
 # ---------------------------------------------------------------------------
 
@@ -401,6 +506,7 @@ class TestFederationDisabledWarning:
                     }
                 ),
                 "/api/ca": _FakeCaResponse(404),
+                "/api/sessions": _FakeCaResponse(200),
             },
         )
         rc = init_wizard.run_init(

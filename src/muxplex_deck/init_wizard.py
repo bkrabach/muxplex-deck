@@ -207,10 +207,24 @@ def _resolve_ca(
 def _resolve_federation_key(
     key_file_path: Path,
     *,
+    server_url: str,
+    ca_file: str | None,
     non_interactive: bool,
     input_func: Callable[[str], str],
     getpass_func: Callable[[str], str],
 ) -> None:
+    """Resolve, VALIDATE, and write the federation key.
+
+    A pasted/loaded key is never written on faith. `/api/instance-info`
+    (already used above to verify the server) is unauthenticated and proves
+    nothing about a credential -- this is exactly the gap that let `init`
+    once print a green "Server reachable" check, write config, and offer to
+    install the service for a federation key that was simply wrong; the
+    user only found out once the running service couldn't authenticate
+    (see AGENTS.md). `cli.check_federation_key_auth` issues one real
+    authenticated request and this loops until it's accepted, or the user
+    gives up (Ctrl-C/EOF, handled by `run_init`'s caller).
+    """
     if key_file_path.exists() and key_file_path.stat().st_size > 0:
         if non_interactive:
             print(f"  Federation key: keeping existing {key_file_path}")
@@ -237,17 +251,38 @@ def _resolve_federation_key(
         "read ~/.config/muxplex/federation_key there. SSH fallback:"
     )
     print(f"    scp <your-server>:.config/muxplex/federation_key {key_file_path}")
-    pasted = getpass_func("Federation key (or path): ")
-    value = pasted.strip()
-    candidate_path = Path(value).expanduser() if value else None
 
-    if candidate_path is not None and candidate_path.is_file():
-        key_value = candidate_path.read_text(encoding="utf-8").strip()
-    else:
-        key_value = value
+    verify: bool | str = ca_file if ca_file else True
+    key_value = ""
+    while True:
+        pasted = getpass_func("Federation key (or path): ")
+        value = pasted.strip()
+        candidate_path = Path(value).expanduser() if value else None
 
-    if not key_value:
-        raise _InitError("no federation key provided")
+        if candidate_path is not None and candidate_path.is_file():
+            key_value = candidate_path.read_text(encoding="utf-8").strip()
+        else:
+            key_value = value
+
+        if not key_value:
+            raise _InitError("no federation key provided")
+
+        status, message = cli_mod.check_federation_key_auth(
+            server_url, key_value, verify=verify
+        )
+        if status == "ok":
+            cli_mod.print_check("ok", "Federation key: verified against server")
+            break
+        if status == "fail":
+            cli_mod.print_check("fail", message)
+            print("  Try again -- paste the correct key, or a path to it.")
+            continue
+        # status == "warn": could not verify one way or the other (network
+        # hiccup, timeout) -- not evidence the key itself is wrong, so
+        # don't loop forever on something re-pasting can't fix. Still,
+        # never claim a check that didn't actually run succeeded.
+        cli_mod.print_check("warn", message)
+        break
 
     key_file_path.parent.mkdir(parents=True, exist_ok=True)
     key_file_path.parent.chmod(0o700)
@@ -311,6 +346,8 @@ def _run_init_impl(
     key_file_raw = raw.get("key_file") or config_mod.DEFAULT_KEY_FILE
     _resolve_federation_key(
         config_mod._expand(key_file_raw),
+        server_url=server_url,
+        ca_file=ca_file_value,
         non_interactive=non_interactive,
         input_func=input_func,
         getpass_func=getpass_func,

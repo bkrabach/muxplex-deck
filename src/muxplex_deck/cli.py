@@ -593,6 +593,60 @@ def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, 
         return "warn", f"Server check failed: {exc}"
 
 
+def check_federation_key_auth(
+    server_url: str, federation_key: str, *, verify: bool | str = True
+) -> tuple[str, str]:
+    """Issue ONE authenticated request to confirm `federation_key` is actually accepted.
+
+    `/api/instance-info` (what `check_server_reachable`/`fetch_instance_info`
+    call) is unauthenticated by design on the server -- it proves TLS and
+    reachability, but nothing about a credential. That gap is exactly what
+    let `init` once print a green "Server reachable" check, write config,
+    and offer to install the service for a federation key that was simply
+    wrong -- the user only found out once the running service couldn't
+    authenticate (see AGENTS.md).
+
+    This hits `GET /api/sessions` instead: authenticated, read-only, the
+    same lightweight endpoint the sidecar's own active loop already polls
+    (see `main.py`), with the key sent as `Authorization: Bearer` -- the
+    exact scheme the muxplex server's `auth.py` checks. Returns one of:
+
+      ("ok", ...)      -- HTTP 200: the key is accepted.
+      ("fail", ...)     -- HTTP 401: the key is definitively rejected.
+                           Callers must not save a key that gets this back.
+      ("warn", ...)     -- anything else (timeout, connection error,
+                           unexpected status): could not verify one way or
+                           the other. This is NOT evidence the key is bad --
+                           callers must not print a false success, but also
+                           must not treat an unrelated network hiccup as a
+                           rejected key.
+    """
+    import httpx
+
+    url = f"{server_url.rstrip('/')}/api/sessions"
+    headers = {"Authorization": f"Bearer {federation_key}"}
+    try:
+        with httpx.Client(verify=verify, timeout=5.0) as client:
+            resp = client.get(url, headers=headers)
+    except httpx.TimeoutException as exc:
+        return (
+            "warn",
+            f"Could not verify federation key -- server check timed out: {exc}",
+        )
+    except httpx.ConnectError as exc:
+        return "warn", f"Could not verify federation key -- server unreachable: {exc}"
+    except Exception as exc:  # noqa: BLE001 -- verification must degrade to warn, never raise
+        return "warn", f"Could not verify federation key: {exc}"
+
+    if resp.status_code == 200:
+        return "ok", "Federation key accepted by server"
+    if resp.status_code == 401:
+        return "fail", "Federation key rejected by server (401 Unauthorized)"
+    return "warn", (
+        f"Could not verify federation key -- unexpected response HTTP {resp.status_code}"
+    )
+
+
 def check_service_status() -> tuple[str, str]:
     """Service-state check: not installed / installed but not running / running.
 
