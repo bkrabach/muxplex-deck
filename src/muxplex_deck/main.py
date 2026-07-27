@@ -54,7 +54,6 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from . import attention, focus, interaction, layout, rendering, views
 from muxplex_client import (
     AuthError,
     MuxplexClient,
@@ -64,6 +63,8 @@ from muxplex_client import (
     Settings,
     UnreachableError,
 )
+
+from . import attention, focus, interaction, layout, rendering, views
 from .config import Config
 from .device import (
     DeckDevice,

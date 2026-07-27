@@ -19,8 +19,6 @@ import threading
 from typing import cast
 
 import pytest
-from PIL import Image
-
 from muxplex_client import (
     Bell,
     MuxplexClient,
@@ -29,6 +27,8 @@ from muxplex_client import (
     Settings,
     View,
 )
+from PIL import Image
+
 from muxplex_deck.device import DeckDevice, DialEventType
 from muxplex_deck.interaction import PickerMode, ViewCycler
 from muxplex_deck.layout import MODE_FULL, MODE_REDUCED
