@@ -1,0 +1,38 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read   # Required for actions/checkout
+  id-token: write  # Required for OIDC Trusted Publisher
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build package
+        # Unlike muxplex, this repo has no [tool.uv.workspace] members --
+        # it's a single distribution (muxplex-deck). Verified locally: a
+        # bare `uv build` and `uv build --all-packages` produce identical
+        # output here (dist/muxplex_deck-*.tar.gz + -*.whl, 2 files either
+        # way) -- --all-packages only matters when workspace members exist,
+        # which this repo doesn't have. Using the bare form since it's the
+        # correct one for this repo's actual structure, not copied from
+        # muxplex without checking.
+        run: uv build
+
+      - name: Publish to PyPI
+        # OIDC Trusted Publishing: PyPI's "muxplex-deck" project has a
+        # trusted publisher registered for this exact repo/workflow/
+        # environment triple. No API token needed.
+        uses: pypa/gh-action-pypi-publish@release/v1
