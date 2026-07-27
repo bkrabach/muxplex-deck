@@ -232,20 +232,28 @@ def _warn_if_no_udev_rule() -> None:
 
     Delegates the actual guidance text to `hidhelp.udev_guidance()` -- the
     single home for this string (see WSL_COLD_START_SPEC.md P6). That
-    function returns `None` when udev isn't actually running (P4: never
-    print a command known to fail here); in that case this prints
-    nothing, and the U-DEAD guidance from `hidhelp.explain_environment()`
-    (surfaced separately by `_print_environment_guidance()` below) takes
-    its place instead.
+    function now returns `None` both when udev isn't actually running
+    (P4: never print a command known to fail here) and when this is WSL
+    (the reload can report success there while the rule still never
+    fires for a usbip-attached device -- see AGENTS.md "U7"; a real WSL
+    user followed this exact block and lost ~40 minutes). On a healthy
+    non-WSL platform this prints nothing, exactly as before. On WSL,
+    show the environment-appropriate guidance instead (the proven
+    per-attach `chown`) rather than leaving the user with nothing.
     """
     if udev_rule_exists():
         return
     from . import hidhelp
 
     guidance = hidhelp.udev_guidance()
-    if guidance is None:
+    if guidance is not None:
+        _print_guidance_block(guidance.message)
         return
-    _print_guidance_block(guidance.message)
+
+    from . import wsl as wsl_mod
+
+    if wsl_mod.detect().is_wsl:
+        _print_environment_guidance()
 
 
 def _print_environment_guidance() -> None:

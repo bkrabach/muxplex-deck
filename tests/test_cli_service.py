@@ -305,6 +305,111 @@ class TestUdevRuleDetection:
 
 
 # ---------------------------------------------------------------------------
+# _warn_if_no_udev_rule() on WSL -- the rule is unproven there (AGENTS.md
+# "U7"): a real WSL user followed the udev remediation `service install`
+# printed and lost ~40 minutes, because the rule never actually fires for a
+# usbip-attached device even when udev itself reports as "live". On WSL this
+# must show the proven per-attach guidance instead of the raw udev block.
+# ---------------------------------------------------------------------------
+
+
+class TestWarnIfNoUdevRuleWslAware:
+    def test_wsl_shows_environment_guidance_not_raw_udev_block(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from muxplex_deck import hidhelp, wsl
+
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(
+            wsl, "detect", lambda **_k: wsl.WslInfo(is_wsl=True, version=2, kernel="x")
+        )
+        monkeypatch.setattr(
+            hidhelp,
+            "explain_environment",
+            lambda **_k: [
+                hidhelp.Guidance(
+                    status="warn", message="chown guidance line", state="W7"
+                )
+            ],
+        )
+
+        service_mod._warn_if_no_udev_rule()
+
+        out = capsys.readouterr().out
+        assert "chown guidance line" in out
+        assert "70-streamdeck.rules" not in out
+        assert "<<'EOF'" not in out
+
+    def test_wsl_with_no_environment_guidance_prints_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from muxplex_deck import hidhelp, wsl
+
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(
+            wsl, "detect", lambda **_k: wsl.WslInfo(is_wsl=True, version=2, kernel="x")
+        )
+        monkeypatch.setattr(hidhelp, "explain_environment", lambda **_k: [])
+
+        service_mod._warn_if_no_udev_rule()
+
+        out = capsys.readouterr().out
+        assert out == ""
+
+    def test_native_linux_container_udev_dead_is_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: non-WSL behavior must stay exactly as before --
+
+        no guidance printed by `_warn_if_no_udev_rule()` itself when udev
+        isn't live and this isn't WSL (the U-DEAD guidance -- if any --
+        still comes from `explain_environment()` calls elsewhere, e.g.
+        `doctor()`, never duplicated here).
+        """
+        from muxplex_deck import usbnode, wsl
+
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(
+            wsl,
+            "detect",
+            lambda **_k: wsl.WslInfo(is_wsl=False, version=None, kernel="x"),
+        )
+        monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: False)
+
+        service_mod._warn_if_no_udev_rule()
+
+        out = capsys.readouterr().out
+        assert out == ""
+
+    def test_native_linux_udev_live_shows_raw_udev_block_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: healthy native Linux still gets the udev block."""
+        from muxplex_deck import usbnode, wsl
+
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(
+            wsl,
+            "detect",
+            lambda **_k: wsl.WslInfo(is_wsl=False, version=None, kernel="x"),
+        )
+        monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: True)
+
+        service_mod._warn_if_no_udev_rule()
+
+        out = capsys.readouterr().out
+        assert "70-streamdeck.rules" in out
+
+
+# ---------------------------------------------------------------------------
 # Unsupported platform
 # ---------------------------------------------------------------------------
 
