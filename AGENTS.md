@@ -141,6 +141,35 @@ product. See `README.md` for setup, config, and verification checklists.
   a copy-pasteable remediation block (never writes to `/etc` itself) when
   none exists, rather than silently installing a service that can't open
   the device.
+- **The udev remediation must be gated on udev actually running.** `udevadm
+  control` talks to `/run/udev/control`; when that socket is absent (WSL
+  without systemd, containers) the reload fails with "No such file or
+  directory" and rules never fire. A real WSL user followed the printed
+  block exactly and lost ~40 minutes. `TAG+="uaccess"` is additionally
+  inert without a logind seat, which WSL has none of -- hence the added
+  `GROUP="plugdev"`. Branch on the capability (`usbnode.udev_is_live()` --
+  `Path("/run/udev/control").exists()`), never on the platform name. This
+  is why it also repairs plain-Linux containers, and won't rot when WSL
+  eventually gains udev. **Never print a command that cannot work on the
+  machine you are printing it to.** All WSL/udev/permission guidance text
+  now lives in one place, `hidhelp.py` (`explain_environment`,
+  `explain_open_failure`, `udev_guidance`) -- consumed by `cli.py`
+  (`doctor`, `status`, `wsl attach`), `service.py`, `main.py`, and
+  `init_wizard.py`. Don't duplicate a copy of this text in a new surface;
+  import `hidhelp` instead. `usbnode.py` (sysfs facts) and `wsl.py`
+  (usbipd-win facts; `attach()` is the ONE mutating function in the whole
+  surface) are the two modules `hidhelp` composes.
+- **The sidecar's open-failure branch must update the status file.**
+  `main.py`'s `deck.open()` except-branch didn't call `reporter.update()`
+  (unlike the `deck is None` branch right above it) -- so a stuck-open
+  device left the status file frozen at stale values, and `muxplex-deck
+  status` reported a *false* "Server: unreachable" even though the server
+  was never contacted. Any new failure branch in the hotplug loop must
+  call `reporter.update(...)`, and any WSL/permission diagnosis must be
+  computed once per failure *episode* (`main._FailureEpisode`), not once
+  per poll cycle -- `hidhelp.explain_open_failure()` can shell out to
+  `usbipd.exe` on WSL, and doing that every 2 seconds forever is its own
+  bug.
 - **Restart policy differs from muxplex on purpose**: `Restart=always` (not
   muxplex's `on-failure`) plus a best-effort `loginctl enable-linger` on
   install -- this is a headless, always-on sidecar meant to survive logout,

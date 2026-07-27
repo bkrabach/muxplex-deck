@@ -95,10 +95,14 @@ without a udev rule granting your user access to the device (vendor id
 prints a copy-pasteable remediation block (the same rule shown in
 "Permissions" under the hardware probe section above) instead of silently
 installing a service that won't work. It never writes to `/etc` itself --
-only detects and reports. Run the printed `sudo tee ... && sudo udevadm
+only detects and reports. This remediation is only ever printed when udev
+is actually running (`/run/udev/control` present) -- on WSL without
+systemd, or in a container, it never fires anyway, so `muxplex-deck`
+detects that and prints a different, WSL/container-appropriate fix instead
+(see `docs/WSL.md`). Run the printed `sudo tee ... && sudo udevadm
 control --reload-rules && sudo udevadm trigger` commands, then unplug and
-replug the deck (or re-`usbipd attach` under WSL) and `muxplex-deck service
-restart`.
+replug the deck (or `muxplex-deck wsl attach` under WSL) and `muxplex-deck
+service restart`.
 
 On Linux, `service install` also attempts `loginctl enable-linger
 <you>` (best-effort, non-fatal) so the service keeps running after you log
@@ -146,24 +150,19 @@ uv run deck-probe
 
 #### Windows + WSL
 
-USB devices are not visible inside WSL until attached from the Windows
-side. In an **admin PowerShell**:
-
-```powershell
-usbipd list                        # find the Stream Deck's BUSID (VID 0fd9)
-usbipd bind --busid <BUSID>        # first time only
-usbipd attach --wsl --busid <BUSID>
-```
-
-Then inside WSL, grant HID access via a udev rule (first time only):
+USB devices are invisible to WSL until Windows hands them over. Rather
+than driving `usbipd`/udev rules by hand for this PoC probe, install and
+use the actual product instead -- it handles this for you:
 
 ```sh
-sudo tee /etc/udev/rules.d/70-streamdeck.rules >/dev/null \
-  <<< 'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"'
-sudo udevadm control --reload-rules
-# then detach/re-attach the device (usbipd detach + attach)
-sudo apt install libhidapi-libusb0   # native HIDAPI, if not present
+uv tool install muxplex-deck
+muxplex-deck wsl attach     # finds the deck, attaches it, tells you what's left
+muxplex-deck doctor         # diagnoses every remaining step, with real values
 ```
+
+Neither needs the details -- but see `docs/WSL.md` if you want them (BUSID/
+device-node churn, the `usbipd` vs `usbipd.exe` trap, durable vs per-attach
+permission options).
 
 **Close the Elgato Stream Deck app on Windows first** -- it holds
 exclusive HID access. The probe prints this same guidance when it finds
