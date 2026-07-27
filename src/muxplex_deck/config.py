@@ -145,9 +145,9 @@ def load_config(config_path: str | None = None) -> Config:
     if not path.exists():
         raise ConfigError(
             f"Config file not found: {path}\n"
-            "Create it with at least a 'server_url' field, e.g.:\n"
-            '  {"server_url": "https://<your-server>:8088"}\n'
-            "See README.md for the full example."
+            "Run: muxplex-deck init\n"
+            "(or create it by hand with at least a 'server_url' field, e.g.:\n"
+            '  {"server_url": "https://<your-server>:8088"})'
         )
 
     try:

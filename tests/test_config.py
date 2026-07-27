@@ -105,3 +105,19 @@ def test_load_config_error_names_invoking_user_path(
         excinfo.value
     )
     assert "/root/" not in str(excinfo.value)
+
+
+def test_missing_config_error_points_at_init_not_readme(tmp_path: Path) -> None:
+    """The CLI teaches, docs supplement -- point at `muxplex-deck init`.
+
+    v0.5.1 fixed `doctor`'s README pointer; this one survived in the
+    sidecar's own runtime startup error (`load_config`'s "Config file not
+    found" message) -- a real first-run user saw "See README.md for the
+    full example." from the running process itself, not just from doctor.
+    """
+    missing = tmp_path / "config.json"
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(str(missing))
+    message = str(excinfo.value)
+    assert "muxplex-deck init" in message
+    assert "README" not in message
