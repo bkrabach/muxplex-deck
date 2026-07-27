@@ -17,6 +17,21 @@ Ported near 1:1 from muxplex's own `service.py` (see that repo's
 (unit/plist path, enable/start, resulting status) using the same ✓/!
 2-space-indent style as `cli.doctor()` -- a silent success path left a real
 user unsure whether `service install` had done anything at all.
+
+`launchctl bootstrap` idempotency: unlike `systemctl start` (idempotent --
+starting an already-active unit just succeeds), `launchctl bootstrap` exits
+5 ("Input/output error") when the job label is ALREADY loaded. A real user
+hit this running `service start` against a service that was already
+healthy and running: the code used ``check=True``, so launchd's expected
+"already loaded" refusal surfaced as an unhandled `CalledProcessError`
+traceback instead of the benign no-op it actually is. `_launchd_bootstrap()`
+is the shared, non-raising (`check=False`) helper both `_launchd_install()`
+and `_launchd_start()` use; both treat exit 5 as success, and any other
+nonzero exit as a genuine failure reported via launchctl's own stderr
+(never swallowed) rather than a raw traceback. `_launchd_restart()` also
+waits for `bootout` to actually finish (it returns before the job is fully
+torn down) so the follow-up `bootstrap` doesn't race it into the same
+exit-5 rejection for the wrong reason.
 """
 
 from __future__ import annotations
@@ -26,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -38,6 +54,21 @@ _SYSTEMD_UNIT_PATH: Path = _SYSTEMD_UNIT_DIR / "muxplex-deck.service"
 _LAUNCHD_PLIST_DIR: Path = Path.home() / "Library" / "LaunchAgents"
 _LAUNCHD_PLIST_PATH: Path = _LAUNCHD_PLIST_DIR / "com.muxplex-deck.plist"
 _LAUNCHD_LABEL: str = "com.muxplex-deck"
+
+# `launchctl bootstrap` exit code when the job label is already loaded. This
+# is launchd's way of saying "already running" -- not a failure -- so it is
+# handled as a benign no-op everywhere `_launchd_bootstrap()` is used, never
+# swallowed silently for any OTHER exit code.
+_LAUNCHD_ALREADY_LOADED_EXIT = 5
+
+# `launchctl bootout` returns before the job has necessarily finished
+# tearing down, so a `restart` (stop then start) can race it: bootstrap
+# fires while the old job is still unloading and gets rejected with the
+# same exit-5 "already loaded" the still-loading old job produces. Poll
+# `service_is_active()` until the job is actually gone (bounded so a stuck
+# teardown can't hang `restart` forever).
+_LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS = 0.2
+_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS = 5.0
 
 # Elgato Stream Deck USB vendor id -- used to detect an existing udev rule.
 _ELGATO_VENDOR_ID = "0fd9"
@@ -342,8 +373,36 @@ def _systemd_uninstall() -> None:
     print()
 
 
+def _report_systemctl_failure(
+    action: str, result: subprocess.CompletedProcess[str]
+) -> None:
+    """Print systemctl's own diagnostics for a genuine (non-idempotent) failure.
+
+    The most common ordinary-user trigger here is running `start`/`restart`
+    before `install` (unit not found) -- a real failure, but one that should
+    surface as a clear message, not a raw `CalledProcessError` traceback.
+    """
+    stderr = (result.stderr or "").strip()
+    print(
+        f"  ERROR: systemctl {action} failed (exit {result.returncode})",
+        file=sys.stderr,
+    )
+    if stderr:
+        print(f"    {stderr}", file=sys.stderr)
+
+
 def _systemd_start() -> None:
-    subprocess.run(["systemctl", "--user", "start", "muxplex-deck"], check=True)
+    result = subprocess.run(
+        ["systemctl", "--user", "start", "muxplex-deck"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        _step_ok("Started the service")
+    else:
+        _report_systemctl_failure("start", result)
+        sys.exit(1)
 
 
 def _systemd_stop() -> None:
@@ -351,7 +410,21 @@ def _systemd_stop() -> None:
 
 
 def _systemd_restart() -> None:
-    subprocess.run(["systemctl", "--user", "restart", "muxplex-deck"], check=True)
+    # `systemctl restart` is a single atomic transaction (unlike launchd's
+    # separate bootout + bootstrap), so it needs no unload-race handling --
+    # and it is idempotent whether or not the unit was already running. The
+    # ordinary failure mode is the unit not being installed yet.
+    result = subprocess.run(
+        ["systemctl", "--user", "restart", "muxplex-deck"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        _step_ok("Restarted the service")
+    else:
+        _report_systemctl_failure("restart", result)
+        sys.exit(1)
 
 
 def _systemd_status() -> None:
@@ -374,6 +447,71 @@ def _systemd_logs() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _launchd_bootstrap() -> subprocess.CompletedProcess[str]:
+    """Run `launchctl bootstrap` for the muxplex-deck plist, never raising.
+
+    `check=False` deliberately: `bootstrap` exits
+    `_LAUNCHD_ALREADY_LOADED_EXIT` (5, "Input/output error") when the job
+    label is already loaded -- launchd's way of saying "already running",
+    not a failure. Callers must inspect `returncode` themselves and decide
+    what that means for them; this helper only runs the command and hands
+    back the raw result.
+    """
+    uid = os.getuid()
+    return subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(_LAUNCHD_PLIST_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _report_launchctl_failure(
+    action: str, result: subprocess.CompletedProcess[str]
+) -> None:
+    """Print launchctl's own diagnostics for a genuine (non-idempotent) failure.
+
+    Only the well-known "already loaded" exit code is treated as benign by
+    callers; every other nonzero exit prints launchctl's own stderr (which
+    already includes its "re-run as root for richer errors" hint) so the
+    real failure is still visible -- just as a clear message instead of an
+    unhandled `CalledProcessError` traceback.
+    """
+    stderr = (result.stderr or "").strip()
+    print(
+        f"  ERROR: launchctl {action} failed (exit {result.returncode})",
+        file=sys.stderr,
+    )
+    if stderr:
+        print(f"    {stderr}", file=sys.stderr)
+
+
+def _wait_for_launchd_unload(timeout: float | None = None) -> bool:
+    """Poll until the launchd job is no longer loaded, or `timeout` elapses.
+
+    `launchctl bootout` returns before the job has necessarily finished
+    tearing down -- immediately re-bootstrapping afterward can race it and
+    get rejected with the same "already loaded" exit code a genuinely
+    still-running job would produce. Returns True once `service_is_active()`
+    reports the job gone; returns False if it was still present when the
+    timeout elapsed (the caller decides how to proceed -- see
+    `_launchd_restart`).
+
+    `timeout` defaults to `_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS` read at CALL time
+    (not as a bound default argument) so tests can monkeypatch the module
+    constant and have it take effect.
+    """
+    if timeout is None:
+        timeout = _LAUNCHD_BOOTOUT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        if not service_is_active():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS)
+
+
 def _launchd_install() -> None:
     print("\nmuxplex-deck service install (launchd)\n")
 
@@ -394,11 +532,16 @@ def _launchd_install() -> None:
     _LAUNCHD_PLIST_PATH.write_text(plist_content)
     _step_ok(f"Wrote plist: {_LAUNCHD_PLIST_PATH}")
 
-    uid = os.getuid()
-    subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(_LAUNCHD_PLIST_PATH)], check=True
-    )
-    _step_ok("Loaded + started the service (launchctl bootstrap)")
+    result = _launchd_bootstrap()
+    if result.returncode == 0:
+        _step_ok("Loaded + started the service (launchctl bootstrap)")
+    elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
+        _step_ok(
+            "Service was already loaded -- plist rewritten; run "
+            "`muxplex-deck service restart` to apply changes"
+        )
+    else:
+        _report_launchctl_failure("bootstrap", result)
 
     if service_is_active():
         _step_ok("Service is running")
@@ -434,10 +577,14 @@ def _launchd_uninstall() -> None:
 
 
 def _launchd_start() -> None:
-    uid = os.getuid()
-    subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(_LAUNCHD_PLIST_PATH)], check=True
-    )
+    result = _launchd_bootstrap()
+    if result.returncode == 0:
+        _step_ok("Started the service (launchctl bootstrap)")
+    elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
+        _step_ok("Service was already running (nothing to start)")
+    else:
+        _report_launchctl_failure("bootstrap", result)
+        sys.exit(1)
 
 
 def _launchd_stop() -> None:
@@ -447,7 +594,20 @@ def _launchd_stop() -> None:
 
 def _launchd_restart() -> None:
     _launchd_stop()
-    _launchd_start()
+    if not _wait_for_launchd_unload():
+        _step_warn(
+            f"Service did not fully unload within "
+            f"{_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS:.0f}s -- attempting restart anyway"
+        )
+
+    result = _launchd_bootstrap()
+    if result.returncode == 0:
+        _step_ok("Restarted the service (launchctl bootstrap)")
+    elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
+        _step_ok("Service is running")
+    else:
+        _report_launchctl_failure("bootstrap", result)
+        sys.exit(1)
 
 
 def _launchd_status() -> None:

@@ -539,3 +539,258 @@ class TestUnsupportedPlatform:
         err = capsys.readouterr().err
         assert "requires systemd" in err
         assert "muxplex-deck run" in err
+
+
+# ---------------------------------------------------------------------------
+# launchd bootstrap idempotency -- a real user hit `service start` against an
+# already-running service and got an unhandled CalledProcessError traceback
+# instead of the benign no-op `launchctl bootstrap` exit 5 ("already loaded")
+# actually is. These tests pin the exit-code branching with a mocked
+# subprocess -- real launchctl is never invoked (see conftest.py Rail 4).
+# ---------------------------------------------------------------------------
+
+
+class TestLaunchdStart:
+    def test_start_success_reports_ok(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0),
+        )
+        service_mod._launchd_start()  # must not raise
+        out = capsys.readouterr().out
+        assert "Started the service" in out
+
+    def test_start_already_loaded_exit5_is_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Pins the exact bug: bootstrap exit 5 is a benign no-op, not a failure."""
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                5, stderr="Bootstrap failed: 5: Input/output error"
+            ),
+        )
+        service_mod._launchd_start()  # must NOT raise CalledProcessError
+        captured = capsys.readouterr()
+        assert "already running" in captured.out
+        # Must not be reported as an error.
+        assert captured.err == ""
+
+    def test_start_genuine_failure_reports_diagnostics_and_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                1, stderr="Bootstrap failed: 1: Operation not permitted"
+            ),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            service_mod._launchd_start()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "ERROR" in err
+        assert "Operation not permitted" in err
+
+
+class TestLaunchdInstallBootstrapIdempotency:
+    def test_install_already_loaded_does_not_raise(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_DIR", tmp_path)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_PLIST_PATH", tmp_path / "com.muxplex-deck.plist"
+        )
+        monkeypatch.setattr(
+            service_mod, "_resolve_bin_for_launchd", lambda: ["/x/muxplex-deck"]
+        )
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:2] == ["launchctl", "bootstrap"]:
+                return _FakeCompletedProcess(
+                    5, stderr="Bootstrap failed: 5: Input/output error"
+                )
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        service_mod._launchd_install()  # must not raise
+
+        out = capsys.readouterr().out
+        assert "already loaded" in out
+        assert "service restart" in out
+
+    def test_install_genuine_bootstrap_failure_reported_not_swallowed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_DIR", tmp_path)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_PLIST_PATH", tmp_path / "com.muxplex-deck.plist"
+        )
+        monkeypatch.setattr(
+            service_mod, "_resolve_bin_for_launchd", lambda: ["/x/muxplex-deck"]
+        )
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:2] == ["launchctl", "bootstrap"]:
+                return _FakeCompletedProcess(
+                    1, stderr="Bootstrap failed: 1: Operation not permitted"
+                )
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        service_mod._launchd_install()  # must not raise -- no check=True crash
+
+        err = capsys.readouterr().err
+        assert "ERROR: launchctl bootstrap failed" in err
+        assert "Operation not permitted" in err
+
+
+class TestLaunchdRestart:
+    def test_restart_waits_for_unload_before_bootstrapping(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Simulates the real bootout race: still active right after stop, then gone."""
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS", 0.001
+        )
+
+        active_sequence = iter([True, True, False])
+        monkeypatch.setattr(
+            service_mod, "service_is_active", lambda: next(active_sequence, False)
+        )
+
+        service_mod._launchd_restart()
+
+        out = capsys.readouterr().out
+        assert "Restarted the service" in out
+        assert "did not fully unload" not in out
+
+    def test_restart_timeout_warns_but_still_attempts_bootstrap(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The old job never reports gone -- restart must warn, then still try."""
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        monkeypatch.setattr(service_mod, "_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS", 0.001
+        )
+
+        service_mod._launchd_restart()
+
+        out = capsys.readouterr().out
+        assert "did not fully unload" in out
+        # Bootstrap is still attempted despite the timeout, and (per the
+        # mocked exit-0 result) reports success.
+        assert "Restarted the service" in out
+
+    def test_restart_genuine_bootstrap_failure_after_clean_unload(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:2] == ["launchctl", "bootstrap"]:
+                return _FakeCompletedProcess(
+                    1, stderr="Bootstrap failed: 1: Operation not permitted"
+                )
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            service_mod._launchd_restart()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "ERROR: launchctl bootstrap failed" in err
+
+
+# ---------------------------------------------------------------------------
+# systemd start/restart -- ordinary user action (start/restart before
+# install, i.e. the unit doesn't exist yet) previously raised an unhandled
+# CalledProcessError from check=True. Must now report cleanly and exit(1).
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdStart:
+    def test_start_success_reports_ok(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        service_mod._systemd_start()  # must not raise
+        out = capsys.readouterr().out
+        assert "Started the service" in out
+
+    def test_start_unit_not_found_reports_and_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                5, stderr="Failed to start muxplex-deck.service: Unit not found."
+            ),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            service_mod._systemd_start()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "ERROR" in err
+        assert "Unit not found" in err
+
+
+class TestSystemdRestart:
+    def test_restart_success_reports_ok(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        service_mod._systemd_restart()  # must not raise
+        out = capsys.readouterr().out
+        assert "Restarted the service" in out
+
+    def test_restart_unit_not_found_reports_and_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                5, stderr="Failed to restart muxplex-deck.service: Unit not found."
+            ),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            service_mod._systemd_restart()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "ERROR" in err
+        assert "Unit not found" in err
