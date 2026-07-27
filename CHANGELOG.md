@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.5.1 (2026-07-27)
+
+### Bug Fixes
+
+- **The udev rule we printed could not be pasted.** The install command was emitted as a `<<'EOF'` heredoc indented for visual alignment, which put the terminator at a non-zero column — so pasting it left the shell waiting at a continuation prompt instead of writing the file. A one-line rule never needed a heredoc; it is now a single `echo … | sudo tee …` that survives paste regardless of surrounding indentation, and a test parses the emitted command with `bash -n` so this cannot silently regress.
+
+- **That rule was also being offered on WSL, where it cannot work.** Install printed the udev remediation whenever udevd was running — but "udevd is running" does not mean "a rule will fire for a usbip-attached device," and on WSL it does not. A user could follow the instructions exactly and see the device node stay root-owned. The guidance is now withheld on WSL entirely, replaced by the per-attach ownership step that actually works there. The same wrong call existed in the setup wizard and is fixed by the same change.
+
+- **`doctor` contradicted itself.** One check would locate the Stream Deck by BUSID and print precise instructions; the next would announce no Stream Deck was found and suggest checking the cable. Later checks now defer to what earlier ones established instead of re-reporting the device as missing.
+
+- **One problem was reported as three.** An attached-but-unopenable device produced a detailed remediation block, a "detected" line, and a separate HID failure line — the last of which pointed at remediation that did not apply on that platform. It is one line now.
+
+- **`doctor` pointed at the README** for the missing config file, in the output whose entire purpose is to avoid sending people to the docs. It names the command that creates the config.
+
+- **`wsl attach` reported failure after succeeding.** It checked the Linux USB bus immediately after attaching and declared the device invisible when the bus had simply not settled. It now retries briefly before reporting a problem.
+
+### Verification
+
+- 374 tests passed via pytest (baseline 360 + 14 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.5.0 (2026-07-27)
 
 ### Features
