@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.1 (2026-07-27)
+
+### Bug Fixes
+
+- **`service start` and `service restart` no longer crash when the service is already running.** `_launchd_start()` ran `launchctl bootstrap` with `check=True` and no handling for the case launchd rejects: a job that is already loaded, which it reports as exit 5. That is the expected outcome of asking an already-running service to start, and it surfaced as an unhandled `CalledProcessError` traceback while `status` simultaneously reported the service healthy. Every sibling helper in the file already used `check=False` and reported state gracefully; start was the outlier. Bootstrap now runs through one shared helper: exit 0 confirms, exit 5 reports that the service was already running, and any other failure prints launchctl's own stderr and exits cleanly rather than raising. `restart` additionally waits for the asynchronous `bootout` to complete — polling for up to five seconds before re-bootstrapping, then proceeding with a warning rather than hanging — since the previous stop-then-start sequence raced launchd's teardown. `service install` carried the identical bug on its own bootstrap call and is fixed the same way. On Linux, `systemd start`/`restart` had the same defect with a different trigger: `systemctl` is idempotent against a running unit, but running either command *before* `install` produced the same raw traceback. Both platforms now behave equivalently. Success paths, previously silent, now print confirmation.
+
+- **`update` no longer drags PyPI installs back to git.** The update command hardcoded `uv tool install --force git+<repo>`, with a comment explaining that no PyPI release existed so no version gate was possible — true when written, and false since v0.4.0 published. Meanwhile `doctor` classified a correct PyPI install as "unknown install source" and advised running `update`, which then reinstalled from git. A user who migrated to PyPI, ran `doctor`, and followed its advice was silently reverted. `update` now reads the same PEP 610 install-source detection `doctor` already used and upgrades in place: PyPI installs from PyPI, git installs from git, and editable installs are refused outright with an explanation. `doctor` reports up-to-date or update-available for PyPI installs like it already did for git, so its recommendation is no longer a trap. A version gate now skips the whole stop/reinstall/restart cycle when already current, with `--force` to override, and an unreachable PyPI degrades to attempting the upgrade rather than blocking.
+
+- **`update` no longer destroys editable installs.** It had no editable guard at all, so running it from a development checkout would have force-reinstalled from git over the working tree.
+
+### Verification
+
+- 267 tests passed via pytest (baseline 254 + 13 new tests added for these fixes).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.4.0 (2026-07-26)
 
 ### Features
