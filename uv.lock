@@ -90,19 +90,15 @@ wheels = [
 
 [[package]]
 name = "muxplex-client"
-version = "0.18.0"
-source = { editable = "../muxplex/client" }
+version = "0.19.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.27.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/32/8f/9a85de49edc96effbcddcc48aac1bf2ff26572b5c5d580abaa3b2cd668de/muxplex_client-0.19.0.tar.gz", hash = "sha256:fd7edc2aba3e3d9287dc738e0054acfe721004f8986342d44b73c5b68307460f", size = 15700, upload-time = "2026-07-27T02:37:07.853Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/cd/2ba54a95983c3ffe4cb77cd7b22a57fabf66b1ae02d6844df8d2d5ca7b73/muxplex_client-0.19.0-py3-none-any.whl", hash = "sha256:4fb2f4314cde364b8903670c816304de530429f4c6595bbba40fc54034bce63d", size = 18554, upload-time = "2026-07-27T02:37:05.121Z" },
 ]
-provides-extras = ["dev"]
 
 [[package]]
 name = "muxplex-deck"
@@ -123,7 +119,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "muxplex-client", editable = "../muxplex/client" },
+    { name = "muxplex-client", specifier = ">=0.19.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "streamdeck", specifier = ">=0.9.5" },
 ]
