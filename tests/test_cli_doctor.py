@@ -566,6 +566,96 @@ class TestCheckForUpdatePypi:
 
 
 # ---------------------------------------------------------------------------
+# check_service_status -- three distinct states, not two. A real user's
+# `service install` crash-looped 1113 times (no config yet), and the very
+# next `doctor` line said "not installed -- run: muxplex-deck service
+# install" about a service that WAS installed and actively failing --
+# conflating "not active" with "not installed" and recommending an action
+# that was already done. See AGENTS.md for the incident.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckServiceStatus:
+    def test_not_installed_recommends_install(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl")
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+
+        status, message = cli.check_service_status()
+
+        assert status == "warn"
+        assert "not installed" in message
+        assert "muxplex-deck service install" in message
+
+    def test_installed_but_not_active_does_not_recommend_install(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the exact bug: an installed, crash-looping service must NOT
+
+        be told to run `service install` again -- it's already installed.
+        """
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl")
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: True)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+
+        status, message = cli.check_service_status()
+
+        assert status == "warn"
+        assert "installed" in message
+        assert "not running" in message
+        assert "service install" not in message
+        assert "service logs" in message
+
+    def test_installed_and_active_is_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/systemctl")
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: True)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        status, message = cli.check_service_status()
+
+        assert status == "ok"
+        assert "running" in message
+
+    def test_missing_tool_reports_clearly_not_as_not_installed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+        status, message = cli.check_service_status()
+
+        assert status == "warn"
+        assert "systemctl not found" in message
+
+    def test_launchd_installed_and_active_is_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(cli.sys, "platform", "darwin")
+        monkeypatch.setattr(cli.shutil, "which", lambda name: "/bin/launchctl")
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: True)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        status, message = cli.check_service_status()
+
+        assert status == "ok"
+        assert "launchd" in message
+        assert "running" in message
+
+
+# ---------------------------------------------------------------------------
 # doctor() -- never raises, always returns 0, even when everything fails
 # ---------------------------------------------------------------------------
 

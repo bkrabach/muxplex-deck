@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import json
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -593,38 +594,35 @@ def check_server_reachable(server_url: str, ca_file: Path | None) -> tuple[str, 
 
 
 def check_service_status() -> tuple[str, str]:
-    """Best-effort service-installed/running check (systemd or launchd)."""
-    if sys.platform == "darwin":
-        import os as _os
+    """Service-state check: not installed / installed but not running / running.
 
-        uid = _os.getuid()
-        try:
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{uid}/com.muxplex-deck"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except FileNotFoundError:
-            return "warn", "Service: launchctl not found"
-        if result.returncode == 0:
-            return "ok", "Service: installed (launchd)"
+    Three distinct states, not two -- `service_is_installed()` (unit/plist
+    file exists) and `service_is_active()` (currently running) are checked
+    independently, so an installed-but-crash-looping service is reported
+    honestly instead of as "not installed" (which used to tell the user to
+    re-run `service install` for a service that was already installed and
+    failing -- see AGENTS.md for the incident this fixes).
+    """
+    from .service import service_is_active, service_is_installed
+
+    if sys.platform == "darwin":
+        manager, tool = "launchd", "launchctl"
+    else:
+        manager, tool = "systemd", "systemctl"
+
+    if shutil.which(tool) is None:
+        return "warn", f"Service: {tool} not found -- run muxplex-deck directly"
+
+    if not service_is_installed():
         return "warn", "Service: not installed -- run: muxplex-deck service install"
 
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "is-active", "muxplex-deck"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except FileNotFoundError:
-        return "warn", "Service: systemctl not found -- run muxplex-deck directly"
-    if result.returncode == 0:
-        return "ok", f"Service: {result.stdout.strip()} (systemd)"
-    return "warn", "Service: not installed -- run: muxplex-deck service install"
+    if service_is_active():
+        return "ok", f"Service: installed and running ({manager})"
+
+    return "warn", (
+        f"Service: installed ({manager}) but not running -- check: "
+        "muxplex-deck service logs"
+    )
 
 
 _CHECK_MARKS: dict[str, str] = {
