@@ -52,7 +52,10 @@ HID_HINT_RULE_EXISTS_BUT_STILL_FAILED = (
     " A udev rule exists but the device still could not be opened."
 )
 
-_UDEV_RULE_CONTENT = 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0660", GROUP="plugdev", TAG+="uaccess"\n'
+_UDEV_RULE_CONTENT = (
+    'SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0660", '
+    'GROUP="plugdev", TAG+="uaccess"'
+)
 
 
 @dataclass(frozen=True)
@@ -369,8 +372,24 @@ def udev_guidance() -> Guidance | None:
 
     Returns `None` when udev is not live (P4: never print a command we
     know will fail here) -- `explain_environment()`'s U-DEAD guidance
-    takes its place in that case instead.
+    takes its place in that case instead. Also returns `None` on WSL:
+    `udevadm control --reload-rules` can report success there while the
+    rule still never fires for a usbip-attached device (see AGENTS.md
+    "U7" -- a real WSL user followed this exact block and lost ~40
+    minutes to a rule that never took effect). On WSL the only proven
+    remediation is the per-attach `sudo chown` in `w7_message()`, already
+    surfaced by `explain_environment()` -- callers show that instead (see
+    `service._warn_if_no_udev_rule`).
+
+    The install command is a single `echo | sudo tee` line rather than a
+    `<<'EOF' ... EOF` heredoc: this text gets copy-pasted into a terminal,
+    and a heredoc terminator that isn't at column 0 (as it wasn't here,
+    once the surrounding block got indented for display) is silently
+    swallowed by the shell, leaving the user stuck at a `>` continuation
+    prompt. A single line has no terminator to misplace.
     """
+    if wsl.detect().is_wsl:
+        return None
     if not usbnode.udev_is_live():
         return None
     return Guidance(
@@ -379,8 +398,8 @@ def udev_guidance() -> Guidance | None:
             f"No udev rule found for the Stream Deck (vendor id {_ELGATO_VENDOR_ID}).\n"
             "Without it, the service (running as your user, not root) will fail to\n"
             "open the device. Install a rule once:\n\n"
-            "      sudo tee /etc/udev/rules.d/70-streamdeck.rules >/dev/null <<'EOF'\n"
-            f"{_UDEV_RULE_CONTENT}EOF\n"
+            f"      echo '{_UDEV_RULE_CONTENT}' | sudo tee "
+            "/etc/udev/rules.d/70-streamdeck.rules >/dev/null\n"
             "      sudo udevadm control --reload-rules && sudo udevadm trigger\n\n"
             "Then unplug and replug the Stream Deck (or re-run `muxplex-deck wsl attach`\n"
             "under WSL), and make sure you're in the `plugdev` group:\n"

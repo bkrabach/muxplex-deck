@@ -389,18 +389,78 @@ class TestUdevGuidance:
     def test_returns_none_when_udev_not_live(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(wsl, "detect", lambda **_kw: _native_linux_info())
         monkeypatch.setattr(usbnode, "udev_is_live", lambda **_kw: False)
         assert hidhelp.udev_guidance() is None
 
     def test_returns_guidance_when_udev_live(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(wsl, "detect", lambda **_kw: _native_linux_info())
         monkeypatch.setattr(usbnode, "udev_is_live", lambda **_kw: True)
         guidance = hidhelp.udev_guidance()
         assert guidance is not None
         assert guidance.state == "U-LIVE"
         assert "plugdev" in guidance.message
         assert "hidraw" not in guidance.message  # V7: dead weight, dropped
+
+    def test_returns_none_on_wsl_even_when_udev_live(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The udev-rule reload can report success on WSL while the rule
+
+        still never fires for a usbip-attached device (AGENTS.md "U7") --
+        a real WSL user followed this exact block and lost ~40 minutes.
+        `udev_is_live()` being True must NOT be enough to show it there.
+        """
+        monkeypatch.setattr(wsl, "detect", lambda **_kw: _wsl2_info())
+        monkeypatch.setattr(usbnode, "udev_is_live", lambda **_kw: True)
+        assert hidhelp.udev_guidance() is None
+
+    @pytest.mark.allow_real_subprocess
+    def test_install_command_has_no_heredoc_and_is_valid_pasteable_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: the printed install command used to be a `<<'EOF'`
+
+        heredoc whose terminator landed indented (`    EOF`) once the
+        surrounding block was indented for display -- a `<<'EOF'` heredoc
+        requires its terminator at column 0, so the shell never saw it and
+        the user got stuck at a `>` continuation prompt four times in a
+        row. Proven here by actually feeding the printed command through
+        `bash -n` (syntax check only -- never executes `sudo`/`tee`; this is
+        the one test in the suite that genuinely needs a real subprocess,
+        hence the explicit opt-in marker -- see AGENTS.md's safety-rail
+        table).
+        """
+        import subprocess
+
+        monkeypatch.setattr(wsl, "detect", lambda **_kw: _native_linux_info())
+        monkeypatch.setattr(usbnode, "udev_is_live", lambda **_kw: True)
+        guidance = hidhelp.udev_guidance()
+        assert guidance is not None
+        assert "<<'EOF'" not in guidance.message
+        assert "EOF" not in guidance.message
+
+        script_lines = [
+            line.strip()
+            for line in guidance.message.splitlines()
+            if line.strip().startswith(("echo ", "sudo "))
+        ]
+        assert script_lines, "expected at least one shell command line"
+        script = "\n".join(script_lines)
+
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"printed command is not valid, pasteable shell: {result.stderr}"
+        )
 
 
 # ---------------------------------------------------------------------------
