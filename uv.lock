@@ -89,11 +89,28 @@ wheels = [
 ]
 
 [[package]]
+name = "muxplex-client"
+version = "0.18.0"
+source = { editable = "../muxplex/client" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "muxplex-deck"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
+    { name = "muxplex-client" },
     { name = "pillow" },
     { name = "streamdeck" },
 ]
@@ -106,6 +123,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "muxplex-client", editable = "../muxplex/client" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "streamdeck", specifier = ">=0.9.5" },
 ]

@@ -38,7 +38,7 @@ cannot contain ':', so this suffix check is unambiguous).
 
 from __future__ import annotations
 
-from .client import Session, Settings
+from muxplex_client import Session, Settings
 
 
 def _member_matches(name: str, members: frozenset[str]) -> bool:

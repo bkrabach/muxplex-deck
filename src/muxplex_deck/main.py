@@ -55,7 +55,7 @@ import time
 from urllib.parse import urlparse
 
 from . import attention, focus, interaction, layout, rendering, views
-from .client import (
+from muxplex_client import (
     AuthError,
     MuxplexClient,
     MuxplexError,
@@ -290,9 +290,9 @@ class _ActiveRuntime:
         callers (the poll loop, and a dial-0 commit) handle those.
         """
         with self.client_lock:
-            sessions = self.client.get_sessions()
-            server_state = self.client.get_state()
-            settings = self.client.get_settings()
+            sessions = self.client.sessions()
+            server_state = self.client.state()
+            settings = self.client.settings()
         self._process(sessions, server_state, settings)
 
     def _process(
@@ -729,7 +729,7 @@ class _ActiveRuntime:
         focus.focus_app(self.focus_app_name)
         try:
             with self.client_lock:
-                self.client.connect_session(name)
+                self.client.connect(name)
         except MuxplexError:
             logger.exception("failed to switch to session %r", name)
             with self.paint_lock, self.deck:
@@ -1033,7 +1033,7 @@ def run(config: Config, manager: DeviceManager) -> int:
 
             try:
                 with MuxplexClient(
-                    config.server_url, config.federation_key, config.ca_file
+                    config.server_url, config.federation_key, ca_file=config.ca_file
                 ) as client:
                     _run_active(
                         deck,

@@ -21,7 +21,7 @@ from typing import cast
 import pytest
 from PIL import Image
 
-from muxplex_deck.client import (
+from muxplex_client import (
     Bell,
     MuxplexClient,
     ServerState,
@@ -139,8 +139,11 @@ class FakeClient:
     """Canned muxplex responses + threading.Events for async assertions."""
 
     def __init__(self, sessions: list[Session], settings: Settings) -> None:
-        self.sessions = sessions
-        self.settings = settings
+        # Underscore-prefixed storage: `sessions`/`settings` are method names
+        # below (matching muxplex_client.MuxplexClient's real surface), so
+        # the plain attribute names would shadow them on this instance.
+        self._sessions = sessions
+        self._settings = settings
         self.active_session: str | None = None
         self.active_view = "all"
         self.connected_names: list[str] = []
@@ -148,18 +151,18 @@ class FakeClient:
         self.connect_event = threading.Event()
         self.view_patch_event = threading.Event()
 
-    def get_sessions(self) -> list[Session]:
-        return list(self.sessions)
+    def sessions(self) -> list[Session]:
+        return list(self._sessions)
 
-    def get_state(self) -> ServerState:
+    def state(self) -> ServerState:
         return ServerState(
             active_session=self.active_session, active_view=self.active_view
         )
 
-    def get_settings(self) -> Settings:
-        return self.settings
+    def settings(self) -> Settings:
+        return self._settings
 
-    def connect_session(self, name: str) -> None:
+    def connect(self, name: str) -> None:
         self.connected_names.append(name)
         self.connect_event.set()
 

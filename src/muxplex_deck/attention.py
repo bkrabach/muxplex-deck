@@ -19,7 +19,7 @@ shows exactly what `views.resolve_view` returned.
 
 from __future__ import annotations
 
-from .client import Session
+from muxplex_client import Session
 
 NEG_INF = float("-inf")
 

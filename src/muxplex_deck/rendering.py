@@ -41,7 +41,7 @@ from PIL import Image, ImageDraw, ImageFont
 from StreamDeck.Devices.StreamDeck import StreamDeck
 from StreamDeck.ImageHelpers import PILHelper
 
-from .client import Session
+from muxplex_client import Session
 from .device import DeckDevice
 
 _KEY_LABEL_FONT_SIZE = 16
