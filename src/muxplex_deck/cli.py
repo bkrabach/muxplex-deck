@@ -323,7 +323,7 @@ def check_config_file(config_path: str | None = None) -> tuple[str, str]:
     resolved = config_mod._resolve_config_path(config_path)
     if resolved.exists():
         return "ok", f"Config: {resolved}"
-    return "warn", f"Config: {resolved} (not yet created -- see README.md)"
+    return "warn", f"Config: {resolved} (not yet created -- run: muxplex-deck init)"
 
 
 def check_federation_key(key_file: Path) -> tuple[str, str]:
@@ -496,9 +496,16 @@ def check_hid_openable() -> tuple[str, str]:
         return "ok", "HID: device in use by the muxplex-deck service (expected)"
 
     from . import hidhelp
+    from . import wsl as wsl_mod
 
     hint = ""
-    if sys.platform not in ("darwin", "win32") and not udev_rule_exists():
+    if wsl_mod.detect().is_wsl:
+        # The udev-rule hints below don't apply on WSL -- see
+        # hidhelp.udev_guidance()'s WSL gate. explain_environment()'s W7
+        # guidance (the proven per-attach chown), already surfaced above
+        # this line in `doctor()`, covers this instead.
+        pass
+    elif sys.platform not in ("darwin", "win32") and not udev_rule_exists():
         hint = hidhelp.HID_HINT_RUN_SERVICE_INSTALL
     elif sys.platform not in ("darwin", "win32"):
         hint = hidhelp.HID_HINT_RULE_EXISTS_BUT_STILL_FAILED
@@ -669,11 +676,40 @@ def doctor(config_path: str | None = None) -> int:
     # this adds no output there -- see hidhelp.explain_environment().
     from . import hidhelp
 
-    for guidance in hidhelp.explain_environment():
+    env_guidances = hidhelp.explain_environment()
+    for guidance in env_guidances:
         checks.append((guidance.status, guidance.message))
+    env_states = {g.state for g in env_guidances}
 
-    checks.append(check_deck_detected(config_path))
-    checks.append(check_hid_openable())
+    if "W7" in env_states:
+        # The W7 guidance just appended above already says the device is
+        # attached but can't be opened, plus the proven per-attach `chown`
+        # fix -- check_deck_detected()/check_hid_openable() would only
+        # restate the same fact across two more (partly contradictory)
+        # lines. See the WSL cold-start bug report: "3 lines describe one
+        # problem". Skip both; nothing more to add.
+        pass
+    else:
+        deck_status, deck_message = check_deck_detected(config_path)
+        if deck_message == _NO_DEVICE_GUIDANCE and env_states & {
+            "W1",
+            "W2",
+            "W3",
+            "W4",
+            "W5",
+            "W6",
+        }:
+            # A WSL-specific state above already explains exactly where
+            # the device is (or precisely why it isn't visible to this OS
+            # yet) -- the generic "check the cable" guidance would
+            # flatly contradict it (see bug report: located @ BUSID 1-4,
+            # immediately followed by "check your cable").
+            deck_message = (
+                "Stream Deck: not detected on this OS yet -- see the WSL "
+                "guidance above."
+            )
+        checks.append((deck_status, deck_message))
+        checks.append(check_hid_openable())
 
     server_url = cfg.server_url if cfg is not None else raw.get("server_url", "")
     checks.append(check_server_reachable(server_url, ca_file))
@@ -1044,6 +1080,34 @@ def update(*, force: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
+# A settled-enough bound for sysfs to enumerate a just-attached device --
+# generous enough to absorb the usbip attach -> udev/sysfs lag that
+# produced a false W6 ("not visible yet") immediately followed by a
+# `doctor` run that found the device fine, but tight enough that a
+# genuinely-stuck attach still fails promptly.
+_ATTACH_SETTLE_ATTEMPTS = 5
+_ATTACH_SETTLE_DELAY_SECONDS = 0.2
+
+
+def _find_usb_node_with_settle(usbnode_mod: Any, vendor_id: str) -> Any:
+    """Poll for the USB node with a bounded settle window after an attach.
+
+    A successful `wsl.attach()` can return before sysfs has finished
+    enumerating the device on this side -- checking `find_usb_node` only
+    once produced a false negative (W6: "attached but Linux doesn't see it
+    yet") moments before the very next `doctor` run found the device
+    working. Retries a few times with a short delay instead of declaring
+    failure on the very first miss.
+    """
+    node = usbnode_mod.find_usb_node(vendor_id)
+    for _ in range(_ATTACH_SETTLE_ATTEMPTS - 1):
+        if node is not None:
+            return node
+        time.sleep(_ATTACH_SETTLE_DELAY_SECONDS)
+        node = usbnode_mod.find_usb_node(vendor_id)
+    return node
+
+
 def wsl_attach(*, vendor_id: str = "0fd9") -> int:
     """`muxplex-deck wsl attach` -- attach the Stream Deck to this WSL2 distro.
 
@@ -1119,7 +1183,7 @@ def wsl_attach(*, vendor_id: str = "0fd9") -> int:
     else:
         print_check("ok", f"Already attached (BUSID {device.busid})")
 
-    node = usbnode_mod.find_usb_node(vendor_id)
+    node = _find_usb_node_with_settle(usbnode_mod, vendor_id)
     if node is None:
         print_check("warn", hidhelp.w6_message(device))
         print()

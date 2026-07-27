@@ -812,3 +812,232 @@ class TestNoDeviceGuidanceNoLongerLeaksWslText:
         text = cli._NO_DEVICE_GUIDANCE
         assert "Elgato Stream Deck app" in text
         assert "cable" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# check_config_file -- must point at the CLI's own `init` command, not the
+# README (doctor is supposed to teach; docs merely supplement -- see AGENTS.md
+# "single home for guidance" convention applied to config, not just HID/WSL).
+# ---------------------------------------------------------------------------
+
+
+class TestCheckConfigFilePointsAtInitCommand:
+    def test_missing_config_points_at_init_not_readme(self, tmp_path: Path) -> None:
+        status, message = cli.check_config_file(str(tmp_path / "config.json"))
+        assert status == "warn"
+        assert "muxplex-deck init" in message
+        assert "README" not in message
+
+
+# ---------------------------------------------------------------------------
+# check_hid_openable() must not offer the udev-rule hints on WSL -- they
+# don't apply there (hidhelp.udev_guidance() returns None for WSL; the
+# proven remediation is the per-attach chown from explain_environment(),
+# already shown earlier in doctor()'s output).
+# ---------------------------------------------------------------------------
+
+
+class TestCheckHidOpenableSuppressesHintOnWsl:
+    def test_wsl_open_failure_has_no_udev_hint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+        import muxplex_deck.service as service_mod
+        from muxplex_deck import wsl
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=False)),
+        )
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        monkeypatch.setattr(
+            wsl, "detect", lambda **_k: wsl.WslInfo(is_wsl=True, version=2, kernel="x")
+        )
+
+        status, message = cli.check_hid_openable()
+
+        assert status == "warn"
+        assert "could not open device" in message
+        assert "service install" not in message
+        assert "udev rule exists" not in message
+
+
+# ---------------------------------------------------------------------------
+# doctor()'s W7 collapse -- when explain_environment() already reports
+# "attached, can't open it" (W7) plus the proven chown fix,
+# check_deck_detected()/check_hid_openable() must not restate the same fact
+# across two more (partly contradictory) lines. See the WSL cold-start bug
+# report: "3 lines describe one problem".
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorW7Collapse:
+    def test_w7_guidance_suppresses_deck_detected_and_hid_openable_lines(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            hidhelp,
+            "explain_environment",
+            lambda **_kw: [
+                hidhelp.Guidance(
+                    status="warn", message="attached, can't open it", state="W7"
+                )
+            ],
+        )
+        deck_detected_calls: list[object] = []
+        hid_openable_calls: list[object] = []
+        monkeypatch.setattr(
+            cli,
+            "check_deck_detected",
+            lambda config_path=None: (
+                deck_detected_calls.append(1)
+                or (
+                    "ok",
+                    "Stream Deck detected (not yet opened -- see HID check below)",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "check_hid_openable",
+            lambda: hid_openable_calls.append(1) or ("warn", "HID: could not open"),
+        )
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        assert deck_detected_calls == []
+        assert hid_openable_calls == []
+        out = capsys.readouterr().out
+        assert "attached, can't open it" in out
+        assert "see HID check below" not in out
+        assert "HID: could not open" not in out
+        # Collapsed to exactly one occurrence of the underlying fact.
+        assert out.count("can't open it") == 1
+
+    def test_non_w7_state_still_calls_both_checks_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: only W7 collapses -- every other state (or no
+
+        state at all) must keep calling both checks exactly as before.
+        """
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(hidhelp, "explain_environment", lambda **_kw: [])
+        monkeypatch.setattr(
+            cli, "check_deck_detected", lambda config_path=None: ("warn", "no device")
+        )
+        monkeypatch.setattr(cli, "check_hid_openable", lambda: ("warn", "n/a"))
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no device" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor()'s W1-W6 contradiction fix -- when a WSL state already located the
+# device (or explains precisely why it isn't visible yet),
+# check_deck_detected()'s generic "not found, check the cable" text must not
+# also be shown -- it flatly contradicts the WSL guidance just above it. See
+# the bug report: "plugged into Windows (BUSID 1-4) but not shared"
+# immediately followed by "No Stream Deck found ... check the USB cable".
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorW1ToW6CableCheckContradiction:
+    def test_w4_state_replaces_generic_cable_check_text(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            hidhelp,
+            "explain_environment",
+            lambda **_kw: [
+                hidhelp.Guidance(
+                    status="warn",
+                    message="plugged into Windows (BUSID 1-4) but not shared",
+                    state="W4",
+                )
+            ],
+        )
+        # The REAL check_deck_detected() function is used (not mocked) so it
+        # returns the actual _NO_DEVICE_GUIDANCE constant, exercising the
+        # exact string-equality swap doctor() performs.
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _FakeManager(None)
+        )
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "but not shared" in out
+        # The contradictory generic guidance must be gone...
+        assert "Check the USB cable and try a different port." not in out
+        # ...replaced by a pointer back to the guidance already shown.
+        assert "see the WSL guidance above" in out
+
+    def test_no_env_guidance_keeps_generic_cable_check_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: the no-hardware, non-WSL path (already covered
+
+        by TestDoctorDeckIntegrationEndToEnd above) must be untouched.
+        """
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(hidhelp, "explain_environment", lambda **_kw: [])
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _FakeManager(None)
+        )
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "No Stream Deck found" in out

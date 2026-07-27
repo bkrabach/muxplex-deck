@@ -150,6 +150,7 @@ class TestWslAttachExitCodes:
     def test_already_attached_node_not_visible_exits_1(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wsl, "detect", lambda **_k: _wsl2_info())
         monkeypatch.setattr(wsl, "find_usbipd", lambda: _paths("/mnt/c/usbipd.exe"))
         monkeypatch.setattr(
@@ -191,6 +192,65 @@ class TestWslAttachExitCodes:
         monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: True)
 
         assert cli.wsl_attach() == 0
+
+
+class TestWslAttachSettlesBeforeDeclaringNotVisible:
+    """Regression: a successful attach can return before sysfs has finished
+
+    enumerating the device -- checking `find_usb_node` exactly once
+    produced a false W6 ("not visible yet") moments before the very next
+    `doctor` run found the device present and working. `wsl_attach()` must
+    retry across a short, bounded settle window instead of failing on the
+    very first miss.
+    """
+
+    def test_node_appears_on_second_check_succeeds_without_real_delay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(cli.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(wsl, "detect", lambda **_k: _wsl2_info())
+        monkeypatch.setattr(wsl, "find_usbipd", lambda: _paths("/mnt/c/usbipd.exe"))
+        monkeypatch.setattr(
+            wsl, "list_devices", lambda *a, **k: [_device(state="shared")]
+        )
+        monkeypatch.setattr(wsl, "attach", lambda *a, **k: (True, "attached"))
+
+        node_lookups: list[int] = []
+
+        def _flaky_find_usb_node(*_a: object, **_k: object) -> usbnode.UsbNode | None:
+            node_lookups.append(1)
+            if len(node_lookups) < 2:
+                return None
+            return _node(readable_writable=True)
+
+        monkeypatch.setattr(usbnode, "find_usb_node", _flaky_find_usb_node)
+        monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: True)
+
+        result = cli.wsl_attach()
+
+        assert result == 0
+        assert len(node_lookups) == 2
+        assert len(sleep_calls) == 1  # exactly one bounded settle wait
+
+    def test_node_never_appears_still_exits_1_after_bounded_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(cli.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(wsl, "detect", lambda **_k: _wsl2_info())
+        monkeypatch.setattr(wsl, "find_usbipd", lambda: _paths("/mnt/c/usbipd.exe"))
+        monkeypatch.setattr(
+            wsl, "list_devices", lambda *a, **k: [_device(state="shared")]
+        )
+        monkeypatch.setattr(wsl, "attach", lambda *a, **k: (True, "attached"))
+        monkeypatch.setattr(usbnode, "find_usb_node", lambda *a, **k: None)
+
+        result = cli.wsl_attach()
+
+        assert result == 1
+        # Bounded, not infinite -- exactly the configured settle window.
+        assert len(sleep_calls) == cli._ATTACH_SETTLE_ATTEMPTS - 1
 
 
 class TestWslAttachOutputContent:
