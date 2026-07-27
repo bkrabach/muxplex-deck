@@ -251,11 +251,14 @@ def _get_install_info() -> dict:
     return info
 
 
+_PYPI_PROJECT_URL = "https://pypi.org/pypi/muxplex-deck/json"
+
+
 def _check_for_update(info: dict) -> tuple[bool, str]:
     """Check if an update is available.
 
-    muxplex-deck is git-only (no PyPI release) -- only the git comparison
-    path applies. Editable installs are never flagged.
+    muxplex-deck 0.4.0+ is published to PyPI, so both the git and pypi
+    comparison paths apply now. Editable installs are never flagged.
     """
     if info["source"] == "editable":
         return False, "editable install -- manage updates manually"
@@ -282,6 +285,24 @@ def _check_for_update(info: dict) -> tuple[bool, str]:
             return True, f"update available ({local_sha[:8]} -> {remote_sha[:8]})"
         except Exception:  # noqa: BLE001 -- any git/network failure means "upgrade to be safe"
             return True, "check failed -- upgrading to be safe"
+
+    if info["source"] == "pypi":
+        try:
+            import httpx
+
+            response = httpx.get(
+                _PYPI_PROJECT_URL,
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            latest = response.json()["info"]["version"]
+            current = info["version"]
+            if latest == current:
+                return False, f"up to date (v{current})"
+            return True, f"update available (v{current} -> v{latest})"
+        except Exception:  # noqa: BLE001 -- any network/parse failure means "upgrade to be safe"
+            return True, "could not check PyPI -- upgrading to be safe"
 
     return True, "unknown install source -- could not check"
 
@@ -855,18 +876,53 @@ def _service_is_active() -> bool:
     return service_is_active()
 
 
-def update() -> None:
+def update(*, force: bool = False) -> None:
     """Update muxplex-deck to the latest version and restart the service (if installed).
 
-    Simplified relative to muxplex's own `upgrade()`: muxplex-deck has no
-    PyPI release, so there is no "already up to date, use --force" version
-    gate -- it always reinstalls from git HEAD (matching `uv tool install
-    --force`'s own semantics). Reporting style (plain `  ERROR: ...` on
-    stderr equivalent) matches muxplex's.
+    Respects how the tool was installed (see `_get_install_info`), mirroring
+    muxplex's own `upgrade()`: a `pypi` install upgrades from PyPI (package
+    name, so `uv tool install --force muxplex-deck` / `pip install --upgrade
+    muxplex-deck`); a `git` (or `unknown`) install keeps reinstalling from
+    git HEAD via `_REPO_URL`, exactly as before -- this honors an explicit
+    git install rather than migrating it. An `editable` install is left
+    alone entirely (dev checkout -- manage it via git yourself).
+
+    Now that a real PyPI release exists, the "already up to date" version
+    gate this module previously lacked (see AGENTS.md history) is real:
+    unless `force=True`, an install already at the latest version/commit
+    is reported and left untouched rather than reinstalled and restarted
+    for no code change. Reporting style (plain `  ERROR: ...` on stderr
+    equivalent) matches muxplex's.
     """
     from .service import service_install
 
     print("\nmuxplex-deck update\n")
+
+    info = _get_install_info()
+    commit_suffix = f" @ {info['commit'][:8]}" if info["commit"] else ""
+    print(
+        f"  Installed: muxplex-deck {info['version']} (via {info['source']}{commit_suffix})"
+    )
+
+    if info["source"] == "editable":
+        print(
+            "\n  Editable install detected -- manage updates via git yourself (no action taken).\n"
+        )
+        return
+
+    if force:
+        print("  Status: --force specified -- skipping version check")
+    else:
+        update_available, message = _check_for_update(info)
+        print(f"  Status: {message}")
+        if not update_available:
+            print(
+                "\n  Already up to date."
+                " Use 'muxplex-deck update --force' to reinstall anyway.\n"
+            )
+            return
+
+    install_target = "muxplex-deck" if info["source"] == "pypi" else f"git+{_REPO_URL}"
 
     was_active = _service_is_active()
     if was_active:
@@ -896,7 +952,7 @@ def update() -> None:
         uv_path = _find_uv()
         if uv_path:
             result = subprocess.run(
-                [uv_path, "tool", "install", "--force", f"git+{_REPO_URL}"],
+                [uv_path, "tool", "install", "--force", install_target],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -910,7 +966,7 @@ def update() -> None:
             pip_path = _find_pip()
             if pip_path:
                 result = subprocess.run(
-                    [pip_path, "install", "--upgrade", f"git+{_REPO_URL}"],
+                    [pip_path, "install", "--upgrade", install_target],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -989,10 +1045,15 @@ def main() -> None:
         "--json", action="store_true", help="Emit raw status as JSON"
     )
 
-    sub.add_parser(
+    update_parser = sub.add_parser(
         "update",
         aliases=["upgrade"],
         help="Update muxplex-deck to the latest version and restart the service",
+    )
+    update_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reinstall even if already at the latest version/commit",
     )
 
     init_parser = sub.add_parser(
@@ -1057,7 +1118,7 @@ def main() -> None:
             status(getattr(args, "config", None), as_json=getattr(args, "json", False))
         )
     elif args.command in ("update", "upgrade"):
-        update()
+        update(force=getattr(args, "force", False))
     elif args.command == "init":
         from .init_wizard import run_init
 

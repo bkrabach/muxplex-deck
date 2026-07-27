@@ -153,8 +153,24 @@ product. See `README.md` for setup, config, and verification checklists.
   via the real `DeviceManager` and reports detected/openable status
   separately, since "detected but can't open" is exactly the
   udev-rule-missing symptom.
-- `update` is git-only (no PyPI release) -- always reinstalls from `main`
-  via `uv tool install --force git+...` (pip fallback), unlike muxplex's
-  own upgrade which has PyPI/uv-tool-managed detection and a
-  version-already-current skip gate. Simplified deliberately: there's only
-  one install path for this project today.
+- `update` is source-aware (v0.4.1+): it reuses `_get_install_info()` --
+  the same PEP 610 `direct_url.json` detection `doctor`'s install-source
+  check already relies on -- to decide *what* to reinstall. A `pypi`
+  install upgrades from PyPI (`uv tool install --force muxplex-deck` /
+  pip fallback); a `git` (or `unknown`) install keeps reinstalling from
+  `main` via `git+...`, exactly as before. An `editable` install is left
+  untouched (manage it via git yourself). It also now has the
+  version-already-current skip gate muxplex's own `upgrade()` has (a real
+  PyPI release makes that gate meaningful); `--force` bypasses it. Do NOT
+  let `update`/`doctor` silently move a user off a source they chose --
+  see the "PyPI vs git install" incident below.
+- `doctor`'s install-source check (`check_install_and_update`) treats
+  `pypi` as a fully known source, not `unknown install source` -- it
+  checks the published version via PyPI's JSON API and reports up to
+  date / update available exactly like the `git` path does via
+  `git ls-remote`. **Incident (2026-07):** `doctor` used to call a
+  correctly-detected `pypi` install "unknown" and tell the user to run
+  `update`; `update` unconditionally reinstalled from `git+...`, silently
+  reverting a user who had deliberately migrated to the PyPI release back
+  onto git. Both entry points must agree on every known source, and
+  neither may recommend an action that undoes the user's install choice.

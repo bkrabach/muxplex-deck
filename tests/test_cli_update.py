@@ -1,9 +1,25 @@
 """`muxplex-deck update` -- install command construction, subprocess fully mocked.
 
 No real `uv`/`pip`/`systemctl`/`launchctl` is ever invoked: `subprocess.run`
-is monkeypatched throughout. Proves: uv-present path uses
-`uv tool install --force git+<repo>`, uv-absent path falls back to
-`pip install --upgrade git+<repo>`, and doctor() is called on success.
+is monkeypatched throughout, and `_get_install_info`/`_check_for_update` are
+monkeypatched (directly, or via the `_default_install_info` autouse fixture)
+so no test depends on this dev checkout's own real install metadata
+(editable) or hits the network/git.
+
+Covers the source-aware behavior added to close the "doctor recommends
+update, update reverts a deliberate pypi install back to git" trap:
+  - `_default_install_info` defaults every test to a `git` install with an
+    update available -- preserves the pre-fix behavior/assertions for tests
+    that don't care about install source.
+  - `TestInstallSourceSelectsTarget` proves pypi -> bare package name,
+    git/unknown -> `git+<repo>` (unchanged).
+  - `TestAlreadyUpToDateSkipsReinstall` proves the new version-gate: no
+    subprocess calls at all when already current, `--force` bypasses it.
+  - `TestEditableInstallNeverReinstalled` proves an editable (dev) install
+    is left alone unconditionally, even under `--force`.
+  - `TestUnreachablePyPIDegradesGracefully` proves a real (unmocked)
+    `_check_for_update` facing a network failure still lets the update
+    proceed rather than blocking or crashing.
 """
 
 from __future__ import annotations
@@ -37,6 +53,35 @@ class _RecordingRun:
 def no_real_service_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """Belt-and-suspenders: never let a real service_install/service_restart run."""
     monkeypatch.setattr(cli, "doctor", lambda *a, **k: 0)
+
+
+@pytest.fixture(autouse=True)
+def _default_install_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every test to a `git` install with an update available.
+
+    Without this, `update()` would call the REAL `_get_install_info()` /
+    `_check_for_update()` -- which, in this dev checkout, report an
+    `editable` install and thus "already up to date" -- silently skipping
+    the reinstall every test below assumes happens. Tests that need a
+    different source/status override these two functions themselves;
+    a later `monkeypatch.setattr` in the test body simply overrides this
+    fixture's patch for that test.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_get_install_info",
+        lambda: {
+            "source": "git",
+            "version": "0.0.0",
+            "commit": "abc123",
+            "url": cli._REPO_URL,
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "_check_for_update",
+        lambda info: (True, "update available (abc123 -> def456)"),
+    )
 
 
 class TestUvPresent:
@@ -159,3 +204,261 @@ class TestServiceLifecycleAroundUpdate:
         cli.update()
 
         assert doctor_calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# Install-source awareness -- the fix for the "doctor tells you to run
+# update; update reverts your pypi install back to git" trap.
+# ---------------------------------------------------------------------------
+
+
+class TestInstallSourceSelectsTarget:
+    def test_pypi_source_uses_bare_package_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {"source": "pypi", "version": "0.4.0", "commit": None, "url": None},
+        )
+        monkeypatch.setattr(
+            cli,
+            "_check_for_update",
+            lambda info: (True, "update available (v0.4.0 -> v0.5.0)"),
+        )
+
+        cli.update()
+
+        install_calls = [c for c in recorder.calls if c[:1] == ["/usr/bin/uv"]]
+        assert install_calls == [
+            ["/usr/bin/uv", "tool", "install", "--force", "muxplex-deck"]
+        ]
+
+    def test_git_source_still_uses_git_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {
+                "source": "git",
+                "version": "0.0.0",
+                "commit": "abc123",
+                "url": cli._REPO_URL,
+            },
+        )
+        monkeypatch.setattr(
+            cli,
+            "_check_for_update",
+            lambda info: (True, "update available (abc123 -> def456)"),
+        )
+
+        cli.update()
+
+        install_calls = [c for c in recorder.calls if c[:1] == ["/usr/bin/uv"]]
+        assert install_calls == [
+            ["/usr/bin/uv", "tool", "install", "--force", f"git+{cli._REPO_URL}"]
+        ]
+
+    def test_unknown_source_falls_back_to_git_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preserves the pre-fix default for the rare ambiguous-source case."""
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {
+                "source": "unknown",
+                "version": "0.0.0",
+                "commit": None,
+                "url": None,
+            },
+        )
+        monkeypatch.setattr(
+            cli,
+            "_check_for_update",
+            lambda info: (True, "unknown install source -- could not check"),
+        )
+
+        cli.update()
+
+        install_calls = [c for c in recorder.calls if c[:1] == ["/usr/bin/uv"]]
+        assert install_calls == [
+            ["/usr/bin/uv", "tool", "install", "--force", f"git+{cli._REPO_URL}"]
+        ]
+
+
+class TestAlreadyUpToDateSkipsReinstall:
+    def test_pypi_up_to_date_skips_install_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {"source": "pypi", "version": "0.4.0", "commit": None, "url": None},
+        )
+        monkeypatch.setattr(
+            cli, "_check_for_update", lambda info: (False, "up to date (v0.4.0)")
+        )
+
+        cli.update()
+
+        # No subprocess calls whatsoever -- not even a service stop attempt.
+        assert recorder.calls == []
+
+    def test_git_same_commit_skips_install_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {
+                "source": "git",
+                "version": "0.0.0",
+                "commit": "abc123",
+                "url": cli._REPO_URL,
+            },
+        )
+        monkeypatch.setattr(
+            cli, "_check_for_update", lambda info: (False, "up to date (commit abc123)")
+        )
+
+        cli.update()
+
+        assert recorder.calls == []
+
+    def test_force_bypasses_up_to_date_skip_and_skips_the_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {"source": "pypi", "version": "0.4.0", "commit": None, "url": None},
+        )
+        check_calls: list[bool] = []
+        monkeypatch.setattr(
+            cli,
+            "_check_for_update",
+            lambda info: check_calls.append(True) or (False, "up to date (v0.4.0)"),
+        )
+
+        cli.update(force=True)
+
+        # --force must skip the version check entirely, not just override its result.
+        assert check_calls == []
+        install_calls = [c for c in recorder.calls if c[:1] == ["/usr/bin/uv"]]
+        assert install_calls == [
+            ["/usr/bin/uv", "tool", "install", "--force", "muxplex-deck"]
+        ]
+
+
+class TestEditableInstallNeverReinstalled:
+    def test_editable_source_takes_no_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {
+                "source": "editable",
+                "version": "0.4.0",
+                "commit": None,
+                "url": None,
+            },
+        )
+        check_calls: list[bool] = []
+        monkeypatch.setattr(
+            cli,
+            "_check_for_update",
+            lambda info: check_calls.append(True) or (False, "editable install"),
+        )
+
+        cli.update()
+
+        assert recorder.calls == []
+        # Editable short-circuits before even consulting the version check.
+        assert check_calls == []
+
+    def test_editable_source_ignores_force(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {
+                "source": "editable",
+                "version": "0.4.0",
+                "commit": None,
+                "url": None,
+            },
+        )
+
+        cli.update(force=True)
+
+        assert recorder.calls == []
+
+
+class TestUnreachablePyPIDegradesGracefully:
+    def test_httpx_failure_still_lets_the_update_proceed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end through the REAL `_check_for_update`: httpx.get is the
+        only thing mocked (to raise), proving an offline/unreachable PyPI
+        degrades to "upgrade to be safe" rather than blocking or crashing
+        the update.
+        """
+        import httpx
+
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: False)
+        monkeypatch.setattr(
+            cli,
+            "_get_install_info",
+            lambda: {"source": "pypi", "version": "0.4.0", "commit": None, "url": None},
+        )
+
+        def _raise(*_a: object, **_k: object) -> None:
+            raise httpx.ConnectError("offline")
+
+        monkeypatch.setattr(httpx, "get", _raise)
+
+        cli.update()
+
+        install_calls = [c for c in recorder.calls if c[:1] == ["/usr/bin/uv"]]
+        assert install_calls == [
+            ["/usr/bin/uv", "tool", "install", "--force", "muxplex-deck"]
+        ]

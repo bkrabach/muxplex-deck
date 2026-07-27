@@ -482,6 +482,90 @@ class TestCheckServerReachable:
 
 
 # ---------------------------------------------------------------------------
+# _check_for_update -- pypi source
+#
+# muxplex-deck 0.4.0+ is published to PyPI; this is the known-source path
+# doctor previously lacked (it fell through to "unknown install source").
+# Network is mocked via `httpx.get` (the module calls it directly, not via
+# `httpx.Client(...)` like check_server_reachable above).
+# ---------------------------------------------------------------------------
+
+
+class _FakePyPIResponse:
+    def __init__(
+        self, version: str | None = None, raise_exc: Exception | None = None
+    ) -> None:
+        self._version = version
+        self._raise_exc = raise_exc
+
+    def raise_for_status(self) -> None:
+        if self._raise_exc is not None:
+            raise self._raise_exc
+
+    def json(self) -> dict:
+        return {"info": {"version": self._version}}
+
+
+class TestCheckForUpdatePypi:
+    @staticmethod
+    def _info(version: str = "0.4.0") -> dict:
+        return {"source": "pypi", "version": version, "commit": None, "url": None}
+
+    def test_up_to_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakePyPIResponse("0.4.0"))
+
+        update_available, message = cli._check_for_update(self._info("0.4.0"))
+
+        assert update_available is False
+        assert "up to date" in message
+        assert "0.4.0" in message
+
+    def test_update_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakePyPIResponse("0.5.0"))
+
+        update_available, message = cli._check_for_update(self._info("0.4.0"))
+
+        assert update_available is True
+        assert "0.4.0" in message
+        assert "0.5.0" in message
+
+    def test_network_failure_degrades_to_upgrade_to_be_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        def _raise(*_a: object, **_k: object) -> None:
+            raise httpx.ConnectError("offline")
+
+        monkeypatch.setattr(httpx, "get", _raise)
+
+        update_available, message = cli._check_for_update(self._info("0.4.0"))
+
+        assert update_available is True
+        assert "could not check PyPI" in message
+
+    def test_bad_response_degrades_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        monkeypatch.setattr(
+            httpx,
+            "get",
+            lambda *a, **k: _FakePyPIResponse(raise_exc=ValueError("404")),
+        )
+
+        update_available, message = cli._check_for_update(self._info("0.4.0"))
+
+        assert update_available is True
+        assert "could not check PyPI" in message
+
+
+# ---------------------------------------------------------------------------
 # doctor() -- never raises, always returns 0, even when everything fails
 # ---------------------------------------------------------------------------
 
