@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.2 (2026-07-27)
+
+### Bug Fixes
+
+- **`service install` no longer starts a service that cannot run.** On a machine with no config yet, install would write the unit, enable it, and start it — at which point the sidecar exited immediately because it had nothing to connect to, and the restart policy put it straight into a loop. One user reached 1113 restarts before noticing. Install now verifies the service can actually start before enabling it, using the very same config load the installed unit performs at startup, so "ready to install" and "ready to run" cannot drift apart. When config is missing it stops, explains why, and names the command that creates it; re-running install afterwards completes the job. Applies to launchd as well as systemd.
+
+- **`doctor` reported an installed service as "not installed."** The service check treated "not currently running" and "never installed" as the same condition, so a unit that was installed and failing was reported as absent — with a recommendation to install it again. Installed-but-not-running is now its own state, and it points at the logs rather than at a redundant reinstall.
+
+- **The sidecar's own startup error pointed at the README.** When it could not find a config file it told the reader to consult the README for an example — in the one message read by someone who has just discovered config is missing. It now names the command that creates the config, matching the change made to `doctor` in v0.5.1.
+
+### Verification
+
+- 390 tests passed via pytest (baseline 374 + 16 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.5.1 (2026-07-27)
 
 ### Bug Fixes
