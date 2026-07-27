@@ -207,10 +207,11 @@ def _blocked_subprocess_run(*args: object, **kwargs: object):
         "REFUSING TO RUN A REAL subprocess.run() FROM A TEST.\n"
         "\n"
         "This suite manages a real systemd/launchd service and calls out to\n"
-        "systemctl/launchctl/loginctl/openssl/git/uv/pip. A test that reaches\n"
-        "the real subprocess.run without mocking it would run those commands\n"
-        "for real on THIS host -- including against a real installed\n"
-        "muxplex-deck service.\n"
+        "systemctl/launchctl/loginctl/openssl/git/uv/pip/usbipd.exe. A test\n"
+        "that reaches the real subprocess.run without mocking it would run\n"
+        "those commands for real on THIS host -- including against a real\n"
+        "installed muxplex-deck service, or (via usbipd.exe on WSL) a real\n"
+        "USB device attachment on the Windows host.\n"
         "\n"
         "Mock subprocess.run yourself (see test_cli_service.py's\n"
         "`recording_run` fixture for the pattern), or if this test genuinely\n"
@@ -228,10 +229,14 @@ def _neutralize_subprocess(
 
     Patches the actual ``subprocess`` module's ``run`` attribute -- every
     module in this codebase that does ``import subprocess;
-    subprocess.run(...)`` (service.py, cli.py, focus.py) shares this one
-    attribute, so this single patch closes the whole class rather than one
-    function in one module. Tests that legitimately need the real thing opt
-    in explicitly:
+    subprocess.run(...)`` (service.py, cli.py, focus.py, wsl.py) shares
+    this one attribute, so this single patch closes the whole class rather
+    than one function in one module. This includes ``wsl.list_devices()``/
+    ``wsl.attach()``, which would otherwise shell out to a real
+    ``usbipd.exe`` and could mutate a real Windows USB device attachment --
+    a strictly worse blast radius than anything else this rail guards,
+    since it reaches outside the machine running the tests entirely. Tests
+    that legitimately need the real thing opt in explicitly:
 
         @pytest.mark.allow_real_subprocess
 

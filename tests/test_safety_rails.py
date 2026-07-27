@@ -210,6 +210,28 @@ def test_subprocess_override_requires_explicit_marker():
     assert "allow_real_subprocess" in src
 
 
+def test_wsl_list_devices_is_neutralized_by_default():
+    """`wsl.list_devices` must go through the same blocked `subprocess.run`
+    as everything else -- a careless test that forgets to mock it must not
+    reach a real `usbipd.exe` and enumerate a real Windows USB attachment.
+    """
+    import muxplex_deck.wsl as wsl_mod
+
+    with pytest.raises(AssertionError, match="REFUSING TO RUN"):
+        wsl_mod.list_devices(Path("/fake/usbipd.exe"))
+
+
+def test_wsl_attach_is_neutralized_by_default():
+    """`wsl.attach` -- the ONE mutating function in the WSL surface -- must
+    go through the same blocked `subprocess.run`. Without this, a careless
+    test could attach a real USB device away from a real Windows host.
+    """
+    import muxplex_deck.wsl as wsl_mod
+
+    with pytest.raises(AssertionError, match="REFUSING TO RUN"):
+        wsl_mod.attach(Path("/fake/usbipd.exe"), "1-4")
+
+
 # ---------------------------------------------------------------------------
 # Rail 5: real HID device neutralization
 # ---------------------------------------------------------------------------
