@@ -421,16 +421,9 @@ def probe_deck_status(manager: Any) -> dict:
 
 _NO_DEVICE_GUIDANCE = (
     "No Stream Deck found. Things to check:\n"
-    "    - All platforms: close the official Elgato Stream Deck app -- it holds\n"
-    "      exclusive HID access, so muxplex-deck cannot open the device while it runs.\n"
-    "    - Linux (incl. WSL): a udev rule must grant access to Elgato devices\n"
-    "      (vendor id 0x0fd9). Run 'muxplex-deck service install' for the exact\n"
-    "      remediation block, or see AGENTS.md.\n"
-    "    - WSL specifically: USB devices are not visible until attached from\n"
-    "      Windows via usbipd -- in an admin PowerShell:\n"
-    "        usbipd list                        (find the Stream Deck's BUSID)\n"
-    "        usbipd bind --busid <BUSID>        (first time only)\n"
-    "        usbipd attach --wsl --busid <BUSID>\n"
+    "    - Close the official Elgato Stream Deck app -- it holds exclusive HID access,\n"
+    "      so muxplex-deck cannot open the device while it is running.\n"
+    "    - Check the USB cable and try a different port.\n"
 )
 
 
@@ -502,11 +495,13 @@ def check_hid_openable() -> tuple[str, str]:
     if service_is_active():
         return "ok", "HID: device in use by the muxplex-deck service (expected)"
 
+    from . import hidhelp
+
     hint = ""
     if sys.platform not in ("darwin", "win32") and not udev_rule_exists():
-        hint = " Run: muxplex-deck service install (prints the udev remediation)."
+        hint = hidhelp.HID_HINT_RUN_SERVICE_INSTALL
     elif sys.platform not in ("darwin", "win32"):
-        hint = " A udev rule exists but the device still could not be opened."
+        hint = hidhelp.HID_HINT_RULE_EXISTS_BUT_STILL_FAILED
     return "warn", f"HID: could not open device ({status['error']}).{hint}"
 
 
@@ -668,6 +663,15 @@ def doctor(config_path: str | None = None) -> int:
         ca_file = config_mod._expand(raw["ca_file"])
     checks.append(check_ca_file(ca_file))
 
+    # Environment guidance (WSL/usbipd/udev-liveness) BEFORE the device
+    # checks -- it explains why the next line is about to warn. Returns []
+    # on a healthy platform (macOS, or native Linux with udev running), so
+    # this adds no output there -- see hidhelp.explain_environment().
+    from . import hidhelp
+
+    for guidance in hidhelp.explain_environment():
+        checks.append((guidance.status, guidance.message))
+
     checks.append(check_deck_detected(config_path))
     checks.append(check_hid_openable())
 
@@ -702,6 +706,9 @@ def _format_device_line(device: dict[str, Any]) -> tuple[str, str]:
     if not device.get("connected"):
         return "warn", "Device: not connected"
     caps = device.get("capabilities") or {}
+    hint = device.get("hint")
+    if not caps and hint:
+        return "warn", "Device: connected (capabilities unavailable)"
     if not caps:
         return "ok", "Device: connected (capabilities unavailable)"
     touchscreen = "yes" if caps.get("has_touchscreen") else "no"
@@ -801,7 +808,15 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
     else:
         print_check("ok", f"Status updated {age:.0f}s ago (pid {data.get('pid', '?')})")
 
-    print_check(*_format_device_line(data.get("device", {})))
+    device_data = data.get("device", {})
+    print_check(*_format_device_line(device_data))
+    hint = device_data.get("hint")
+    if hint and not device_data.get("connected"):
+        # Populated by the sidecar's open-failure branch (see main.py /
+        # hidhelp.explain_open_failure) -- this is what turns a stale
+        # status file into the primary teaching surface instead of a
+        # bare "not connected" with no explanation.
+        print_check("warn", hint)
     print_check(*_format_server_line(data.get("server", {})))
     print_check("ok", _format_state_line(data.get("state", {})))
 
@@ -1017,6 +1032,122 @@ def update(*, force: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# wsl attach -- find, share-check, and attach the Stream Deck under WSL2.
+#
+# This is the ONLY command whose entire purpose is to mutate host state
+# (WSL_COLD_START_SPEC.md section 6.1): it's the sole caller of
+# `wsl.attach()`. Its deciding rationale isn't convenience -- it removes
+# the `usbipd` vs `usbipd.exe` trap from the recurring path entirely (a
+# user who never types either name cannot get the wrong binary; see
+# section 6.4). Never invokes `sudo` (P3) -- when a permission fix is
+# still needed after attaching, it prints the command, it doesn't run it.
+# ---------------------------------------------------------------------------
+
+
+def wsl_attach(*, vendor_id: str = "0fd9") -> int:
+    """`muxplex-deck wsl attach` -- attach the Stream Deck to this WSL2 distro.
+
+    Exit 0 on a successful attach (even if a follow-up permission fix is
+    still needed -- the attach itself succeeded). Exit 1 for every state
+    that stops short of attaching (not WSL, WSL1, usbipd.exe missing, not
+    found, not shared) so scripts can branch on it.
+    """
+    from . import hidhelp
+    from . import usbnode as usbnode_mod
+    from . import wsl as wsl_mod
+
+    print("\nmuxplex-deck wsl attach\n")
+
+    info = wsl_mod.detect()
+    if not info.is_wsl:
+        print_check(
+            "fail", "Not running under WSL -- this command only makes sense there."
+        )
+        print()
+        return 1
+    print_check("ok", f"WSL{info.version} detected ({info.kernel})")
+
+    if info.version == 1:
+        print_check("fail", hidhelp.W1_MESSAGE)
+        print()
+        return 1
+
+    paths = wsl_mod.find_usbipd()
+    if paths.linux_impostor is not None and paths.windows is not None:
+        print_check("warn", hidhelp.impostor_message(paths))
+
+    if paths.windows is None:
+        print_check("warn", hidhelp.W2_MESSAGE)
+        print()
+        return 1
+    print_check("ok", f"usbipd.exe: {paths.windows}")
+
+    devices = wsl_mod.list_devices(paths.windows, vendor_id=vendor_id)
+    if devices is None:
+        print_check("warn", hidhelp.W2_MESSAGE)
+        print()
+        return 1
+    if not devices:
+        print_check("warn", hidhelp.NO_MATCHING_WINDOWS_DEVICE_MESSAGE)
+        print()
+        return 1
+
+    device = devices[0]
+    print_check(
+        "ok",
+        f"Found on Windows: BUSID {device.busid}  {device.vid_pid}  {device.description}",
+    )
+
+    if device.state == "not_shared":
+        print_check("warn", hidhelp.w4_message(device))
+        print()
+        return 1
+
+    if device.state == "unknown":
+        print_check("warn", hidhelp.w3_unknown_state_message(device))
+        print()
+        return 1
+
+    if device.state == "shared":
+        print_check("ok", "Shared -- attaching...")
+        success, message = wsl_mod.attach(paths.windows, device.busid)
+        if not success:
+            print_check("fail", f"Attach failed: {message}")
+            print()
+            return 1
+        print_check("ok", "Attached")
+    else:
+        print_check("ok", f"Already attached (BUSID {device.busid})")
+
+    node = usbnode_mod.find_usb_node(vendor_id)
+    if node is None:
+        print_check("warn", hidhelp.w6_message(device))
+        print()
+        return 1
+    print_check("ok", f"Visible to Linux: {node.path}")
+
+    if not node.readable_writable:
+        print_check("warn", hidhelp.w7_message(node))
+        if not usbnode_mod.udev_is_live():
+            print_check(
+                "warn",
+                hidhelp.u_dead_wsl_message(wsl_mod.wsl_conf_systemd_state()),
+            )
+
+    print()
+    print("  Next:")
+    print("    muxplex-deck service restart")
+    print("    muxplex-deck status")
+    print()
+    print(
+        "  The device number changes on every attach -- re-run "
+        "`muxplex-deck wsl attach`\n  after any unplug or Windows reboot."
+    )
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1085,6 +1216,13 @@ def main() -> None:
         "key", nargs="?", help="Config key (omit to reset all)"
     )
 
+    wsl_parser = sub.add_parser("wsl", help="WSL2 USB/IP helpers")
+    wsl_sub = wsl_parser.add_subparsers(dest="wsl_command")
+    wsl_sub.add_parser(
+        "attach",
+        help="Find, share-check, and attach the Stream Deck to this WSL2 distro",
+    )
+
     service_parser = sub.add_parser(
         "service", help="Manage the muxplex-deck background service"
     )
@@ -1129,6 +1267,12 @@ def main() -> None:
                 non_interactive=getattr(args, "non_interactive", False),
             )
         )
+    elif args.command == "wsl":
+        cmd = getattr(args, "wsl_command", None)
+        if cmd == "attach":
+            sys.exit(wsl_attach())
+        else:
+            wsl_parser.print_help()
     elif args.command == "config":
         config_path = getattr(args, "config", None)
         cmd = getattr(args, "config_command", None)

@@ -672,3 +672,143 @@ class TestDoctorDeckIntegrationEndToEnd:
         assert result == 0
         out = capsys.readouterr().out
         assert "No Stream Deck found" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor()'s new environment-guidance section (WSL_COLD_START_SPEC.md).
+# W0 (not WSL) + udev live must add NOTHING -- this is the no-regression
+# guard for macOS/healthy-Linux users' doctor output.
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorEnvironmentGuidanceNoRegression:
+    def test_no_wsl_and_udev_live_adds_no_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The critical no-noise case (success criterion #9 / #5)."""
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(hidhelp, "explain_environment", lambda **_kw: [])
+        monkeypatch.setattr(
+            cli, "check_deck_detected", lambda config_path=None: ("warn", "no device")
+        )
+        monkeypatch.setattr(cli, "check_hid_openable", lambda: ("warn", "n/a"))
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        # Only the pre-existing checks appear -- nothing from the new
+        # environment section, which returned [].
+        assert "no device" in out
+
+    def test_environment_guidance_is_surfaced_before_device_checks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            hidhelp,
+            "explain_environment",
+            lambda **_kw: [
+                hidhelp.Guidance(status="warn", message="WSL guidance line", state="W4")
+            ],
+        )
+        monkeypatch.setattr(
+            cli, "check_deck_detected", lambda config_path=None: ("warn", "no device")
+        )
+        monkeypatch.setattr(cli, "check_hid_openable", lambda: ("warn", "n/a"))
+        monkeypatch.setattr(cli, "check_service_status", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(cli, "check_install_and_update", lambda: ("ok", "n/a"))
+        monkeypatch.setattr(
+            cli, "check_server_reachable", lambda *a, **k: ("warn", "n/a")
+        )
+
+        result = cli.doctor(str(tmp_path / "nonexistent-config.json"))
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "WSL guidance line" in out
+        # Environment guidance appears before the "no device" line.
+        assert out.index("WSL guidance line") < out.index("no device")
+
+
+# ---------------------------------------------------------------------------
+# check_hid_openable()'s hint text now delegates to hidhelp -- must still
+# preserve the exact pre-existing behavior for native-Linux callers.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckHidOpenableHintDelegatesToHidhelp:
+    def test_hint_uses_hidhelp_run_service_install_constant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+        import muxplex_deck.service as service_mod
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=False)),
+        )
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+
+        status, message = cli.check_hid_openable()
+
+        assert status == "warn"
+        assert hidhelp.HID_HINT_RUN_SERVICE_INSTALL in message
+
+    def test_hint_uses_hidhelp_rule_exists_but_failed_constant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+        import muxplex_deck.service as service_mod
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            device_real_mod,
+            "RealDeviceManager",
+            lambda: _FakeManager(_FakeDeck(openable=False)),
+        )
+        monkeypatch.setattr(service_mod, "udev_rule_exists", lambda: True)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+
+        status, message = cli.check_hid_openable()
+
+        assert status == "warn"
+        assert hidhelp.HID_HINT_RULE_EXISTS_BUT_STILL_FAILED in message
+
+
+# ---------------------------------------------------------------------------
+# _NO_DEVICE_GUIDANCE (V10 fix) -- must no longer leak WSL/udev text on
+# every platform. This is a deliberate content change (not "byte-identical"
+# for this specific string) -- see WSL_COLD_START_SPEC.md section 7.7.
+# ---------------------------------------------------------------------------
+
+
+class TestNoDeviceGuidanceNoLongerLeaksWslText:
+    def test_no_wsl_or_udev_mentions(self) -> None:
+        text = cli._NO_DEVICE_GUIDANCE
+        assert "usbipd" not in text.lower()
+        assert "udev" not in text.lower()
+        assert "wsl" not in text.lower()
+
+    def test_still_mentions_elgato_app_and_cable(self) -> None:
+        text = cli._NO_DEVICE_GUIDANCE
+        assert "Elgato Stream Deck app" in text
+        assert "cable" in text.lower()

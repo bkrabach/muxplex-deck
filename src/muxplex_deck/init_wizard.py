@@ -337,10 +337,34 @@ def _run_init_impl(
     status, message = cli_mod.check_hid_openable()
     cli_mod.print_check(status, message)
 
-    # Step 7: next steps
-    if sys.platform not in ("darwin", "win32") and not service_mod.udev_rule_exists():
+    # Step 7: next steps -- environment guidance (WSL/usbipd/udev) first,
+    # then the udev-rule remediation (only when it could actually work --
+    # see hidhelp.udev_guidance()'s P4 gate), via the single shared home
+    # for this text (hidhelp) rather than a copy of it here.
+    from . import hidhelp
+
+    for guidance in hidhelp.explain_environment():
         print()
-        print(service_mod._UDEV_REMEDIATION)
+        cli_mod.print_check(guidance.status, guidance.message)
+
+    if sys.platform not in ("darwin", "win32") and not service_mod.udev_rule_exists():
+        udev = hidhelp.udev_guidance()
+        if udev is not None:
+            print()
+            cli_mod.print_check(udev.status, udev.message)
+
+    if (
+        not non_interactive
+        and hidhelp.is_wsl2()
+        and _confirm(
+            "\nAttach the Stream Deck now (`muxplex-deck wsl attach`)?",
+            default=True,
+            input_func=input_func,
+        )
+    ):
+        from .cli import wsl_attach
+
+        wsl_attach()
 
     if not non_interactive and _confirm(
         "\nRun `muxplex-deck service install` now?",
