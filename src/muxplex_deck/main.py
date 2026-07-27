@@ -52,6 +52,7 @@ import logging
 import signal
 import threading
 import time
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from muxplex_client import (
@@ -970,6 +971,59 @@ def _run_active(
         _safe_close(deck)
 
 
+class _FailureEpisode:
+    """Tracks a repeating failure so it's logged (and expensively diagnosed)
+    once per episode, not once per poll cycle.
+
+    An "episode" is a run of consecutive failures sharing the same
+    signature (`type(exc).__name__ + str(exc)`). The first failure in an
+    episode logs at ERROR with `error_prefix` + a `build_detail()` result
+    (computed ONLY here -- this is what keeps an expensive diagnosis, like
+    shelling out to `usbipd.exe`, from running every 2 seconds forever);
+    the full traceback goes to DEBUG. Subsequent identical failures are
+    silent except for a periodic one-line heartbeat. `reset()` on success
+    (or a changed signature, detected automatically) starts a fresh
+    episode next time.
+    """
+
+    def __init__(self, heartbeat_seconds: float) -> None:
+        self._heartbeat_seconds = heartbeat_seconds
+        self._signature: str | None = None
+        self._count = 0
+        self._last_heartbeat = 0.0
+        self.detail = ""
+
+    def reset(self) -> None:
+        self._signature = None
+        self._count = 0
+        self._last_heartbeat = 0.0
+        self.detail = ""
+
+    def note(
+        self,
+        exc: BaseException,
+        *,
+        build_detail: Callable[[], str],
+        error_prefix: str,
+        heartbeat_message: str,
+    ) -> None:
+        """Record one failure occurrence of `exc`."""
+        signature = f"{type(exc).__name__}:{exc}"
+        now = time.monotonic()
+        if signature != self._signature:
+            self._signature = signature
+            self._count = 1
+            self._last_heartbeat = now
+            self.detail = build_detail()
+            logger.error("%s%s", error_prefix, self.detail)
+            logger.debug("failure detail", exc_info=exc)
+            return
+        self._count += 1
+        if now - self._last_heartbeat >= self._heartbeat_seconds:
+            logger.info(heartbeat_message, self._count)
+            self._last_heartbeat = now
+
+
 def _install_signal_handler() -> threading.Event:
     shutting_down = threading.Event()
 
@@ -994,22 +1048,39 @@ def run(config: Config, manager: DeviceManager) -> int:
     # of `status` probing the (possibly exclusively-held) device directly.
     reporter = StatusReporter(config.server_url)
 
+    # Log-once-per-episode trackers -- see `_FailureEpisode`'s docstring.
+    # Two separate instances: enumeration failures and open failures are
+    # unrelated conditions and must not reset/confuse each other's episode.
+    enumerate_episode = _FailureEpisode(ABSENT_HEARTBEAT_SECONDS)
+    open_episode = _FailureEpisode(ABSENT_HEARTBEAT_SECONDS)
+
     logger.info("muxplex-deck starting (server=%s)", config.server_url)
     try:
         while not shutting_down.is_set():
             try:
                 deck = _find_deck(manager)
-            except Exception:
-                logger.exception(
-                    "Unexpected error while enumerating Stream Deck devices; will retry"
+                enumerate_episode.reset()
+            except Exception as exc:  # noqa: BLE001 -- device backends raise varied errors; log + retry, never crash the loop
+                enumerate_episode.note(
+                    exc,
+                    build_detail=lambda exc=exc: str(exc),
+                    error_prefix="Unexpected error while enumerating Stream Deck devices; will retry: ",
+                    heartbeat_message=(
+                        "still failing to enumerate Stream Deck devices "
+                        "(attempt %d, same error)"
+                    ),
                 )
                 shutting_down.wait(DEVICE_POLL_SECONDS)
                 continue
 
             if deck is None:
                 reporter.update(
-                    device_connected=False, device_caps=None, server_connected=False
+                    device_connected=False,
+                    device_caps=None,
+                    server_connected=False,
+                    hint=None,
                 )
+                open_episode.reset()
                 now = time.monotonic()
                 if not logged_waiting:
                     logger.info(
@@ -1027,8 +1098,33 @@ def run(config: Config, manager: DeviceManager) -> int:
             logged_waiting = False
             try:
                 deck.open()
-            except Exception:
-                logger.exception("Failed to open Stream Deck device; will retry")
+                open_episode.reset()
+            except Exception as exc:  # noqa: BLE001 -- HID backends raise varied errors; report + retry, never crash the loop
+                from . import hidhelp
+
+                def _build_open_failure_detail(exc: BaseException = exc) -> str:
+                    # Computed ONLY on a new episode -- may shell out to
+                    # usbipd.exe on WSL, so it must never run per-cycle.
+                    return hidhelp.explain_open_failure(str(exc)).message
+
+                open_episode.note(
+                    exc,
+                    build_detail=_build_open_failure_detail,
+                    error_prefix=f"cannot open the Stream Deck: {exc}\n",
+                    heartbeat_message=(
+                        "still cannot open the Stream Deck (attempt %d, same error)"
+                    ),
+                )
+                # Fixes the stale-status/false-"Server: unreachable" bug: the
+                # loop never got far enough to try the server, so without
+                # this update the status file froze at whatever it last
+                # said (see WSL_COLD_START_SPEC.md section 9.3 / V6).
+                reporter.update(
+                    device_connected=False,
+                    device_caps=None,
+                    server_connected=False,
+                    hint=open_episode.detail,
+                )
                 shutting_down.wait(DEVICE_POLL_SECONDS)
                 continue
 
@@ -1049,7 +1145,10 @@ def run(config: Config, manager: DeviceManager) -> int:
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")
                 reporter.update(
-                    device_connected=False, device_caps=None, server_connected=False
+                    device_connected=False,
+                    device_caps=None,
+                    server_connected=False,
+                    hint=None,
                 )
                 _safe_close(deck)
                 shutting_down.wait(DEVICE_POLL_SECONDS)

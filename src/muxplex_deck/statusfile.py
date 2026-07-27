@@ -69,6 +69,7 @@ def build_status(
     active_session: str | None,
     active_view: str | None,
     page: int | None,
+    hint: str | None = None,
 ) -> dict[str, Any]:
     """Build the status dict written to disk. Pure -- no I/O, easy to test.
 
@@ -77,10 +78,19 @@ def build_status(
     serial, firmware, key_count, key_rows/cols, dial_count,
     has_touchscreen, is_visual, etc. Never include the federation key or
     any other secret here.
+
+    `hint` (optional, additive -- no `SCHEMA_VERSION` bump needed) is
+    actionable guidance for why the device couldn't be opened (see
+    `hidhelp.explain_open_failure`), published so `muxplex-deck status`
+    can show it instead of a stale/misleading status. Older readers that
+    don't know this field simply don't see it (`.get()` is used to read
+    it back -- see `cli._format_device_line`).
     """
     device: dict[str, Any] = {"connected": device_connected}
     if device_connected and device_caps is not None:
         device["capabilities"] = device_caps
+    if hint is not None:
+        device["hint"] = hint
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -163,6 +173,7 @@ class StatusReporter:
             "active_session": None,
             "active_view": None,
             "page": None,
+            "hint": None,
         }
 
     def update(self, **fields: Any) -> None:
