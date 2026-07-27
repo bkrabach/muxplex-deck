@@ -629,6 +629,13 @@ _CHECK_MARKS: dict[str, str] = {
     "ok": "\033[32m\u2713\033[0m",
     "fail": "\033[31m\u2717\033[0m",
     "warn": "\033[33m!\033[0m",
+    # Distinct from "warn": "warn" means a check RAN and found something to
+    # flag; "unknown" means the check could not be run at all yet (e.g. the
+    # currently-running process hasn't published a status write of its own
+    # yet). Conflating the two is what let a dying process's stale-but-
+    # recent status snapshot get reported as definite failures right after
+    # `service restart` -- see AGENTS.md's restart-race incident.
+    "unknown": "\033[36m?\033[0m",
 }
 
 
@@ -789,7 +796,7 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
     fall back to a direct probe -- this keeps `status` useful even before
     the service has ever been installed.
     """
-    from .service import service_is_active
+    from .service import service_is_active, service_main_pid
     from .statusfile import read_status
 
     running = service_is_active()
@@ -825,9 +832,40 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
 
     if data is None:
         print_check(
-            "warn",
+            "unknown",
             "No status file found even though the service is running -- it "
             "may have just started. Try: muxplex-deck service logs",
+        )
+        print()
+        return 0
+
+    # Is this snapshot from the process running RIGHT NOW, or from a
+    # PREVIOUS incarnation? Age alone can't tell: a process that's about to
+    # be replaced (e.g. by `service restart`) can write its LAST status
+    # moments before exiting, so it still looks "fresh" by age even though
+    # it no longer reflects reality -- exactly the restart-race incident in
+    # AGENTS.md (2 false failures reported from a dying process's stale-but-
+    # recent write). Comparing the recorded pid to the service manager's own
+    # live MainPID is the reliable signal; fall back to the age check only
+    # when the live pid can't be determined at all (unsupported platform,
+    # command failure).
+    current_pid = service_main_pid()
+    recorded_pid = data.get("pid")
+    if current_pid is not None:
+        is_current = recorded_pid == current_pid
+    else:
+        is_current = (
+            time.time() - data.get("updated_at", 0)
+        ) <= _STATUS_STALE_THRESHOLD_SECONDS
+
+    if not is_current:
+        print_check(
+            "unknown",
+            f"Status not yet available for the running process (pid "
+            f"{current_pid if current_pid is not None else '?'}) -- the "
+            f"published status is from a previous run (pid {recorded_pid}). "
+            "This is expected right after (re)starting; try again in a "
+            "moment, or: muxplex-deck service logs",
         )
         print()
         return 0

@@ -61,6 +61,9 @@ class TestStatusServiceRunning:
         import muxplex_deck.service as service_mod
 
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        # Matches the pid _write_status() records -- this IS the currently
+        # running process's own status, so it should be trusted as current.
+        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 4242)
         monkeypatch.setattr(statusfile, "default_status_path", lambda: status_path)
 
         rc = cli.status()
@@ -105,6 +108,9 @@ class TestStatusServiceRunning:
         import muxplex_deck.service as service_mod
 
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        # Pid still matches the live process -- this is genuinely the SAME
+        # process just not writing (stuck), not a stale previous incarnation.
+        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 4242)
         monkeypatch.setattr(statusfile, "default_status_path", lambda: status_path)
 
         rc = cli.status()
@@ -124,12 +130,94 @@ class TestStatusServiceRunning:
         import muxplex_deck.service as service_mod
 
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 4242)
         monkeypatch.setattr(statusfile, "default_status_path", lambda: status_path)
 
         rc = cli.status()
         out = capsys.readouterr().out
         assert rc == 0
         assert "stale" not in out.lower()
+
+
+class TestStatusPidFreshnessGuard:
+    """Guards the bug CLASS this session found repeatedly: state reported
+
+    that wasn't actually observed this instant. Age alone can't tell a
+    dying-but-recently-written process apart from the one running right
+    now (the `service restart` race in AGENTS.md: 2 false failures read
+    from a previous incarnation's stale-but-recent status write). Only a
+    live pid comparison can.
+    """
+
+    def test_pid_mismatch_reports_unknown_not_failed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        status_path = tmp_path / "status.json"
+        # Written by a PREVIOUS incarnation (pid 1111): device disconnected,
+        # server unreachable -- the exact stale snapshot a dying process
+        # leaves behind. Age is small (just written), so an age-only check
+        # would call this "fresh" and report it as current truth.
+        _write_status(
+            status_path,
+            pid=1111,
+            device={"connected": False},
+            server={
+                "url": "https://example:8088",
+                "connected": False,
+                "last_error": "Authentication required",
+            },
+        )
+
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        # The service manager says the CURRENT process is pid 2222 --
+        # different from what's recorded in status.json.
+        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 2222)
+        monkeypatch.setattr(statusfile, "default_status_path", lambda: status_path)
+
+        rc = cli.status()
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Must NOT present the previous incarnation's failures as current --
+        # this is the false alarm the restart race produced verbatim.
+        assert "Device: not connected" not in out
+        assert "unreachable" not in out
+        assert "Authentication required" not in out
+        # Must say "unknown", not silently show ok/warn from stale data.
+        assert "previous run" in out.lower() or "not yet available" in out.lower()
+
+    def test_pid_undetermined_falls_back_to_age_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """When the live pid can't be determined at all (unsupported
+
+        platform, service manager command failure), fall back to the
+        original age-based staleness check rather than refusing to report
+        anything.
+        """
+        status_path = tmp_path / "status.json"
+        _write_status(status_path)
+
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        monkeypatch.setattr(service_mod, "service_main_pid", lambda: None)
+        monkeypatch.setattr(statusfile, "default_status_path", lambda: status_path)
+
+        rc = cli.status()
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Fresh data, pid undeterminable -- still reports the real device/
+        # server state (age-based fallback), not a blanket "unknown".
+        assert "Stream Deck +" in out
+        assert "reachable" in out
 
 
 class TestStatusServiceNotRunning:

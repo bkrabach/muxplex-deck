@@ -1012,6 +1012,12 @@ class TestLaunchdRestart:
         monkeypatch.setattr(
             service_mod, "service_is_active", lambda: next(active_sequence, False)
         )
+        # This test is about the unload race, not the freshness wait added
+        # separately (see TestRestartWaitsForFreshStatus) -- stub it out so
+        # this test stays focused and fast.
+        monkeypatch.setattr(
+            service_mod, "_wait_for_fresh_status", lambda timeout=None: True
+        )
 
         service_mod._launchd_restart()
 
@@ -1031,6 +1037,11 @@ class TestLaunchdRestart:
         monkeypatch.setattr(service_mod, "_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS", 0.01)
         monkeypatch.setattr(
             service_mod, "_LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS", 0.001
+        )
+        # This test is about the unload-timeout warning, not the separate
+        # freshness wait (see TestRestartWaitsForFreshStatus) -- stub it out.
+        monkeypatch.setattr(
+            service_mod, "_wait_for_fresh_status", lambda timeout=None: True
         )
 
         service_mod._launchd_restart()
@@ -1106,6 +1117,11 @@ class TestSystemdRestart:
         monkeypatch.setattr(
             service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
         )
+        # This test is about the plain restart-success path -- the
+        # freshness wait itself is covered by TestRestartWaitsForFreshStatus.
+        monkeypatch.setattr(
+            service_mod, "_wait_for_fresh_status", lambda timeout=None: True
+        )
         service_mod._systemd_restart()  # must not raise
         out = capsys.readouterr().out
         assert "Restarted the service" in out
@@ -1126,3 +1142,199 @@ class TestSystemdRestart:
         err = capsys.readouterr().err
         assert "ERROR" in err
         assert "Unit not found" in err
+
+
+# ---------------------------------------------------------------------------
+# service_main_pid -- best-effort live pid lookup, never raises. Guards the
+# bug CLASS this session found four times: state reported that wasn't
+# actually observed this instant. This is the primitive that lets both
+# `restart` and `status` tell "the process running right now" apart from
+# "a previous incarnation's last write" -- see AGENTS.md's restart-race
+# incident (2 false failures from a dying process's stale-but-recent write).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceMainPid:
+    def test_systemd_parses_pid_from_show_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0, stdout="12345\n"),
+        )
+        assert service_mod.service_main_pid() == 12345
+
+    def test_systemd_zero_pid_means_not_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MainPID is 0 (systemd's own convention) when the unit isn't active."""
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0, stdout="0\n"),
+        )
+        assert service_mod.service_main_pid() is None
+
+    def test_systemd_nonzero_exit_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(1, stderr="unit not found"),
+        )
+        assert service_mod.service_main_pid() is None
+
+    def test_systemd_unparseable_output_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(0, stdout="not-a-number\n"),
+        )
+        assert service_mod.service_main_pid() is None
+
+    def test_systemd_missing_binary_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise FileNotFoundError("no systemctl")
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _raise)
+        assert service_mod.service_main_pid() is None
+
+    def test_launchd_parses_pid_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                0,
+                stdout=("com.muxplex-deck = {\n\tpid = 6789\n\tstate = running\n}\n"),
+            ),
+        )
+        assert service_mod.service_main_pid() == 6789
+
+    def test_launchd_not_loaded_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(3, stderr="Could not find service"),
+        )
+        assert service_mod.service_main_pid() is None
+
+
+# ---------------------------------------------------------------------------
+# _wait_for_fresh_status / restart integration -- the restart-race fix
+# itself (AGENTS.md incident: `service restart` returned before the new
+# process published status, so `status` read the dying old process's
+# stale-but-recent snapshot and reported 2 false failures).
+# ---------------------------------------------------------------------------
+
+
+class TestRestartWaitsForFreshStatus:
+    def test_waits_until_pid_matches_then_reports_success(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.001)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:3] == ["systemctl", "--user", "restart"]:
+                return _FakeCompletedProcess(0)
+            if argv[:3] == ["systemctl", "--user", "show"]:
+                return _FakeCompletedProcess(0, stdout="4321\n")
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        # First two polls still see the OLD process's snapshot (pid 1111);
+        # the third sees the NEW process (pid 4321) has finally published.
+        read_sequence = iter(
+            [{"pid": 1111}, {"pid": 1111}, {"pid": 4321}, {"pid": 4321}]
+        )
+        monkeypatch.setattr(
+            statusfile_mod,
+            "read_status",
+            lambda path=None: next(read_sequence, {"pid": 4321}),
+        )
+
+        service_mod._systemd_restart()
+
+        out = capsys.readouterr().out
+        assert "Restarted the service" in out
+        assert "has not published fresh status" not in out
+
+    def test_timeout_reports_honestly_never_a_false_success(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The new process's pid never shows up in status.json in time --
+
+        must warn, never silently claim "Restarted the service" (see
+        AGENTS.md: printing a check-mark for a step never verified is
+        exactly the bug class this whole round of fixes closes).
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.005)
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:3] == ["systemctl", "--user", "restart"]:
+                return _FakeCompletedProcess(0)
+            if argv[:3] == ["systemctl", "--user", "show"]:
+                return _FakeCompletedProcess(0, stdout="4321\n")
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+        # status.json never catches up to the new pid within the timeout.
+        monkeypatch.setattr(
+            statusfile_mod, "read_status", lambda path=None: {"pid": 1111}
+        )
+
+        service_mod._systemd_restart()  # must not raise
+
+        out = capsys.readouterr().out
+        assert "has not published fresh status" in out
+        assert "Restarted the service" not in out
+
+    def test_restart_failure_short_circuits_before_freshness_wait(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A genuine restart failure must exit(1) without ever polling for
+
+        freshness -- there is no new process to wait for.
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        def _blow_up_if_called(path: object = None) -> None:
+            raise AssertionError(
+                "read_status should not be called when restart itself failed"
+            )
+
+        monkeypatch.setattr(statusfile_mod, "read_status", _blow_up_if_called)
+        monkeypatch.setattr(
+            service_mod.subprocess,
+            "run",
+            lambda *a, **k: _FakeCompletedProcess(
+                5, stderr="Failed to restart muxplex-deck.service: Unit not found."
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            service_mod._systemd_restart()
+        assert exc_info.value.code == 1

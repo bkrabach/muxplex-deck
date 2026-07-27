@@ -72,6 +72,20 @@ _LAUNCHD_ALREADY_LOADED_EXIT = 5
 _LAUNCHD_BOOTOUT_POLL_INTERVAL_SECONDS = 0.2
 _LAUNCHD_BOOTOUT_TIMEOUT_SECONDS = 5.0
 
+# `systemctl restart` / `launchctl bootstrap` both return once the new
+# process has been LAUNCHED, not once it has done anything -- the new
+# sidecar needs at least one poll cycle to open the device (or notice it
+# can't) and publish its first status write via `statusfile.StatusReporter`.
+# Until then, `status.json` still holds the PREVIOUS process's last
+# snapshot, which `muxplex-deck status` would otherwise present as current,
+# healthy truth (the restart-race incident in AGENTS.md: 2 false failures
+# read from a dying process's stale-but-recent write, moments before it
+# exited). `restart` polls for a status write from the NEW process (by pid,
+# via `service_main_pid()`) before reporting success, bounded so a genuinely
+# slow-starting sidecar can't hang the command forever.
+_RESTART_STATUS_POLL_INTERVAL_SECONDS = 0.2
+_RESTART_STATUS_TIMEOUT_SECONDS = 5.0
+
 # Elgato Stream Deck USB vendor id -- used to detect an existing udev rule.
 _ELGATO_VENDOR_ID = "0fd9"
 _UDEV_RULE_DIRS: tuple[Path, ...] = (
@@ -309,6 +323,70 @@ def service_is_active() -> bool:
     return result.returncode == 0
 
 
+def service_main_pid() -> int | None:
+    """Best-effort PID of the currently-running muxplex-deck service process.
+
+    Never raises -- matches `service_is_active()`'s contract: any failure
+    (service manager missing, service not running, unexpected/unparseable
+    output) reads as "cannot determine", which callers must treat as "don't
+    know", never as a false positive or negative on its own.
+
+    This is what lets `status()` (and `_wait_for_fresh_status()` below) tell
+    whether a published `status.json` (`statusfile.build_status()`'s own
+    `pid` field) was written by the process running RIGHT NOW under the
+    service, or by a PREVIOUS incarnation whose last write can look
+    deceptively fresh by age alone -- see the restart-race incident in
+    AGENTS.md: the old process's last write happened moments before it
+    exited, so an age-only staleness check saw it as "recent" and reported
+    it as current truth. Comparing pids is the only way to tell those apart.
+    """
+    if _is_darwin():
+        uid = os.getuid()
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return None
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pid = "):
+                try:
+                    return int(stripped[len("pid = ") :].strip())
+                except ValueError:
+                    return None
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "muxplex-deck",
+                "--property=MainPID",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
 def service_is_installed() -> bool:
     """Is the muxplex-deck unit/plist file present on disk?
 
@@ -502,6 +580,56 @@ def _systemd_stop() -> None:
     subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"], check=False)
 
 
+def _wait_for_fresh_status(timeout: float | None = None) -> bool:
+    """Poll until `status.json`'s recorded pid matches the service's live
+    MainPID, or `timeout` elapses.
+
+    See `_RESTART_STATUS_TIMEOUT_SECONDS`'s docstring for why this exists:
+    the process a restart just launched needs at least one poll cycle
+    before it publishes its own status, and comparing pids (not wall-clock
+    age) is the only reliable way to tell "this snapshot belongs to the
+    process running right now" from "this is the previous process's last
+    write" -- the exact restart-race incident in AGENTS.md.
+
+    Returns True once a matching status is observed; False if `timeout`
+    elapses first. Never raises -- `service_main_pid()` and
+    `statusfile.read_status()` are both best-effort/never-raise themselves.
+    """
+    from . import statusfile
+
+    if timeout is None:
+        timeout = _RESTART_STATUS_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        current_pid = service_main_pid()
+        if current_pid is not None:
+            data = statusfile.read_status()
+            if data is not None and data.get("pid") == current_pid:
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_RESTART_STATUS_POLL_INTERVAL_SECONDS)
+
+
+def _report_restart_result(success_message: str) -> None:
+    """Print the final restart line: success only once fresh status is
+    actually observed, otherwise an honest "still waiting" warning.
+
+    Shared by systemd and launchd so both platforms make the same promise:
+    never print a success line for a step (the new process being up and
+    reporting) that was not actually verified -- see AGENTS.md's restart-
+    race incident, which this directly closes.
+    """
+    if _wait_for_fresh_status():
+        _step_ok(success_message)
+    else:
+        _step_warn(
+            "Restart command sent, but the service has not published fresh "
+            f"status within {_RESTART_STATUS_TIMEOUT_SECONDS:.0f}s -- it may "
+            "still be starting. Check: muxplex-deck status"
+        )
+
+
 def _systemd_restart() -> None:
     # `systemctl restart` is a single atomic transaction (unlike launchd's
     # separate bootout + bootstrap), so it needs no unload-race handling --
@@ -513,11 +641,11 @@ def _systemd_restart() -> None:
         text=True,
         check=False,
     )
-    if result.returncode == 0:
-        _step_ok("Restarted the service")
-    else:
+    if result.returncode != 0:
         _report_systemctl_failure("restart", result)
         sys.exit(1)
+
+    _report_restart_result("Restarted the service")
 
 
 def _systemd_status() -> None:
@@ -704,12 +832,14 @@ def _launchd_restart() -> None:
 
     result = _launchd_bootstrap()
     if result.returncode == 0:
-        _step_ok("Restarted the service (launchctl bootstrap)")
+        success_message = "Restarted the service (launchctl bootstrap)"
     elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
-        _step_ok("Service is running")
+        success_message = "Service is running"
     else:
         _report_launchctl_failure("bootstrap", result)
         sys.exit(1)
+
+    _report_restart_result(success_message)
 
 
 def _launchd_status() -> None:
