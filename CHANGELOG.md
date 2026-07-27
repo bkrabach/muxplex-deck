@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.3 (2026-07-27)
+
+### Bug Fixes
+
+- **`status` no longer reports a healthy device and server as broken immediately after a restart.** `service restart` returned as soon as the service manager accepted the command, before the newly started process had published any status of its own — so a `status` run in the next second read the *previous* process's final snapshot and reported a connected Stream Deck as disconnected and a reachable server as unreachable. Restart now waits for the running process to publish status under its own process id before reporting success, and says plainly when that has not happened within five seconds rather than claiming a success it cannot confirm. Independently, `status` now compares the process id recorded in the status file against the one actually running, and reports the device and server as *undetermined* rather than failed whenever the two disagree — so the same false alarm cannot appear after a crash-loop or a restart the tool did not itself perform. The check uses process identity rather than timestamp age deliberately: a dying process's last write can look recent while describing a system that no longer exists.
+
+- **`init` no longer accepts a federation key without checking it.** The wizard wrote whatever key it was given, printed a reachability confirmation, and offered to install the service — and the reachability check ran against an endpoint that requires no credentials, so a wrong key produced a completely successful-looking setup that failed later as a service unable to authenticate. The key is now used to make one authenticated request before it is saved. A rejected key is reported at the prompt, is not written, and can be re-entered immediately. When the server cannot be reached to verify, that is stated as unverified rather than reported as success.
+
+### Verification
+
+- 404 tests passed via pytest (baseline 390 + 14 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.5.2 (2026-07-27)
 
 ### Bug Fixes
