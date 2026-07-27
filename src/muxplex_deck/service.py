@@ -44,6 +44,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import config as config_mod
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -307,6 +309,22 @@ def service_is_active() -> bool:
     return result.returncode == 0
 
 
+def service_is_installed() -> bool:
+    """Is the muxplex-deck unit/plist file present on disk?
+
+    Independent of `service_is_active()` -- a service that is installed but
+    crash-looping (or simply stopped) is still installed. `doctor`'s
+    `check_service_status` used to conflate "not active" with "not
+    installed" and recommend `service install` for a service that was
+    already installed and failing; this is the file-existence half of the
+    fix (see AGENTS.md for the incident: 1113 restarts, then told to
+    "install" a service that was already there).
+    """
+    if _is_darwin():
+        return _LAUNCHD_PLIST_PATH.exists()
+    return _SYSTEMD_UNIT_PATH.exists()
+
+
 def _enable_linger() -> None:
     """Best-effort `loginctl enable-linger` so the service survives logout.
 
@@ -346,6 +364,37 @@ def _print_next_steps() -> None:
     print()
 
 
+def _config_ready() -> tuple[bool, str | None]:
+    """Return (True, None) if config is loadable, else (False, ConfigError message).
+
+    Calls the exact same `config.load_config()` the installed unit's own
+    `ExecStart` (`... run`, no `--config` flag) will call at startup, so
+    "ready to install" and "ready to run" can never diverge. A config that
+    fails this check would make the service crash immediately once
+    started, and `Restart=always` (`KeepAlive` on launchd) would then
+    restart it every few seconds forever -- see the `service install`
+    crash-loop incident in AGENTS.md (1113 restarts on a fresh machine
+    with no config yet).
+    """
+    try:
+        config_mod.load_config(None)
+    except config_mod.ConfigError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _print_config_not_ready(config_error: str | None) -> None:
+    """Explain why install is stopping short of enabling/starting the service."""
+    _print_guidance_block(
+        "Not enabling or starting yet -- configuration is incomplete:\n"
+        + (config_error or "unknown configuration error")
+    )
+    print()
+    print("  Run muxplex-deck init to create it, then run this command again:")
+    print("    muxplex-deck service install")
+    print()
+
+
 def _systemd_install() -> None:
     print("\nmuxplex-deck service install (systemd --user)\n")
 
@@ -361,6 +410,15 @@ def _systemd_install() -> None:
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     _step_ok("Reloaded the systemd user daemon")
+
+    # Never enable/start a unit whose config we already know will make it
+    # crash on launch -- see `_config_ready()`. The unit file above is
+    # harmless to have on disk either way; only the "make it run" steps are
+    # gated.
+    config_ready, config_error = _config_ready()
+    if not config_ready:
+        _print_config_not_ready(config_error)
+        return
 
     subprocess.run(
         ["systemctl", "--user", "enable", "--now", "muxplex-deck"], check=True
@@ -566,6 +624,15 @@ def _launchd_install() -> None:
     _LAUNCHD_PLIST_DIR.mkdir(parents=True, exist_ok=True)
     _LAUNCHD_PLIST_PATH.write_text(plist_content)
     _step_ok(f"Wrote plist: {_LAUNCHD_PLIST_PATH}")
+
+    # Never bootstrap (load + start) a job whose config we already know will
+    # make it crash on launch -- see `_config_ready()`. `KeepAlive` would
+    # then have launchd relaunch it forever. The plist above is harmless to
+    # have on disk either way; only the "make it run" step is gated.
+    config_ready, config_error = _config_ready()
+    if not config_ready:
+        _print_config_not_ready(config_error)
+        return
 
     result = _launchd_bootstrap()
     if result.returncode == 0:

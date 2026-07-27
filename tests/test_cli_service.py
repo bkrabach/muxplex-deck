@@ -125,6 +125,7 @@ class TestSystemdInstall:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
         monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
 
@@ -169,6 +170,7 @@ class TestSystemdInstall:
             "_warn_if_no_udev_rule",
             lambda: calls.__setitem__("udev", True),
         )
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
 
@@ -197,6 +199,7 @@ class TestLaunchdInstall:
             lambda: ["/opt/homebrew/bin/muxplex-deck"],
         )
         monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._launchd_install()
 
@@ -468,6 +471,225 @@ class _FakeCompletedProcess:
 
 
 # ---------------------------------------------------------------------------
+# service_is_installed -- file-existence check, independent of active status.
+# Fixes `doctor` conflating "not active" with "not installed" for an
+# already-installed, crash-looping service (AGENTS.md incident).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceIsInstalled:
+    def test_systemd_installed_true_when_unit_file_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        unit_path = tmp_path / "muxplex-deck.service"
+        unit_path.write_text("[Unit]\n")
+        monkeypatch.setattr(service_mod, "_SYSTEMD_UNIT_PATH", unit_path)
+        assert service_mod.service_is_installed() is True
+
+    def test_systemd_installed_false_when_unit_file_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(
+            service_mod, "_SYSTEMD_UNIT_PATH", tmp_path / "muxplex-deck.service"
+        )
+        assert service_mod.service_is_installed() is False
+
+    def test_launchd_installed_true_when_plist_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        plist_path = tmp_path / "com.muxplex-deck.plist"
+        plist_path.write_text("<plist></plist>\n")
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_PATH", plist_path)
+        assert service_mod.service_is_installed() is True
+
+    def test_launchd_installed_false_when_plist_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_PLIST_PATH", tmp_path / "com.muxplex-deck.plist"
+        )
+        assert service_mod.service_is_installed() is False
+
+
+# ---------------------------------------------------------------------------
+# _config_ready -- gates install/start on the SAME load_config() the running
+# sidecar itself calls, so "ready to install" and "ready to run" can't diverge.
+# ---------------------------------------------------------------------------
+
+
+class TestConfigReady:
+    def test_ready_when_config_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / "config.json"
+        key_path = tmp_path / "federation_key"
+        key_path.write_text("sekrit\n", encoding="utf-8")
+        config_path.write_text(
+            f'{{"server_url": "https://example.test:8088", "key_file": "{key_path}"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MUXPLEX_DECK_CONFIG", str(config_path))
+        ready, error = service_mod._config_ready()
+        assert ready is True
+        assert error is None
+
+    def test_not_ready_when_config_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MUXPLEX_DECK_CONFIG", str(tmp_path / "no-such-config.json"))
+        ready, error = service_mod._config_ready()
+        assert ready is False
+        assert error is not None
+        assert "Config file not found" in error
+
+
+# ---------------------------------------------------------------------------
+# Crash-loop regression: `service install` must never enable/bootstrap a
+# unit whose config is known-broken -- see AGENTS.md, "1113 restarts on a
+# fresh machine with no config yet". Both systemd (`enable --now`) and
+# launchd (`launchctl bootstrap`) must be skipped entirely when config isn't
+# ready; the unit/plist file may still be written (harmless).
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdInstallConfigGate:
+    def _setup_paths(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            service_mod, "_SYSTEMD_UNIT_DIR", tmp_path / "systemd" / "user"
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_SYSTEMD_UNIT_PATH",
+            tmp_path / "systemd" / "user" / "muxplex-deck.service",
+        )
+        monkeypatch.setattr(
+            service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
+        )
+        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
+        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+
+    def test_missing_config_does_not_enable_or_start(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        self._setup_paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            service_mod, "_config_ready", lambda: (False, "Config file not found: X")
+        )
+
+        service_mod._systemd_install()
+
+        # The unit file is still written (harmless), and daemon-reload still
+        # runs, but `enable`/`enable --now` must NEVER be invoked -- that is
+        # the exact crash-loop trigger.
+        unit_path = tmp_path / "systemd" / "user" / "muxplex-deck.service"
+        assert unit_path.exists()
+        assert ["systemctl", "--user", "daemon-reload"] in recording_run.calls
+        assert not any(
+            call[:3] == ["systemctl", "--user", "enable"]
+            for call in recording_run.calls
+        )
+
+        out = capsys.readouterr().out
+        assert "Not enabling or starting yet" in out
+        assert "Config file not found: X" in out
+        assert "muxplex-deck init" in out
+        assert "service install" in out
+
+    def test_ready_config_still_enables_and_starts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: the healthy path is unchanged by the gate."""
+        self._setup_paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        service_mod._systemd_install()
+
+        assert [
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            "muxplex-deck",
+        ] in recording_run.calls
+        out = capsys.readouterr().out
+        assert "Enabled + started the service" in out
+        assert "Not enabling or starting yet" not in out
+
+
+class TestLaunchdInstallConfigGate:
+    def _setup_paths(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(service_mod, "_LAUNCHD_PLIST_DIR", tmp_path)
+        monkeypatch.setattr(
+            service_mod, "_LAUNCHD_PLIST_PATH", tmp_path / "com.muxplex-deck.plist"
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_resolve_bin_for_launchd",
+            lambda: ["/opt/homebrew/bin/muxplex-deck"],
+        )
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+
+    def test_missing_config_does_not_bootstrap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        self._setup_paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            service_mod, "_config_ready", lambda: (False, "Config file not found: X")
+        )
+
+        service_mod._launchd_install()
+
+        plist_path = tmp_path / "com.muxplex-deck.plist"
+        assert plist_path.exists()
+        assert not any(
+            call[:2] == ["launchctl", "bootstrap"] for call in recording_run.calls
+        )
+
+        out = capsys.readouterr().out
+        assert "Not enabling or starting yet" in out
+        assert "muxplex-deck init" in out
+
+    def test_ready_config_still_bootstraps(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_run: _RecordingRun,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Regression guard: the healthy path is unchanged by the gate."""
+        self._setup_paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        service_mod._launchd_install()
+
+        bootstrap_calls = [
+            c for c in recording_run.calls if c[:2] == ["launchctl", "bootstrap"]
+        ]
+        assert len(bootstrap_calls) == 1
+        out = capsys.readouterr().out
+        assert "Loaded + started the service" in out
+        assert "Not enabling or starting yet" not in out
+
+
+# ---------------------------------------------------------------------------
 # Narration -- service install/uninstall must print step-by-step progress,
 # not succeed silently (a real user reported `service install` gave no
 # feedback at all).
@@ -496,6 +718,7 @@ class TestSystemdInstallNarration:
         monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
         monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
 
@@ -529,6 +752,7 @@ class TestSystemdInstallNarration:
         monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
         monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
         monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
 
@@ -600,6 +824,7 @@ class TestLaunchdInstallNarration:
         )
         monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._launchd_install()
 
@@ -721,6 +946,7 @@ class TestLaunchdInstallBootstrapIdempotency:
             service_mod, "_resolve_bin_for_launchd", lambda: ["/x/muxplex-deck"]
         )
         monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         def _fake_run(argv: list[str], **kwargs: Any) -> Any:
             if argv[:2] == ["launchctl", "bootstrap"]:
@@ -751,6 +977,7 @@ class TestLaunchdInstallBootstrapIdempotency:
             service_mod, "_resolve_bin_for_launchd", lambda: ["/x/muxplex-deck"]
         )
         monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         def _fake_run(argv: list[str], **kwargs: Any) -> Any:
             if argv[:2] == ["launchctl", "bootstrap"]:
