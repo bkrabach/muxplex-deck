@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.10.0 (2026-07-28)
+
+### Features
+
+- **Controls can now be assigned to whatever you want them to do.** Every key, and every dial rotation and press, can be bound to any of nineteen actions — switching sessions, stepping or picking views, paging, adjusting brightness, jumping back to the previous session, bringing the muxplex window forward, refreshing immediately, or nothing at all. Bindings are written against what a device *has* — its keys and dials — rather than which model it is, so the same configuration is meaningful on any deck and the parts that don't apply are reported rather than ignored. Manage them with `muxplex-deck controls` (`show`, `actions`, `set`, `unset`, `reset`).
+
+- **Nothing changes unless you ask for it.** Defaults are computed rather than stored, and are pinned by tests against the previous release's exact behavior on every supported layout. A user who never configures a binding sees an identical deck.
+
+- **Several controls that previously did nothing are now usable.** On a deck with four dials only two were ever assigned; the rest are now bindable. On a deck with keys but no dials there was previously no way to step between views at all — only to open the picker — and that is now a binding away.
+
+- **Configuration mistakes are caught, and the ones that can't be are reported rather than dropped.** A binding that is malformed or names an unknown action is refused at startup. A binding that is valid but cannot apply to the currently attached device — a dial binding on a deck with no dials — is reported in the startup log, in the status file, in `doctor`, and in `controls`, rather than being silently discarded. The deck is not required to be plugged in for the sidecar to start, so this case cannot be a hard failure.
+
+### Bug Fixes
+
+- **Jumping back to the previous session now works when the switch came from elsewhere.** The record of which session was previously active was only updated when the change originated at the deck, so a switch made from the web interface or another client left it stale.
+
+### Verification
+
+- 824 tests passed via pytest (baseline 681 + 143 new across control mapping, capability dispatch, and binding round-trip tests).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.5 (2026-07-28)
 
 ### Bug Fixes
