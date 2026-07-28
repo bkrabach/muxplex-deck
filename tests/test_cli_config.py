@@ -121,6 +121,122 @@ class TestConfigSet:
         assert load_raw_config(config_path)["sort"] == "server"
 
 
+class TestConfigSetRoundTrip:
+    """Regression net for incident 5 ("`config set` silently stores the
+
+    wrong type"): `cli.config_set()` used to type-detect from the
+    default's type via an `isinstance` chain that fell through to
+    ``value = raw_value`` for ANY unmatched type -- harmless today only
+    because every shipped key happens to default to str or float. The
+    invariant that must hold for every key, present and future: what
+    `config_set` WRITES must be exactly what `config_get`/`load_raw_config`
+    READ BACK -- never a same-looking-but-wrong-typed approximation.
+    """
+
+    @pytest.mark.parametrize(
+        ("key", "raw", "expected"),
+        [
+            (
+                "server_url",
+                "https://roundtrip.test:8088",
+                "https://roundtrip.test:8088",
+            ),
+            (
+                "key_file",
+                "~/.config/muxplex-deck/other_key",
+                "~/.config/muxplex-deck/other_key",
+            ),
+            (
+                "ca_file",
+                "~/.config/muxplex-deck/ca.crt",
+                "~/.config/muxplex-deck/ca.crt",
+            ),
+            ("poll_interval", "4.5", 4.5),
+            ("sort", "server", "server"),
+            ("focus_app", "muxplex", "muxplex"),
+        ],
+    )
+    def test_every_shipped_key_round_trips_exactly(
+        self, config_path: str, key: str, raw: str, expected: object
+    ) -> None:
+        """For every key `DEFAULT_CONFIG` ships today: set it, then read it
+
+        back two ways (`load_raw_config` and `cli.config_get`'s own
+        stdout), and both must match the expected VALUE and TYPE exactly --
+        not a stringified look-alike.
+        """
+        cli.config_set(key, raw, config_path)
+        result = load_raw_config(config_path)
+        assert result[key] == expected
+        assert type(result[key]) is type(expected)
+
+    def test_every_default_config_key_is_covered_by_the_round_trip_above(self) -> None:
+        """Guards the guard: if a new key is ever added to `DEFAULT_CONFIG`
+
+        without a matching case in the parametrize list above, this fails
+        loudly instead of the new key silently going untested.
+        """
+        covered = {
+            "server_url",
+            "key_file",
+            "ca_file",
+            "poll_interval",
+            "sort",
+            "focus_app",
+        }
+        assert set(DEFAULT_CONFIG.keys()) == covered
+
+    def test_structured_default_type_is_rejected_loudly_not_stored_as_a_string(
+        self,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The actual incident 5 regression: simulate the future `controls`-
+
+        shaped key (a dict default) by injecting a fake dict-typed entry
+        into `DEFAULT_CONFIG` (the same dict object `cli.py` imported its
+        `DEFAULT_CONFIG` reference from, so the mutation is visible on
+        both names). Before the fix, `config_set` would store the raw CLI
+        string in place of the dict and print success; now it must exit 1,
+        print an explanation to stderr, and never touch the file at all.
+        """
+        monkeypatch.setitem(DEFAULT_CONFIG, "fake_structured_key", {"a": 1})
+
+        with pytest.raises(SystemExit) as excinfo:
+            cli.config_set("fake_structured_key", '{"a": 2}', config_path)
+        assert excinfo.value.code == 1
+
+        captured = capsys.readouterr()
+        assert "fake_structured_key" in captured.err
+        assert "dict" in captured.err
+
+        # The config file must not exist (nothing was ever written) or, if
+        # it does, must not contain the rejected key at all -- the write
+        # path (`patch_raw_config`) must never have been reached.
+        if Path(config_path).exists():
+            on_disk = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            assert "fake_structured_key" not in on_disk
+
+    def test_structured_default_type_rejection_is_generic_not_just_dict(
+        self,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Same guard, a different structured type (list), to prove the
+
+        rejection is a genuine `else` branch (any unhandled type) rather
+        than a special case written only for dict.
+        """
+        monkeypatch.setitem(DEFAULT_CONFIG, "fake_list_key", [1, 2, 3])
+
+        with pytest.raises(SystemExit) as excinfo:
+            cli.config_set("fake_list_key", "1,2,3", config_path)
+        assert excinfo.value.code == 1
+        assert "list" in capsys.readouterr().err
+
+
 class TestConfigReset:
     def test_reset_one_key(self, config_path: str) -> None:
         patch_raw_config({"sort": "server"}, config_path)

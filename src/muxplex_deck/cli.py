@@ -207,7 +207,26 @@ def config_get(key: str, config_path: str | None = None) -> None:
 
 
 def config_set(key: str, raw_value: str, config_path: str | None = None) -> None:
-    """Set a config value. Type is auto-detected from the default's type."""
+    """Set a config value. Type is auto-detected from the default's type.
+
+    Only scalar types (bool/int/float/str) are supported -- these are the
+    only types with an unambiguous, lossless text encoding on a CLI. Type
+    detection used to fall through an ``else: value = raw_value`` for any
+    default type it didn't recognize, which was harmless only because
+    every key that has ever shipped happens to default to str or float.
+    A key whose default is a structured type (dict/list/etc -- e.g. a
+    future mapping-shaped config value) would silently store the raw CLI
+    string where a structured value belongs, print success, and corrupt
+    the file: the loader would then either misread it or fail confusingly
+    much later, far from this command.
+
+    The invariant this enforces: what `config_set` writes must be exactly
+    what `config_get`/the config loader read back -- never an
+    approximation. A bare string can never satisfy that for a dict or
+    list, so those types are rejected loudly here instead of silently
+    accepted. Structured keys need a dedicated interface (their own
+    subcommand, or direct file editing), not CLI-string coercion.
+    """
     if key not in DEFAULT_CONFIG:
         print(f"Unknown setting: {key}", file=sys.stderr)
         print(
@@ -224,8 +243,18 @@ def config_set(key: str, raw_value: str, config_path: str | None = None) -> None
             value = int(raw_value)
         elif isinstance(default, float):
             value = float(raw_value)
-        else:
+        elif isinstance(default, str):
             value = raw_value
+        else:
+            print(
+                f"Cannot set '{key}' via 'config set': its value is a "
+                f"{type(default).__name__}, which has no unambiguous text "
+                "representation on the command line. Edit the config file "
+                "directly, or use a dedicated command if one exists for "
+                "this key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     except ValueError as exc:
         print(f"Invalid value for {key}: {exc}", file=sys.stderr)
         sys.exit(1)
