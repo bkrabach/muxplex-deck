@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.1 (2026-07-28)
+
+### Bug Fixes
+
+- **The `--log-file` option was accepted and then ignored.** Every run flag was parsed correctly and then dropped: the code that finally starts the sidecar never read the parsed value back out, so a log file was never opened. Running in a terminal hid this completely, because logging falls back to the console — but the background service on Windows runs without a console, so its log went nowhere and the service appeared to produce no diagnostics at all. A second, independent defect in the same area meant any run flag written *before* the `run` command was reset to nothing, a known behaviour of the argument parser when a subcommand re-declares the same options; flags now work written on either side of `run`.
+
+- **The Stream Deck no longer keeps displaying the last screen after the sidecar stops.** Stopping the service left the final frame painted on the device indefinitely, showing sessions that were no longer being tracked. The device is now reset on the way out — on stop, on interrupt, and on unexpected errors. A forced kill still cannot be intercepted, and in that case the last frame will remain.
+
+### Verification
+
+- 627 tests passed via pytest (baseline 611 + 16 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.0 (2026-07-28)
 
 ### Features
