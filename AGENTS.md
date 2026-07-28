@@ -298,3 +298,69 @@ product. See `README.md` for setup, config, and verification checklists.
   `stdin=subprocess.DEVNULL` explicitly, so any FUTURE interactive prompt
   from either tool fails fast and loud instead of hanging silently on
   whatever stdin happens to be inherited.
+- **`service restart` left the task registered but NOT running (state 3) --
+  VERIFIED on real hardware (2026-07-28), root cause confirmed against
+  documented `MultipleInstancesPolicy` semantics.** `muxplex-deck service
+  restart` printed "has not published fresh status" and `status`
+  afterward reported state 3 (`TASK_STATE_READY`) -- the user had to run
+  `service start` manually every time. Root cause: `_win_restart()` called
+  `schtasks /Run` immediately after `schtasks /End`, on the (wrong)
+  assumption -- stated in the code's own comment -- that "Task Scheduler's
+  /End has no separate unload race to wait out". `schtasks /End` requests
+  termination but does not synchronously wait for Task Scheduler's own
+  internal "is this task running" bookkeeping to catch up with the killed
+  process, so `/Run` landed while the OLD instance was still considered
+  running -- `MultipleInstancesPolicy=IgnoreNew` (chosen deliberately, see
+  section 1.2) then silently discarded the new run request. Net effect:
+  old process dies, new one never starts. **This was already the
+  documented plan** -- WINDOWS_NATIVE_SPEC.md section 1.6's `restart` row
+  says "stop -> poll `state != RUNNING` (bounded, reusing
+  `_wait_for_launchd_unload`'s shape) -> start" -- but the original
+  implementation never actually added that poll. **Fix:**
+  `_win_wait_for_task_stopped()` (service.py), polling `_win_task_query()`
+  directly (never the cross-platform `service_is_active()` dispatcher --
+  this function is already Windows-specific), gates `_win_restart()`'s
+  `/Run` the same way `_wait_for_launchd_unload()` gates launchd's
+  `bootstrap` after `bootout`. On timeout it reports honestly ("Task did
+  not report stopped within Ns -- attempting restart anyway") and still
+  attempts the restart, never silently giving up -- same contract as the
+  launchd path. No documented Microsoft source states `/End` is
+  asynchronous outright; this conclusion is inferred from (a) the
+  real-hardware symptom being exactly what an async-teardown race would
+  produce, (b) `IgnoreNew`'s documented behavior
+  (learn.microsoft.com/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicy-settingstype-element)
+  confirming it silently drops a new run while an instance is considered
+  running, and (c) the fix (poll until genuinely stopped, then run) fully
+  resolving the reported symptom on the reporting user's own hardware.
+- **Windows foreground focus: `AttachThreadInput` alone is NOT enough for a
+  windowless background process -- VERIFIED on real hardware (2026-07-28),
+  fixed with a second, independently-documented technique, no system-wide
+  setting change.** The sidecar's log showed `SetForegroundWindow`
+  "succeeding" while only flashing the taskbar icon, even with
+  `AttachThreadInput` in place. Research (not hardware-verified, but
+  Microsoft-documentation-grounded): `SetForegroundWindow`'s own docs list
+  the exemptions that allow a foreground switch, and a StackOverflow report
+  independently confirms `AttachThreadInput` specifically "doesn't work if
+  your app is a background process without any windows and input focus" --
+  exactly this sidecar's situation (no window, no message pump, never
+  received input itself). **The fix, layered on top (kept, harmless):**
+  `focus.py`'s `_raise_to_foreground()` now calls `tap_alt_key()` FIRST,
+  unconditionally, on every focus attempt -- a `SendInput`-synthesized lone
+  ALT keydown/keyup. This is not a brute-force hack: Microsoft's own
+  `LockSetForegroundWindow` Remarks state plainly, "The system
+  automatically enables calls to SetForegroundWindow if the user presses
+  the ALT key or takes some action that causes the system itself to change
+  the foreground window"
+  (learn.microsoft.com/windows/win32/api/winuser/nf-winuser-locksetforegroundwindow).
+  `SendInput` is the documented way to synthesize that keypress without a
+  real keyboard. **Explicitly rejected:**
+  `SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0)`, the other
+  commonly-cited workaround -- it persists a REGISTRY value
+  (`HKCU\Control Panel\Desktop\ForegroundLockTimeout`) affecting every
+  application on the machine, not just this sidecar, and was never going to
+  be made opt-in silently; the SendInput approach needed no such
+  compromise. **UNVERIFIED on real Windows hardware** whether the ALT-tap
+  actually closes the gap the 2026-07-28 report found (the analysis above
+  is Microsoft-doc-grounded, not yet hardware-confirmed) -- next real-deck
+  session should confirm `focus_app` now raises the PWA window instead of
+  only flashing its taskbar icon.
