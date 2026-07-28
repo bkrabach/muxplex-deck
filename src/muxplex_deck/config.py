@@ -19,6 +19,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import controls as controls_mod
+
 try:
     import pwd
 except ImportError:  # non-POSIX (Windows) -- no sudo there, plain expanduser is fine
@@ -42,6 +44,11 @@ DEFAULT_CONFIG: dict = {
     "poll_interval": DEFAULT_POLL_INTERVAL_SECONDS,
     "sort": DEFAULT_SORT_MODE,
     "focus_app": "",
+    # address -> action; empty means "all capability-derived defaults" (see
+    # `layout.default_bindings`). Defaults are computed, never stored here --
+    # a fresh install has no "controls" key at all and sees zero behavior
+    # change. See docs/CONTROL_MAPPING_DESIGN.md.
+    "controls": {},
 }
 
 
@@ -94,6 +101,15 @@ class Config:
     pre-existing behavior -- honor muxplex's own `sort_order` (alphabetical
     vs server/manual order) with no client-side reordering. See `.attention`
     for the "attention" mode's tie-break rules.
+    """
+    controls: dict[str, str]
+    """Resolved (address -> action) overrides, Gate-1 validated (grammar +
+
+    catalog + kind), but NOT yet checked against any deck's capabilities --
+    that is Gate 2 (`layout.plan_layout`), which runs later because at
+    config-load time there may be no deck plugged in at all. Empty dict
+    means "use the capability-derived defaults for whatever deck connects".
+    See docs/CONTROL_MAPPING_DESIGN.md.
     """
     focus_app: str
     """Identifier for the locally installed muxplex PWA, used to bring it to
@@ -148,6 +164,51 @@ def _load_federation_key(key_file: Path) -> str:
     if not key:
         raise ConfigError(f"Federation key file {key_file} is empty")
     return key
+
+
+def _validate_controls(raw_controls: object) -> dict[str, str]:
+    """Gate 1 (§6): capability-blind validation of the `controls` config field.
+
+    Fails closed -- raises `ConfigError` for anything decidable from the
+    file alone: not an object, a non-string value, a malformed address, an
+    unknown action, or a kind mismatch (e.g. a momentary action bound to a
+    dial turn). What this does NOT check -- whether an address's index is
+    within a real deck's actual key/dial count -- is Gate 2
+    (`layout.plan_layout`), which runs later because there may be no deck
+    plugged in at config-load time at all.
+    """
+    if not isinstance(raw_controls, dict):
+        raise ConfigError(
+            "Config field 'controls' must be a JSON object, got "
+            f"{type(raw_controls).__name__}"
+        )
+    validated: dict[str, str] = {}
+    for address_text, action in raw_controls.items():
+        if not isinstance(action, str):
+            raise ConfigError(
+                f"Config field 'controls' value for {address_text!r} must be "
+                f"a string, got {action!r}"
+            )
+        try:
+            address = controls_mod.parse_address(address_text)
+        except controls_mod.AddressError as exc:
+            raise ConfigError(f"Config field 'controls' {exc}") from exc
+        if action not in controls_mod.ACTIONS:
+            raise ConfigError(
+                f"Config field 'controls' has unknown action {action!r} for "
+                f"{address_text!r}. Valid actions: "
+                f"{', '.join(sorted(controls_mod.ACTIONS))}"
+            )
+        valid_for_address = controls_mod.valid_actions_for_address(address)
+        if action not in valid_for_address:
+            target = "a dial turn" if address.is_relative_only else "a key/dial push"
+            raise ConfigError(
+                f"Config field 'controls': action {action!r} cannot be bound "
+                f"to {address_text!r} -- {target} accepts only: "
+                f"{', '.join(valid_for_address)}"
+            )
+        validated[address.text] = action
+    return validated
 
 
 def load_config(config_path: str | None = None) -> Config:
@@ -215,12 +276,15 @@ def load_config(config_path: str | None = None) -> Config:
             f"got {focus_app!r}"
         )
 
+    controls_value = _validate_controls(raw.get("controls", {}))
+
     return Config(
         server_url=server_url.rstrip("/"),
         federation_key=federation_key,
         ca_file=ca_file,
         poll_interval=float(poll_interval),
         sort=sort,
+        controls=controls_value,
         focus_app=focus_app.strip(),
     )
 
