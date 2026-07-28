@@ -18,10 +18,13 @@ from muxplex_deck import cli
 def recorded_run(monkeypatch: pytest.MonkeyPatch) -> dict:
     calls: dict = {}
 
-    def fake_run(config_path=None, *, emulator=False, emulator_port=8484):
+    def fake_run(
+        config_path=None, *, emulator=False, emulator_port=8484, log_file=None
+    ):
         calls["config_path"] = config_path
         calls["emulator"] = emulator
         calls["emulator_port"] = emulator_port
+        calls["log_file"] = log_file
         return 0
 
     monkeypatch.setattr(cli, "run", fake_run)
@@ -40,6 +43,7 @@ class TestDefaultActionDispatch:
             "config_path": None,
             "emulator": False,
             "emulator_port": 8484,
+            "log_file": None,
         }
 
     def test_run_subcommand_identical_to_bare(
@@ -52,6 +56,7 @@ class TestDefaultActionDispatch:
             "config_path": None,
             "emulator": False,
             "emulator_port": 8484,
+            "log_file": None,
         }
 
     def test_bare_invocation_with_config_flag(

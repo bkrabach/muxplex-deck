@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import logging
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import urlparse
 
 from muxplex_client import (
@@ -94,7 +96,38 @@ FULL_BRIGHTNESS_PERCENT = 100
 _MAX_VIEW_LABEL_CHARS = 20
 
 
-def _configure_logging() -> None:
+def _configure_logging(log_file: Path | None = None) -> None:
+    """Configure logging, optionally to a rotating file instead of stderr.
+
+    `log_file` is required in practice on Windows under Task Scheduler:
+    `pythonw.exe` (the GUI-subsystem interpreter `service._resolve_pythonw()`
+    resolves to -- see WINDOWS_NATIVE_SPEC.md section 1.5) leaves
+    `sys.stdout`/`sys.stderr` as `None`, and `logging.StreamHandler()` around
+    a `None` stream would fail. `cli.py`'s `--log-file` flag (all platforms,
+    default `None`) is what plumbs a path down to here; on macOS/Linux this
+    stays `None` and behavior is byte-for-byte unchanged from before this
+    parameter existed.
+    """
+    if log_file is not None:
+        from logging.handlers import RotatingFileHandler
+
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        return
+    if sys.stderr is None:
+        # Defensive: a console-less launch with no --log-file must not
+        # crash trying to build a StreamHandler around a None stream.
+        logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+        return
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
@@ -1035,8 +1068,8 @@ def _install_signal_handler() -> threading.Event:
     return shutting_down
 
 
-def run(config: Config, manager: DeviceManager) -> int:
-    _configure_logging()
+def run(config: Config, manager: DeviceManager, *, log_file: Path | None = None) -> int:
+    _configure_logging(log_file)
 
     shutting_down = _install_signal_handler()
     hostname = urlparse(config.server_url).hostname or config.server_url

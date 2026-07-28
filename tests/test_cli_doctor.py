@@ -921,27 +921,50 @@ class TestCheckServiceStatus:
         assert "launchd" in message
         assert "running" in message
 
-    def test_windows_reports_not_yet_supported_not_missing_systemctl(
+    def test_windows_never_consults_which_and_names_task_scheduler(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """On native Windows, `systemctl` will never be found -- that's not
-        a missing tool the user needs to install, it's a not-yet-built
-        platform increment (Task Scheduler support). The message must say
-        that, not frame it as a missing Linux binary.
+        """Native Windows has Task Scheduler support now (WINDOWS_NATIVE_SPEC.md
+
+        section 1) -- `schtasks.exe` ships with every Windows install, so
+        there is nothing to gate on via `shutil.which()` the way
+        `systemctl`/`launchctl` are (see `service_manager_available()`).
+        The message must name "Task Scheduler", never "systemctl".
         """
+        import muxplex_deck.service as service_mod
+
         monkeypatch.setattr(cli.sys, "platform", "win32")
-        # Even if something named "systemctl" happened to resolve on
-        # PATH, win32 must short-circuit before ever consulting `which`.
+        # win32 must never consult `which` at all -- there's no tool
+        # presence to probe.
         monkeypatch.setattr(
             cli.shutil, "which", lambda name: (_ for _ in ()).throw(AssertionError)
         )
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: True)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        status, message = cli.check_service_status()
+
+        assert status == "ok"
+        assert "Task Scheduler" in message
+        assert "systemctl" not in message
+
+    def test_windows_not_installed_recommends_install(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.service as service_mod
+
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        monkeypatch.setattr(
+            cli.shutil, "which", lambda name: (_ for _ in ()).throw(AssertionError)
+        )
+        monkeypatch.setattr(service_mod, "service_is_installed", lambda: False)
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
 
         status, message = cli.check_service_status()
 
         assert status == "warn"
-        assert "isn't supported on windows yet" in message.lower()
-        assert "systemctl" not in message.lower()
-        assert "muxplex-deck" in message
+        assert "not installed" in message
+        assert "muxplex-deck service install" in message
 
 
 # ---------------------------------------------------------------------------

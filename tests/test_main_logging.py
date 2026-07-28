@@ -21,6 +21,69 @@ from muxplex_deck import statusfile
 from muxplex_deck.config import Config
 
 # ---------------------------------------------------------------------------
+# _configure_logging -- log_file plumbing for Windows Task Scheduler
+# (WINDOWS_NATIVE_SPEC.md section 1.5): pythonw.exe leaves sys.stdout/
+# sys.stderr as None, so a --log-file path must route logging to a
+# RotatingFileHandler instead of a StreamHandler. On macOS/Linux (no
+# log_file, real stderr) behavior stays byte-for-byte the same as before
+# this parameter existed.
+# ---------------------------------------------------------------------------
+
+
+class TestConfigureLogging:
+    def test_log_file_writes_via_rotating_file_handler(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log_path = tmp_path / "nested" / "muxplex-deck.log"
+        # A previous test in this process may have already called
+        # logging.basicConfig(); reset the root logger's handlers so this
+        # test's basicConfig() call actually takes effect.
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+        main_mod._configure_logging(log_path)
+        logging.getLogger("muxplex_deck").info("hello from the log file")
+        for h in root.handlers:
+            h.flush()
+
+        assert log_path.exists()
+        assert "hello from the log file" in log_path.read_text(encoding="utf-8")
+
+    def test_no_log_file_and_no_stderr_does_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defensive: a console-less launch (pythonw.exe) with no --log-file
+
+        must not crash trying to build a StreamHandler around a None stream.
+        """
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        monkeypatch.setattr(main_mod.sys, "stderr", None)
+
+        main_mod._configure_logging(None)  # must not raise
+        logging.getLogger("muxplex_deck").info("should not crash")
+
+    def test_no_log_file_with_real_stderr_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """macOS/Linux regression guard: default (no log_file) behavior is
+
+        byte-for-byte the same as before `log_file` existed.
+        """
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+        main_mod._configure_logging(None)
+        logging.getLogger("muxplex_deck").warning("plain stderr message")
+
+        captured = capsys.readouterr()
+        assert "plain stderr message" in captured.err
+
+
+# ---------------------------------------------------------------------------
 # _FailureEpisode -- the reusable log-once-per-episode tracker
 # ---------------------------------------------------------------------------
 

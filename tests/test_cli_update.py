@@ -205,6 +205,38 @@ class TestServiceLifecycleAroundUpdate:
 
         assert doctor_calls == [True]
 
+    def test_active_service_on_windows_is_stopped_via_schtasks_not_systemctl(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Was a LIVE BUG: `update()`'s stop block hardcoded
+
+        launchctl/systemctl (`else: subprocess.run(["systemctl", ...])`),
+        which raises `FileNotFoundError` on Windows -- `check=False` only
+        suppresses a nonzero *exit*, not a failed *exec*. Latent only
+        because `_service_is_active()` returned False on Windows before
+        Task Scheduler support existed. Now that `service_stop()` dispatches
+        per platform, an active Windows service must be stopped via
+        `schtasks /End`, never `systemctl`.
+        """
+        recorder = _RecordingRun()
+        monkeypatch.setattr(cli.subprocess, "run", recorder)
+        monkeypatch.setattr(cli, "_find_uv", lambda: "/usr/bin/uv")
+        monkeypatch.setattr(cli, "_service_is_active", lambda: True)
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+
+        restart_calls: list[bool] = []
+        monkeypatch.setattr(
+            "muxplex_deck.service.service_restart", lambda: restart_calls.append(True)
+        )
+        monkeypatch.setattr("muxplex_deck.service.service_install", lambda: None)
+
+        cli.update()  # must not raise FileNotFoundError
+
+        stop_calls = [c for c in recorder.calls if c[:2] == ["schtasks", "/End"]]
+        assert len(stop_calls) == 1
+        assert not any(c and c[0] == "systemctl" for c in recorder.calls)
+        assert restart_calls == [True]
+
 
 # ---------------------------------------------------------------------------
 # Install-source awareness -- the fix for the "doctor tells you to run

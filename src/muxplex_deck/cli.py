@@ -60,6 +60,15 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         default=8484,
         help="Port for the emulator's web UI (default: 8484). Ignored without --emulator.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Write logs to this file instead of stderr (default: stderr, unchanged "
+        "behavior). All platforms -- required in practice under Windows Task "
+        "Scheduler, since pythonw.exe has no console for stderr to go to "
+        "(see WINDOWS_NATIVE_SPEC.md section 1.5); `muxplex-deck service install` "
+        "passes this automatically on Windows.",
+    )
 
 
 def run(
@@ -67,6 +76,7 @@ def run(
     *,
     emulator: bool = False,
     emulator_port: int = 8484,
+    log_file: str | None = None,
 ) -> int:
     """Load config, build the device backend, and run the sidecar's main loop.
 
@@ -90,7 +100,8 @@ def run(
         print(str(exc), file=sys.stderr)
         return 1
 
-    return main_mod.run(cfg, manager)
+    log_path = Path(log_file).expanduser() if log_file else None
+    return main_mod.run(cfg, manager, log_file=log_path)
 
 
 # ---------------------------------------------------------------------------
@@ -758,19 +769,15 @@ def check_service_status() -> tuple[str, str]:
     if sys.platform == "darwin":
         manager, tool = "launchd", "launchctl"
     elif sys.platform == "win32":
-        # Accurate-but-misleading is still misleading: "systemctl not
-        # found" frames this as a missing Linux tool, when the real story
-        # is that background-service support (Task Scheduler) is a
-        # not-yet-built increment on this platform -- not something the
-        # user is missing or can install their way out of.
-        return "warn", (
-            "Service: background-service install isn't supported on "
-            "Windows yet -- run: muxplex-deck"
-        )
+        # Task Scheduler has no single "is the tool present" probe the way
+        # `shutil.which("systemctl")` does -- `schtasks.exe` ships with
+        # every Windows install, so there's nothing to gate on here; skip
+        # straight to the installed/active checks below.
+        manager, tool = "Task Scheduler", None
     else:
         manager, tool = "systemd", "systemctl"
 
-    if shutil.which(tool) is None:
+    if tool is not None and shutil.which(tool) is None:
         return "warn", f"Service: {tool} not found -- run muxplex-deck directly"
 
     if not service_is_installed():
@@ -1378,19 +1385,19 @@ def update(*, force: bool = False) -> None:
     was_active = _service_is_active()
     if was_active:
         print("  Stopping service...")
-        if sys.platform == "darwin":
-            uid = os.getuid()
-            subprocess.run(
-                ["launchctl", "bootout", f"gui/{uid}/com.muxplex-deck"],
-                capture_output=True,
-                check=False,
-            )
-        else:
-            subprocess.run(
-                ["systemctl", "--user", "stop", "muxplex-deck"],
-                capture_output=True,
-                check=False,
-            )
+        # Was a hardcoded launchctl/systemctl-only block -- the `else`
+        # branch ran `systemctl` unconditionally, which raises
+        # `FileNotFoundError` on Windows (`check=False` only suppresses a
+        # nonzero *exit*, not a failed *exec*). This was latent only
+        # because `service_is_active()` returned False on Windows before
+        # Task Scheduler support existed -- now that it can return True
+        # there, this must dispatch per platform. `service.service_stop()`
+        # already does exactly that (darwin/windows/systemd), so this is
+        # strictly less code, one dispatch site, not a duplicated stop
+        # implementation.
+        from .service import service_stop
+
+        service_stop()
     else:
         print("  No active service found (skipping stop)")
 

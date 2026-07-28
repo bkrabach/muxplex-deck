@@ -203,3 +203,43 @@ product. See `README.md` for setup, config, and verification checklists.
   reverting a user who had deliberately migrated to the PyPI release back
   onto git. Both entry points must agree on every known source, and
   neither may recommend an action that undoes the user's install choice.
+- **Windows background service = Task Scheduler, at-logon, current user --
+  never a Windows Service.** See WINDOWS_NATIVE_SPEC.md section 1 for the
+  full reasoning; the short version: creating/deleting a real Windows
+  Service needs admin, and it runs as LocalSystem (wrong `%USERPROFILE%`)
+  or a named account whose password would have to live in the SCM --
+  both disqualifying before HID access is ever considered. `service.py`'s
+  `_win_*` functions register a scheduled task via `schtasks /Create /XML`
+  (`InteractiveToken` logon, `LeastPrivilege`, no stored password) whose
+  action is `pythonw.exe -m muxplex_deck run --log-file <path>` with NO
+  `cmd.exe` wrapper -- a wrapper would break the PID contract
+  (`IRunningTask.EnginePID` must be the sidecar's own pid, not a
+  wrapper's). `_win_task_query()` reads state via COM
+  (`Schedule.Service`), never `schtasks /Query` text (localized, so
+  unsafe to parse for a correctness-critical predicate). Honest
+  trade-offs, surfaced in `service install`'s own output, not buried:
+  starts at logon (not boot); worst-case restart latency ~60s (Task
+  Scheduler's minimum repetition interval) vs systemd's ~5s.
+- **Service command narration (install/uninstall/start/restart) goes
+  through `report.py`'s VERDICT/STATE/ACTION renderer**, same as
+  `doctor()`/`status()` (v0.7.1) -- not the old print-as-you-go
+  `_step_ok`/`_step_warn` style. Each step becomes a `report.Check`
+  collected into a list; ONE `report.render(...)` call prints the whole
+  thing at the end. This is what let a Windows implementation (no
+  `systemctl status`-shaped external command to lean on) present itself
+  consistently with systemd/launchd. `service_stop()`/`service_logs()`
+  are unchanged in kind -- `stop` was always silent, `logs` is (and stays)
+  a raw passthrough stream; `service_status()` keeps macOS/Linux's raw
+  `launchctl print`/`systemctl status` passthrough deliberately (more
+  detail than we could reconstruct, display-only, never parsed for a
+  decision) -- only Windows' `status` renders its own report, since
+  `schtasks /Query /V` is explicitly rejected (localized, verbose).
+- **A platform-dispatch gate that goes from provably-False to True is a
+  live-bug trigger, not just a feature add.** `cli.update()`'s stop block
+  hardcoded `launchctl`/`else: systemctl` -- latent only because
+  `service_is_active()` returned `False` on Windows before Task Scheduler
+  support existed. The moment `service_manager_available()`/
+  `service_is_active()` can return `True` on a new platform, every branch
+  that was guarded by "this platform can't get here anyway" needs a fresh
+  look. Fixed by routing through `service.service_stop()` (one dispatch
+  site) instead of a second, duplicated stop implementation in `cli.py`.
