@@ -1,12 +1,18 @@
 """Runtime tests for both layout modes -- no hardware, no server, no I/O.
 
 Drives `main._ActiveRuntime` with a fake `DeckDevice` (a 15-key/3x5/72px
-Original-class deck, and an 8-key/2x4/120px Deck+-class deck) and a fake
-`MuxplexClient` with canned responses, asserting:
+Original-class deck, an 8-key/2x4/120px Deck+-class deck, and a 6-key/2x3
+Mini-class deck) and a fake `MuxplexClient` with canned responses, asserting:
 
-- reduced mode: reserved-key presses page/cycle and NEVER connect; session
-  presses connect the right session; the strip is never painted; rendered
-  key images are the deck's real 72x72 (not an assumed 120).
+- reduced mode (15-key Original): reserved-key presses page/cycle and NEVER
+  connect; session presses connect the right session; the strip is never
+  painted; rendered key images are the deck's real 72x72 (not an assumed
+  120).
+- reduced mode, compact 3-column geometry (6-key Mini): same contract as
+  above, but PREV/VIEW/NEXT sit on the bottom row (keys 3/4/5) instead of
+  the three corners, and the session page size is 3 -- proves the
+  bottom-row `layout` geometry actually drives `main._ActiveRuntime`
+  end-to-end, not just `plan_layout` in isolation.
 - full mode (Stream Deck+): every key connects its session, dials drive
   paging/view cycling, and the strip is painted -- the pre-existing
   behavior, preserved.
@@ -212,6 +218,21 @@ def reduced() -> tuple[FakeDeck, FakeClient, _ActiveRuntime]:
         is_touch=False,
     )
     client = FakeClient(_make_sessions(20), SETTINGS)
+    ctx = _make_runtime(deck, client)
+    ctx.refresh()
+    return deck, client, ctx
+
+
+@pytest.fixture
+def mini() -> tuple[FakeDeck, FakeClient, _ActiveRuntime]:
+    deck = FakeDeck(
+        key_count=6,
+        key_layout=(2, 3),
+        key_size=(80, 80),  # distinct from both other fixtures' sizes
+        dial_count=0,
+        is_touch=False,
+    )
+    client = FakeClient(_make_sessions(10), SETTINGS)
     ctx = _make_runtime(deck, client)
     ctx.refresh()
     return deck, client, ctx
@@ -471,6 +492,158 @@ class TestReducedViewPickerPaging:
         ctx.handle_key(0)  # reopen
         assert ctx.picker.window_start == 0
         assert ctx.last_key_state[1] == ("picker", "all", True)
+
+
+class TestMiniRuntime:
+    """6-key Mini-class deck (2 rows x 3 cols): bottom-row PREV/VIEW/NEXT.
+
+    Same contract as `TestReducedRuntime` (reserved keys page/cycle and
+    never connect, session presses connect the right session, no strip),
+    but the reserved keys are 3/4/5 (bottom row) instead of 0/10/14
+    (corners), and there are only 3 session slots per page instead of 12
+    -- proving the `layout._reserved_control_keys` bottom-row geometry
+    actually drives `main._ActiveRuntime`, not just `plan_layout` alone.
+    """
+
+    def test_plan_and_paging(self, mini) -> None:
+        _deck, _client, ctx = mini
+        assert ctx.plan.mode == MODE_REDUCED
+        assert ctx.plan.prev_key == 3
+        assert ctx.plan.view_key == 4
+        assert ctx.plan.next_key == 5
+        assert ctx.plan.session_slots == (0, 1, 2)
+        assert ctx.pager.page_size == 3
+        assert ctx.pager.page_count == 4  # ceil(10 sessions / 3 per page)
+
+    def test_all_keys_painted_at_real_80px_size(self, mini) -> None:
+        deck, _client, _ctx = mini
+        assert set(deck.key_images) == set(range(6))
+        for image_bytes in deck.key_images.values():
+            assert _image_size(image_bytes) == (80, 80)
+
+    def test_strip_never_painted(self, mini) -> None:
+        deck, _client, _ctx = mini
+        assert deck.strip_paint_count == 0
+
+    def test_session_key_press_connects_correct_session(self, mini) -> None:
+        _deck, client, ctx = mini
+        ctx.handle_key(0)  # slot 0 of page 1
+        assert client.connect_event.wait(_WAIT_SECONDS)
+        assert client.connected_names == ["session-00"]
+        assert ctx.active_session == "session-00"
+
+    def test_next_prev_keys_page_with_more_than_three_sessions(self, mini) -> None:
+        _deck, client, ctx = mini
+        ctx.handle_key(5)  # NEXT (bottom-right) -> page 2 (sessions 3..5)
+        assert ctx.pager.page == 2
+        ctx.handle_key(5)  # NEXT -> page 3 (sessions 6..8)
+        assert ctx.pager.page == 3
+        ctx.handle_key(5)  # NEXT -> page 4 (session 9 only, last page)
+        assert ctx.pager.page == 4
+        ctx.handle_key(5)  # NEXT again -- clamped at last page
+        assert ctx.pager.page == 4
+        ctx.handle_key(3)  # PREV (bottom-left)
+        assert ctx.pager.page == 3
+        assert client.connected_names == []  # paging alone never connects
+
+    def test_second_page_session_press_connects_paged_session(self, mini) -> None:
+        _deck, client, ctx = mini
+        ctx.handle_key(5)  # NEXT -> page 2 (sessions 3..5)
+        ctx.repaint()
+        ctx.handle_key(1)  # slot 1 of page 2 -> session-04
+        assert client.connect_event.wait(_WAIT_SECONDS)
+        assert client.connected_names == ["session-04"]
+
+    def test_view_key_opens_picker_and_never_connects(self, mini) -> None:
+        _deck, client, ctx = mini
+        ctx.handle_key(4)  # VIEW (bottom-middle) tap opens the picker
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert ctx.picker.window_start == 0
+        assert client.view_patches == []
+        assert client.connected_names == []
+
+
+MINI_VIEWS_SETTINGS = Settings(
+    # 4 named views + implicit "all" + implicit "hidden" = 6 options ->
+    # 2 picker pages of 3 (page size == this deck's 3 session slots).
+    views=tuple(View(name=f"view-{i:02d}", sessions=frozenset()) for i in range(4)),
+    hidden_sessions=frozenset(),
+    sort_order="manual",
+)
+
+
+@pytest.fixture
+def mini_many_views() -> tuple[FakeDeck, FakeClient, _ActiveRuntime]:
+    deck = FakeDeck(
+        key_count=6,
+        key_layout=(2, 3),
+        key_size=(80, 80),
+        dial_count=0,
+        is_touch=False,
+    )
+    client = FakeClient(_make_sessions(2), MINI_VIEWS_SETTINGS)
+    ctx = _make_runtime(deck, client)
+    ctx.refresh()
+    return deck, client, ctx
+
+
+class TestMiniViewPicker:
+    """Reduced-layout paged view picker on the 6-key Mini: page size 3."""
+
+    def _open_picker(self, ctx: _ActiveRuntime) -> None:
+        ctx.handle_key(4)  # VIEW
+        assert ctx.picker.mode == PickerMode.VIEW
+
+    def test_picker_uses_session_slots_only_not_all_six_keys(
+        self, mini_many_views
+    ) -> None:
+        _deck, _client, ctx = mini_many_views
+        self._open_picker(ctx)
+        # options = ["all", "view-00".."view-03", "hidden"] (6 total);
+        # window 0 shows the first 3 on the session-slot keys (0, 1, 2).
+        assert ctx.last_key_state[0] == ("picker", "all", True)
+        assert ctx.last_key_state[1] == ("picker", "view-00", False)
+        assert ctx.last_key_state[2] == ("picker", "view-01", False)
+        # reserved keys repurposed: BACK on VIEW, PREV/NEXT show the
+        # picker's own page footer -- never repainted as session tiles.
+        assert ctx.last_key_state[4] == ("control", "VIEW", "< BACK", "")
+        assert ctx.last_key_state[3] == ("control", "", "< PREV", "p1/2")
+        assert ctx.last_key_state[5] == ("control", "", "NEXT >", "p1/2")
+
+    def test_next_pages_and_second_page_maps_correct_names(
+        self, mini_many_views
+    ) -> None:
+        _deck, client, ctx = mini_many_views
+        self._open_picker(ctx)
+        ctx.handle_key(5)  # NEXT -> window_start 3
+        assert ctx.picker.window_start == 3
+        # options[3:6] == ["view-02", "view-03", "hidden"]
+        assert ctx.last_key_state[0] == ("picker", "view-02", False)
+        assert ctx.last_key_state[1] == ("picker", "view-03", False)
+        assert ctx.last_key_state[2] == ("picker", "hidden", False)
+        assert ctx.last_key_state[5] == ("control", "", "NEXT >", "p2/2")
+        ctx.handle_key(1)  # slot 1 on this window -> "view-03"
+        assert client.view_patches == ["view-03"]
+        assert ctx.picker.mode == PickerMode.NONE
+
+    def test_paging_clamps_at_both_ends(self, mini_many_views) -> None:
+        _deck, client, ctx = mini_many_views
+        self._open_picker(ctx)
+        ctx.handle_key(3)  # PREV on first page -- clamped
+        assert ctx.picker.window_start == 0
+        ctx.handle_key(5)  # NEXT -> second (last) page
+        ctx.handle_key(5)  # NEXT again -- clamped at last page
+        assert ctx.picker.window_start == 3
+        assert ctx.picker.mode == PickerMode.VIEW
+        assert client.view_patches == []
+
+    def test_back_key_cancels_without_patch(self, mini_many_views) -> None:
+        _deck, client, ctx = mini_many_views
+        self._open_picker(ctx)
+        ctx.handle_key(4)  # VIEW key is BACK while the picker is open
+        assert ctx.picker.mode == PickerMode.NONE
+        assert client.view_patches == []
+        assert client.connected_names == []
 
 
 class TestFullRuntime:
