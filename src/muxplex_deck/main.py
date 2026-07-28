@@ -76,6 +76,7 @@ from .device import (
     TouchscreenEventType,
 )
 from .interaction import Pager, PickerController, PickerMode, ViewCycler
+from .singleton import InstanceLock, InstanceLockError, default_lock_path
 from .statusfile import StatusReporter
 
 logger = logging.getLogger("muxplex_deck")
@@ -1096,9 +1097,47 @@ def _install_signal_handler() -> threading.Event:
     return shutting_down
 
 
-def run(config: Config, manager: DeviceManager, *, log_file: Path | None = None) -> int:
+def run(
+    config: Config,
+    manager: DeviceManager,
+    *,
+    log_file: Path | None = None,
+    lock_path: Path | None = None,
+) -> int:
     _configure_logging(log_file)
 
+    # Single-instance guard -- see `.singleton`'s module docstring for why
+    # this lives here rather than trusting any service manager's own
+    # multiple-instance policy. Acquired BEFORE the signal handler and
+    # BEFORE anything device/server-related, so a second instance exits
+    # immediately and cleanly rather than racing the first for the
+    # exclusive HID handle or the shared status file. Released in the
+    # `finally` below, which -- because it wraps the entire loop -- fires
+    # on every exit path: clean shutdown, an uncaught exception, or the
+    # signal handler setting `shutting_down`.
+    lock = InstanceLock(lock_path or default_lock_path())
+    try:
+        lock.acquire()
+    except InstanceLockError as exc:
+        logger.error(
+            "%s -- another muxplex-deck instance is already running against "
+            "this state directory. Exiting instead of racing it for the "
+            "Stream Deck and the status file. Run `muxplex-deck status` to "
+            "see the live instance; if you believe that's stale, stop it "
+            "(`muxplex-deck service stop`, or Task Manager / kill the pid) "
+            "before starting a new one.",
+            exc,
+        )
+        return 1
+
+    try:
+        return _run(config, manager)
+    finally:
+        lock.release()
+
+
+def _run(config: Config, manager: DeviceManager) -> int:
+    """The hotplug + server-connectivity loop, guarded by `run()`'s lock."""
     shutting_down = _install_signal_handler()
     hostname = urlparse(config.server_url).hostname or config.server_url
     logged_waiting = False

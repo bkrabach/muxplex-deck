@@ -439,3 +439,128 @@ class TestOpenFailureLoggingAndStatusFile:
         # explain_open_failure (which may shell out to usbipd.exe on WSL)
         # must be called exactly once per episode, not once per cycle.
         assert query_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# run() + the single-instance guard -- the fix for the Windows Task
+# Scheduler double-spawn incident (AGENTS.md / WINDOWS_NATIVE_SPEC.md): a
+# single `schtasks /Run` produced two live sidecars on real hardware. This
+# guard makes a second instance detect the first and exit cleanly instead
+# of racing it for the exclusive HID handle and the shared status file --
+# regardless of platform, and regardless of what triggers the duplicate
+# launch (Task Scheduler, a manual `run` while the service is already up,
+# a stale process, a double-click).
+# ---------------------------------------------------------------------------
+
+
+class _NeverFindsDevice:
+    def find_device(self) -> Any:
+        return None
+
+
+class TestRunSingleInstanceGuard:
+    def test_second_instance_exits_cleanly_without_touching_the_device(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from muxplex_deck.singleton import InstanceLock
+
+        lock_path = tmp_path / "muxplex-deck.lock"
+        holder = InstanceLock(lock_path)
+        holder.acquire()
+        try:
+            config = _make_config(tmp_path)
+            find_device_calls = {"n": 0}
+
+            class _CountingManager:
+                def find_device(self) -> Any:
+                    find_device_calls["n"] += 1
+                    return None
+
+            with caplog.at_level(logging.ERROR, logger="muxplex_deck"):
+                result = main_mod.run(config, _CountingManager(), lock_path=lock_path)
+
+            assert result == 1
+            # The whole point of the guard: a losing instance must never
+            # reach the device/server logic at all, not even once.
+            assert find_device_calls["n"] == 0
+            assert any(
+                "already running" in r.message
+                for r in caplog.records
+                if r.levelno == logging.ERROR
+            )
+        finally:
+            holder.release()
+
+    def test_lock_is_released_after_run_returns_so_a_replacement_can_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The v0.5.3 restart contract: once `run()` returns (any exit
+
+        path), a replacement instance must acquire the lock immediately --
+        no stale-lock window that would wedge a legitimate restart.
+        """
+        lock_path = tmp_path / "muxplex-deck.lock"
+        config = _make_config(tmp_path)
+
+        already_done = threading.Event()
+        already_done.set()  # loop body never runs -- exits on the first check
+        monkeypatch.setattr(main_mod, "_install_signal_handler", lambda: already_done)
+
+        result = main_mod.run(config, _NeverFindsDevice(), lock_path=lock_path)
+        assert result == 0
+
+        # A second, independent run() against the SAME lock path must
+        # succeed immediately -- this is the replacement-instance handoff.
+        still_done = threading.Event()
+        still_done.set()
+        monkeypatch.setattr(main_mod, "_install_signal_handler", lambda: still_done)
+        result2 = main_mod.run(config, _NeverFindsDevice(), lock_path=lock_path)
+        assert result2 == 0
+
+    def test_lock_is_released_when_the_loop_raises_unexpectedly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even a crash inside the loop must release the lock -- a bug in
+
+        the hotplug loop must not also permanently wedge every future
+        restart behind a lock nobody will ever release.
+        """
+        lock_path = tmp_path / "muxplex-deck.lock"
+        config = _make_config(tmp_path)
+
+        def _boom() -> Any:
+            raise RuntimeError("simulated crash installing the signal handler")
+
+        monkeypatch.setattr(main_mod, "_install_signal_handler", _boom)
+
+        with pytest.raises(RuntimeError):
+            main_mod.run(config, _NeverFindsDevice(), lock_path=lock_path)
+
+        from muxplex_deck.singleton import InstanceLock
+
+        # The lock must already be free again.
+        probe = InstanceLock(lock_path)
+        probe.acquire()  # must not raise
+        probe.release()
+
+    def test_default_lock_path_is_used_when_none_given(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: `run()` must actually wire `lock_path=None` to
+
+        `singleton.default_lock_path()`, not silently skip locking.
+        """
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        config = _make_config(tmp_path)
+
+        already_done = threading.Event()
+        already_done.set()
+        monkeypatch.setattr(main_mod, "_install_signal_handler", lambda: already_done)
+
+        result = main_mod.run(config, _NeverFindsDevice())
+        assert result == 0
+
+        expected_lock_path = tmp_path / "state" / "muxplex-deck" / "muxplex-deck.lock"
+        assert expected_lock_path.exists()
