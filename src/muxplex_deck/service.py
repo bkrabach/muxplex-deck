@@ -169,6 +169,24 @@ def _have_systemctl() -> bool:
     return shutil.which("systemctl") is not None
 
 
+def service_manager_available() -> bool:
+    """Whether ANY supported service manager exists on this machine.
+
+    True on macOS (launchd) and Linux with systemd; False on native
+    Windows today (Task Scheduler support is a separate, not-yet-built
+    increment -- see WINDOWS_NATIVE_SPEC.md section 1) and on any Linux
+    without `systemctl` (containers, minimal distros).
+
+    Callers that are about to OFFER `service install` -- not merely
+    dispatch to it -- must check this first and skip the offer entirely
+    when it's False, rather than asking a yes/no question and only then
+    hitting `_unsupported_platform_error()`. That "offer, then fail" shape
+    is the same class of bug as the v0.5.2 crash-loop incident: presenting
+    an action that provably cannot succeed on this machine (see AGENTS.md).
+    """
+    return _is_darwin() or _have_systemctl()
+
+
 def _resolve_muxplex_deck_bin() -> str:
     """Return the muxplex-deck binary path (joined string -- systemd splits it).
 

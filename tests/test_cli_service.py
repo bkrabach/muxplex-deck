@@ -872,6 +872,48 @@ class TestUnsupportedPlatform:
 
 
 # ---------------------------------------------------------------------------
+# service_manager_available -- gates whether callers (namely `init`) may
+# even OFFER `service install`, not just whether dispatching to it would
+# fail. See AGENTS.md's v0.5.2 crash-loop incident: never present an
+# action that provably cannot succeed on this machine.
+# ---------------------------------------------------------------------------
+
+
+class TestServiceManagerAvailable:
+    def test_true_on_darwin_regardless_of_systemctl(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: True)
+        monkeypatch.setattr(service_mod, "_have_systemctl", lambda: False)
+        assert service_mod.service_manager_available() is True
+
+    def test_true_on_linux_with_systemctl(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(service_mod, "_have_systemctl", lambda: True)
+        assert service_mod.service_manager_available() is True
+
+    def test_false_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Native Windows has no supported service manager yet (Task
+        Scheduler support is a separate, not-yet-built increment).
+        """
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(service_mod, "_have_systemctl", lambda: False)
+        assert service_mod.service_manager_available() is False
+
+    def test_false_on_linux_without_systemctl(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Minimal containers / distros without systemd -- same as WSL
+        without systemd, another real case that must not be offered.
+        """
+        monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(service_mod, "_have_systemctl", lambda: False)
+        assert service_mod.service_manager_available() is False
+
+
+# ---------------------------------------------------------------------------
 # launchd bootstrap idempotency -- a real user hit `service start` against an
 # already-running service and got an unhandled CalledProcessError traceback
 # instead of the benign no-op `launchctl bootstrap` exit 5 ("already loaded")
