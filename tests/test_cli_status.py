@@ -69,7 +69,7 @@ class TestStatusServiceRunning:
         rc = cli.status()
         out = capsys.readouterr().out
         assert rc == 0
-        assert "Service: running" in out
+        assert "Running." in out
         assert "Stream Deck +" in out
         assert "8 keys" in out
         assert "reachable" in out
@@ -91,7 +91,7 @@ class TestStatusServiceRunning:
         rc = cli.status()
         out = capsys.readouterr().out
         assert rc == 0
-        assert "No status file found" in out
+        assert "no status file yet" in out
         assert "service logs" in out
 
     def test_stale_timestamp_is_flagged(
@@ -253,7 +253,7 @@ class TestStatusServiceNotRunning:
         out = capsys.readouterr().out
         assert rc == 0
         assert probe_calls == ["called"]
-        assert "Service: not running" in out
+        assert "not running" in out
         assert "Stream Deck Original" in out
 
     def test_ignores_stale_status_file_when_not_running(
@@ -278,7 +278,7 @@ class TestStatusServiceNotRunning:
         rc = cli.status()
         out = capsys.readouterr().out
         assert rc == 0
-        assert "Service: not running" in out
+        assert "not running" in out
         assert "No Stream Deck found" in out
 
 

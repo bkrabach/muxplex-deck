@@ -986,7 +986,12 @@ class TestDoctorNeverRaises:
         )
         cli.doctor(str(tmp_path / "nonexistent-config.json"))
         out = capsys.readouterr().out
-        assert "muxplex-deck doctor" in out
+        # New layout: a leading blank line, a VERDICT line at column 0, then
+        # a blank separator before STATE -- no "muxplex-deck doctor" banner.
+        assert out.startswith("\n")
+        lines = out.splitlines()
+        assert lines[1] == "Not ready -- 2 things to do."
+        assert lines[2] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1031,10 @@ class TestDoctorDeckIntegrationEndToEnd:
         out = capsys.readouterr().out
         assert "Stream Deck Original" in out
         assert "15 keys" in out
-        assert "HID: device opened successfully" in out
+        # device-detection and HID-open share the same glyph here (both
+        # "ok") -- see cli._device_hid_checks -- so they merge onto one
+        # "device" line instead of a separate "HID: ..." line.
+        assert "HID opens" in out
 
     def test_no_device_present_still_reports_not_found_guidance(
         self,

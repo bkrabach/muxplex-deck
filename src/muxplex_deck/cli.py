@@ -812,15 +812,118 @@ def print_check(status: str, message: str) -> None:
         print(f"{prefix}{line}")
 
 
-def doctor(config_path: str | None = None) -> int:
+def _status_glyph(status: str) -> str:
+    """Map a check helper's ("ok"|"warn"|"fail") status to a report glyph.
+
+    "ok" -> fine. "fail" (a definitive rejection) and "warn" (almost always
+    paired with a "run: ..." remediation already in the message) both ->
+    act-now. Checks that are genuinely blocked on an upstream item (e.g.
+    server/service before config exists) are never routed through this
+    mapper -- callers construct those `Check`s directly with
+    `report.BLOCKED` instead.
+    """
+    from . import report
+
+    return report.FINE if status == "ok" else report.ACT
+
+
+def _hid_tail(hid_message: str) -> str:
+    """Short phrase summarizing a successful HID-open, for the merged device line."""
+    text = hid_message
+    text = text.removeprefix("HID: ")
+    if text.startswith("device opened successfully"):
+        return "HID opens"
+    if text.startswith("device in use by the muxplex-deck service"):
+        return "HID in use by service"
+    return text if text.startswith("HID") else f"HID: {text}"
+
+
+def _device_hid_checks(
+    deck_status: str, deck_message: str, hid_status: str, hid_message: str
+) -> list[Any]:
+    """Merge device-detection + HID-open into one line when they agree.
+
+    When both share a glyph there's nothing to hide by combining them --
+    one readable "device" line beats two boring ones. When they diverge
+    (e.g. the device is visible on Windows but WSL can't open it yet),
+    collapsing to a single worst-member line would silently drop whichever
+    fact ACTION needs to reference (like a busid) -- so they render as two
+    independent, dependency-ordered lines instead: "device" (is it
+    physically present) then "hid" (can this process open it).
+    """
+    from . import report
+
+    deck_glyph = _status_glyph(deck_status)
+    hid_glyph = _status_glyph(hid_status)
+    if deck_glyph == hid_glyph:
+        tail = _hid_tail(hid_message)
+        value = f"{deck_message}, {tail}" if tail else deck_message
+        return [report.Check("device", deck_glyph, value)]
+    return [
+        report.Check("device", deck_glyph, deck_message),
+        report.Check("hid", hid_glyph, hid_message),
+    ]
+
+
+def _doctor_decision(check: Any) -> Any:
+    """Build the ACTION decision for the first act-now check, in dependency order."""
+    from . import report
+
+    if check.subject == "config":
+        return report.Decision(
+            commands=["muxplex-deck init"],
+            prose=(
+                "Creates the config, fetches and fingerprints the server CA, "
+                "stores the federation key, and offers to install the service."
+            ),
+        )
+    command = report.extract_run_command(check.value)
+    if command:
+        return report.Decision(commands=[command])
+    return report.Decision(commands=[], prose=check.value)
+
+
+def _build_doctor_action(collapsed: list[Any]) -> list[str] | None:
+    """The ACTION band: the first act-now item's decision, plus an overflow
+
+    note when more than one independent act-now item exists (see
+    report.Action.overflow_note) -- never dump every fix at once.
+    """
+    from . import report
+
+    act_items = [c for c in collapsed if c.glyph == report.ACT]
+    if not act_items:
+        return None
+    overflow = None
+    if len(act_items) > 1:
+        overflow = f"{len(act_items) - 1} more after this -- rerun doctor."
+    action = report.Action(
+        decision=_doctor_decision(act_items[0]), overflow_note=overflow
+    )
+    return report.render_action(action)
+
+
+def doctor(config_path: str | None = None, *, show_all: bool = False) -> int:
     """Run diagnostic checks and report system status. Always returns 0 (informational)."""
-    print("\nmuxplex-deck doctor\n")
+    from . import hidhelp, report
 
-    checks: list[tuple[str, str]] = []
-    checks.append(check_python_version())
-    checks.append(check_install_and_update())
-    checks.append(check_config_file(config_path))
+    utf8 = report.utf8_capable()
 
+    py_status, py_message = check_python_version()
+    inst_status, inst_message = check_install_and_update()
+    env_members = [
+        report.Check("python", _status_glyph(py_status), py_message),
+        report.Check("install", _status_glyph(inst_status), inst_message),
+    ]
+    hidapi_check = check_hidapi_dll()  # Windows-only; None everywhere else.
+    if hidapi_check is not None:
+        hidapi_status, hidapi_message = hidapi_check
+        env_members.append(
+            report.Check("hidapi", _status_glyph(hidapi_status), hidapi_message)
+        )
+    environment_group = report.Group("environment", env_members)
+
+    cfg_status, cfg_message = check_config_file(config_path)
     try:
         cfg = config_mod.load_config(config_path)
     except ConfigError:
@@ -828,28 +931,43 @@ def doctor(config_path: str | None = None) -> int:
 
     raw = config_mod.load_raw_config(config_path)
     key_file = config_mod._expand(raw.get("key_file", config_mod.DEFAULT_KEY_FILE))
-    checks.append(check_federation_key(key_file))
+    key_status, key_message = check_federation_key(key_file)
 
     ca_file = cfg.ca_file if cfg is not None else None
     if cfg is None and raw.get("ca_file"):
         ca_file = config_mod._expand(raw["ca_file"])
-    checks.append(check_ca_file(ca_file))
+    ca_status, ca_message = check_ca_file(ca_file)
 
-    # Windows-only; None (skipped, not appended) on every other platform.
-    hidapi_check = check_hidapi_dll()
-    if hidapi_check is not None:
-        checks.append(hidapi_check)
+    config_group = report.Group(
+        "config",
+        [
+            report.Check("file", _status_glyph(cfg_status), cfg_message),
+            report.Check("key", _status_glyph(key_status), key_message),
+            report.Check("ca", _status_glyph(ca_status), ca_message),
+        ],
+    )
+    config_created = cfg_status == "ok"
+
+    items: list[Any] = [environment_group, config_group]
 
     # Environment guidance (WSL/usbipd/udev-liveness) BEFORE the device
     # checks -- it explains why the next line is about to warn. Returns []
     # on a healthy platform (macOS, or native Linux with udev running), so
     # this adds no output there -- see hidhelp.explain_environment().
-    from . import hidhelp
-
     env_guidances = hidhelp.explain_environment()
     for guidance in env_guidances:
-        checks.append((guidance.status, guidance.message))
+        items.append(
+            report.Check("device", _status_glyph(guidance.status), guidance.message)
+        )
     env_states = {g.state for g in env_guidances}
+
+    if not config_created:
+        # Server/service structurally need server_url/config -- blocked,
+        # not independently evaluated. Device/HID don't depend on config
+        # at all (a bare USB probe works with no config file), so they are
+        # still evaluated for real below.
+        items.append(report.Check("server", report.BLOCKED, "waiting on config"))
+        items.append(report.Check("service", report.BLOCKED, "waiting on config"))
 
     if "W7" in env_states:
         # The W7 guidance just appended above already says the device is
@@ -874,22 +992,27 @@ def doctor(config_path: str | None = None) -> int:
             # yet) -- the generic "check the cable" guidance would
             # flatly contradict it (see bug report: located @ BUSID 1-4,
             # immediately followed by "check your cable").
-            deck_message = (
-                "Stream Deck: not detected on this OS yet -- see the WSL "
-                "guidance above."
-            )
-        checks.append((deck_status, deck_message))
-        checks.append(check_hid_openable())
+            deck_message = "not detected on this OS yet -- see the WSL guidance above."
+        hid_status, hid_message = check_hid_openable()
+        items.extend(
+            _device_hid_checks(deck_status, deck_message, hid_status, hid_message)
+        )
 
-    server_url = cfg.server_url if cfg is not None else raw.get("server_url", "")
-    checks.append(check_server_reachable(server_url, ca_file))
+    if config_created:
+        server_url = cfg.server_url if cfg is not None else raw.get("server_url", "")
+        srv_status, srv_message = check_server_reachable(server_url, ca_file)
+        items.append(report.Check("server", _status_glyph(srv_status), srv_message))
 
-    checks.append(check_service_status())
+        svc_status, svc_message = check_service_status()
+        items.append(report.Check("service", _status_glyph(svc_status), svc_message))
 
-    for status, message in checks:
-        print_check(status, message)
+    collapsed = report.collapsed_checks(items)
+    action_count = report.count_actions([c.glyph for c in collapsed])
+    verdict = report.verdict_readiness(action_count)
+    state_lines = report.render_items(items, show_all=show_all, utf8=utf8)
+    action_lines = _build_doctor_action(collapsed)
 
-    print()
+    sys.stdout.write(report.render(verdict, state_lines, action_lines))
     return 0
 
 
@@ -908,48 +1031,62 @@ def doctor(config_path: str | None = None) -> int:
 _STATUS_STALE_THRESHOLD_SECONDS = 15.0
 
 
-def _format_device_line(device: dict[str, Any]) -> tuple[str, str]:
+def _status_device_item(device: dict[str, Any]) -> Any:
+    """Build the "device" Check from the sidecar's published status snapshot.
+
+    "-" is the correct rendering for "I could not determine this" -- during
+    a restart race the caller returns before this is ever called (see the
+    pid-freshness guard in `status()`), so this function only ever runs
+    when the snapshot is genuinely current.
+    """
+    from . import report
+
     if not device.get("connected"):
-        return "warn", "Device: not connected"
+        return report.Check("device", report.ACT, "not connected")
     caps = device.get("capabilities") or {}
     hint = device.get("hint")
-    if not caps and hint:
-        return "warn", "Device: connected (capabilities unavailable)"
     if not caps:
-        return "ok", "Device: connected (capabilities unavailable)"
+        glyph = report.ACT if hint else report.FINE
+        return report.Check("device", glyph, "connected (capabilities unavailable)")
     touchscreen = "yes" if caps.get("has_touchscreen") else "no"
-    return "ok", (
-        f"Device: {caps.get('model', '?')} -- {caps.get('key_count', '?')} keys "
+    value = (
+        f"{caps.get('model', '?')} -- {caps.get('key_count', '?')} keys "
         f"({caps.get('key_rows', '?')}x{caps.get('key_cols', '?')}), "
         f"{caps.get('dial_count', '?')} dials, touchscreen={touchscreen}"
     )
+    return report.Check("device", report.FINE, value)
 
 
-def _format_server_line(server: dict[str, Any]) -> tuple[str, str]:
+def _status_server_item(server: dict[str, Any]) -> Any:
+    from . import report
+
     url = server.get("url") or "(not configured)"
     if server.get("connected"):
-        return "ok", f"Server: {url} (reachable)"
+        return report.Check("server", report.FINE, f"{url} (reachable)")
     err = server.get("last_error")
-    message = f"Server: {url} (unreachable)"
+    value = f"{url} (unreachable)"
     if err:
-        message += f" -- {err}"
-    return "warn", message
+        value += f" -- {err}"
+    return report.Check("server", report.ACT, value)
 
 
-def _format_state_line(state: dict[str, Any]) -> str:
-    session = state.get("active_session") or "none"
-    view = state.get("active_view") or "all"
+def _status_view_value(state: dict[str, Any]) -> str:
+    view_name = state.get("active_view") or "all"
     page = state.get("page")
-    page_text = str(page) if page is not None else "-"
-    return f"Active session: {session} | view: {view} | page: {page_text}"
+    return f"{view_name} (page {page})" if page is not None else view_name
 
 
-def _print_direct_probe(config_path: str | None) -> None:
+def _direct_probe_item(config_path: str | None) -> Any:
     """Fallback when the service isn't running -- nothing holds the device."""
-    print_check(*check_deck_detected(config_path))
+    from . import report
+
+    deck_status, deck_message = check_deck_detected(config_path)
+    return report.Check("device", _status_glyph(deck_status), deck_message)
 
 
-def status(config_path: str | None = None, *, as_json: bool = False) -> int:
+def status(
+    config_path: str | None = None, *, as_json: bool = False, show_all: bool = False
+) -> int:
     """Print the sidecar's hardware + connection status.
 
     Reads the status file the running sidecar publishes (see
@@ -961,6 +1098,7 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
     fall back to a direct probe -- this keeps `status` useful even before
     the service has ever been installed.
     """
+    from . import report
     from .service import service_is_active, service_main_pid
     from .statusfile import read_status
 
@@ -972,36 +1110,45 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
         print(json.dumps(payload, indent=2))
         return 0 if data is not None else 1
 
-    print("\nmuxplex-deck status\n")
-    print_check(
-        "ok" if running else "warn",
-        f"Service: {'running' if running else 'not running'}",
-    )
+    utf8 = report.utf8_capable()
 
     if not running:
-        if data is None:
-            print_check(
-                "warn",
-                "No status file found -- probing the device directly instead "
-                "(safe: nothing holds it while the service is stopped).",
-            )
-        else:
-            print_check(
-                "warn",
-                "Service not running -- probing the device directly instead "
-                "of trusting the (possibly stale) status file.",
-            )
-        _print_direct_probe(config_path)
-        print()
+        probe_note = (
+            "no status file -- probing the device directly instead (safe: "
+            "nothing holds it while the service is stopped)"
+            if data is None
+            else "not trusting the (possibly stale) status file -- probing "
+            "the device directly instead"
+        )
+        items: list[Any] = [
+            report.Check("service", report.BLOCKED, "not running"),
+            report.Check("probe", report.BLOCKED, probe_note),
+            _direct_probe_item(config_path),
+        ]
+        collapsed = report.collapsed_checks(items)
+        action_count = report.count_actions([c.glyph for c in collapsed])
+        verdict = (
+            "Not connected -- service not running."
+            if action_count == 0
+            else report.verdict_readiness(action_count)
+        )
+        state_lines = report.render_items(items, show_all=show_all, utf8=utf8)
+        sys.stdout.write(report.render(verdict, state_lines, None))
         return 0
 
     if data is None:
-        print_check(
-            "unknown",
-            "No status file found even though the service is running -- it "
-            "may have just started. Try: muxplex-deck service logs",
+        items = [
+            report.Check(
+                "status",
+                report.BLOCKED,
+                "no status file yet -- the sidecar may have just started. "
+                "Try: muxplex-deck service logs",
+            )
+        ]
+        state_lines = report.render_items(items, show_all=show_all, utf8=utf8)
+        sys.stdout.write(
+            report.render("Not connected -- starting up.", state_lines, None)
         )
-        print()
         return 0
 
     # Is this snapshot from the process running RIGHT NOW, or from a
@@ -1024,40 +1171,94 @@ def status(config_path: str | None = None, *, as_json: bool = False) -> int:
         ) <= _STATUS_STALE_THRESHOLD_SECONDS
 
     if not is_current:
-        print_check(
-            "unknown",
-            f"Status not yet available for the running process (pid "
-            f"{current_pid if current_pid is not None else '?'}) -- the "
-            f"published status is from a previous run (pid {recorded_pid}). "
-            "This is expected right after (re)starting; try again in a "
-            "moment, or: muxplex-deck service logs",
+        # "-" (BLOCKED), never "!" (act-now): we did not actually observe
+        # this instant, so nothing here has earned a verdict yet -- see the
+        # restart-race incident this guards against (AGENTS.md).
+        items = [
+            report.Check(
+                "status",
+                report.BLOCKED,
+                f"not yet available for the running process (pid "
+                f"{current_pid if current_pid is not None else '?'}) -- the "
+                f"published status is from a previous run (pid {recorded_pid}). "
+                "This is expected right after (re)starting; try again in a "
+                "moment, or: muxplex-deck service logs",
+            )
+        ]
+        state_lines = report.render_items(items, show_all=show_all, utf8=utf8)
+        sys.stdout.write(
+            report.render("Not connected -- previous run's data.", state_lines, None)
         )
-        print()
         return 0
 
     age = time.time() - data.get("updated_at", 0)
-    if age > _STATUS_STALE_THRESHOLD_SECONDS:
-        print_check(
-            "warn",
-            f"Status file is stale (last updated {age:.0f}s ago) -- the "
-            "sidecar may be stuck. Try: muxplex-deck service logs",
-        )
-    else:
-        print_check("ok", f"Status updated {age:.0f}s ago (pid {data.get('pid', '?')})")
+    stale = age > _STATUS_STALE_THRESHOLD_SECONDS
+    device_item = _status_device_item(data.get("device", {}))
+    server_item = _status_server_item(data.get("server", {}))
+    state = data.get("state", {})
 
-    device_data = data.get("device", {})
-    print_check(*_format_device_line(device_data))
-    hint = device_data.get("hint")
-    if hint and not device_data.get("connected"):
+    session_readout = report.Readout("session", state.get("active_session") or "none")
+    view_readout = report.Readout("view", _status_view_value(state))
+    pid_readout = report.Readout(
+        "pid", f"{data.get('pid', '?')} (updated {age:.0f}s ago)"
+    )
+
+    all_fine = (
+        not stale
+        and device_item.glyph == report.FINE
+        and server_item.glyph == report.FINE
+    )
+
+    if all_fine:
+        readouts = [
+            session_readout,
+            view_readout,
+            report.Readout("device", device_item.value),
+            report.Readout("server", server_item.value),
+            pid_readout,
+        ]
+        state_lines = report.render_readouts(readouts)
+        sys.stdout.write(report.render("Running.", state_lines, None))
+        return 0
+
+    lines: list[str] = [
+        report.format_readout_line(session_readout.name, session_readout.value),
+        report.format_readout_line(view_readout.name, view_readout.value),
+        report.format_check_line(
+            device_item.glyph, device_item.subject, device_item.value, utf8=utf8
+        ),
+    ]
+    hint = data.get("device", {}).get("hint")
+    if hint and device_item.glyph != report.FINE:
         # Populated by the sidecar's open-failure branch (see main.py /
         # hidhelp.explain_open_failure) -- this is what turns a stale
         # status file into the primary teaching surface instead of a
         # bare "not connected" with no explanation.
-        print_check("warn", hint)
-    print_check(*_format_server_line(data.get("server", {})))
-    print_check("ok", _format_state_line(data.get("state", {})))
+        lines.append(report.format_check_line(report.ACT, "hint", hint, utf8=utf8))
+    lines.append(
+        report.format_check_line(
+            server_item.glyph, server_item.subject, server_item.value, utf8=utf8
+        )
+    )
+    if stale:
+        lines.append(
+            report.format_check_line(
+                report.ACT,
+                "status",
+                f"stale (last updated {age:.0f}s ago) -- the sidecar may be "
+                "stuck. Try: muxplex-deck service logs",
+                utf8=utf8,
+            )
+        )
+    lines.append(report.format_readout_line(pid_readout.name, pid_readout.value))
 
-    print()
+    glyphs = [device_item.glyph, server_item.glyph]
+    if hint and device_item.glyph != report.FINE:
+        glyphs.append(report.ACT)
+    if stale:
+        glyphs.append(report.ACT)
+    verdict = report.verdict_readiness(report.count_actions(glyphs))
+    sys.stdout.write(report.render(verdict, lines, None))
     return 0
 
 
@@ -1428,13 +1629,30 @@ def main() -> None:
 
     sub.add_parser("version", help="Show the muxplex-deck version")
 
-    sub.add_parser("doctor", help="Check dependencies and system status")
+    doctor_parser = sub.add_parser(
+        "doctor", help="Check dependencies and system status"
+    )
+    doctor_parser.add_argument(
+        "--all",
+        "--verbose",
+        dest="show_all",
+        action="store_true",
+        help="Show every underlying check (VID:PID, full paths, etc.) instead "
+        "of the collapsed summary -- a strict superset, never a different answer",
+    )
 
     status_parser = sub.add_parser(
         "status", help="Show connected hardware + connection state"
     )
     status_parser.add_argument(
         "--json", action="store_true", help="Emit raw status as JSON"
+    )
+    status_parser.add_argument(
+        "--all",
+        "--verbose",
+        dest="show_all",
+        action="store_true",
+        help="Show every underlying check instead of the collapsed summary",
     )
 
     update_parser = sub.add_parser(
@@ -1511,10 +1729,14 @@ def main() -> None:
     if args.command == "version":
         print_version()
     elif args.command == "doctor":
-        doctor(getattr(args, "config", None))
+        doctor(getattr(args, "config", None), show_all=getattr(args, "show_all", False))
     elif args.command == "status":
         sys.exit(
-            status(getattr(args, "config", None), as_json=getattr(args, "json", False))
+            status(
+                getattr(args, "config", None),
+                as_json=getattr(args, "json", False),
+                show_all=getattr(args, "show_all", False),
+            )
         )
     elif args.command in ("update", "upgrade"):
         update(force=getattr(args, "force", False))
