@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.6.1 (2026-07-27)
+
+### Bug Fixes
+
+- **The federation key was still being saved without being checked.** v0.5.3 added a check that the key actually authenticates before writing it, but the check was making a request the server answers with a redirect rather than a yes or no, which the wizard read as "cannot verify" and then wrote the key regardless. The request now identifies itself as wanting a machine-readable answer, which is what the server needs in order to answer the authentication question at all instead of redirecting to a sign-in page. Following that redirect would have been worse than the original problem: the redirect leads to a page that returns success, so a client that followed it would have accepted every key, valid or not.
+
+- **Setup no longer offers to install a background service on platforms that cannot run one.** On Windows, `init` finished by asking whether to install the service and then failed with an error when told yes — the same shape as the crash-loop removed in v0.5.2, where an action was offered that could not possibly succeed. Setup now checks for a supported service manager first, states plainly when background-service install is not available, and names what to run instead. The closing summary no longer recommends the command that just failed.
+
+- **Diagnostics no longer report the absence of Unix tooling as a problem on Windows.** A missing `systemctl` was reported as though a Linux install were broken, rather than as background-service support not being available yet; and a missing `openssl` was reported as a warning even though Windows does not ship one, which is not something the reader can act on.
+
+### Changes
+
+- **The federation-key prompt was rewritten.** It previously paused mid-setup, described a file living on the server using a path formatted for the machine the reader was not on, offered three different ways to obtain the key, accepted either a pasted secret or a file path through a single hidden field, and included a command template containing a placeholder the wizard already knew the value of. It now shows one command, with the real server name filled in and written so it is runnable from where it is printed, and offers an explicit way to defer — which finishes the rest of setup, skips the service offer, and names the single command to run when the key is available. The certificate fingerprint is still shown for out-of-band verification but no longer occupies the position immediately before the prompt. The connection-security message leads with what it means rather than with a raw error; the underlying detail remains available in verbose mode.
+
+### Verification
+
+- 449 tests passed via pytest (baseline 433 + 16 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.6.0 (2026-07-27)
 
 ### Features
