@@ -96,11 +96,28 @@ class Config:
     for the "attention" mode's tie-break rules.
     """
     focus_app: str
-    """macOS application name of the locally installed muxplex PWA to bring
-    to the foreground when a key press switches the active session (see
+    """Identifier for the locally installed muxplex PWA, used to bring it to
+    the foreground when a key press switches the active session (see
     `.focus`). Empty (the default) disables the feature entirely -- no
-    subprocess calls, no log noise. macOS-only today; on other platforms a
-    configured value logs one INFO notice and is otherwise ignored.
+    subprocess/API calls, no log noise.
+
+    Meaning is platform-specific -- one field, two interpretations, not a
+    second config key, because each platform has exactly one natural way
+    to address "the PWA" and they're different shapes: macOS's PWA is a
+    real, individually-launchable `.app` bundle (addressed by name, via
+    `open -a`); Windows' runs inside a generic browser process with no
+    per-app identity of its own, so the only thing that reliably names it
+    is its window TITLE (addressed by substring match). Concretely:
+
+    - macOS: the `.app` bundle name (as `open -a <name>` expects).
+    - Windows: a substring to match against a top-level window's title
+      (see `focus._focus_windows` for the matching + foreground-steal
+      mechanics, and its real, documented limits).
+    - Linux/WSL: no implementation exists yet; a configured value logs one
+      INFO notice per process and is otherwise ignored.
+
+    Existing macOS configs are unaffected -- this only changes what the
+    same field means when read on Windows.
     """
 
 
@@ -193,7 +210,8 @@ def load_config(config_path: str | None = None) -> Config:
     focus_app = raw.get("focus_app", "")
     if not isinstance(focus_app, str):
         raise ConfigError(
-            f"Config field 'focus_app' must be a string (macOS app name), "
+            "Config field 'focus_app' must be a string (macOS: .app bundle "
+            "name; Windows: browser window title substring), "
             f"got {focus_app!r}"
         )
 
