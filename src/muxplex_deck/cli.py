@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -328,13 +329,30 @@ def check_config_file(config_path: str | None = None) -> tuple[str, str]:
 
 
 def check_federation_key(key_file: Path) -> tuple[str, str]:
-    """Federation key presence + permission check. Never prints the key itself."""
+    """Federation key presence + permission check. Never prints the key itself.
+
+    On Windows, `Path.chmod()` only toggles the read-only bit -- it does not
+    restrict other users -- so `st_mode` reads back as a permissive value
+    (typically 0o666) no matter what actually protects the file (NTFS ACLs,
+    which are per-user profile directories by default). Warning on every
+    run and recommending a `chmod` that cannot fix anything would violate
+    this repo's own rule (AGENTS.md: never print a command that cannot work
+    on the machine you are printing it to) -- so Windows gets presence-only
+    reporting, no POSIX-mode judgment, and no ACL check (that would be new,
+    untested, platform-specific security code for a file already inside a
+    per-user profile directory; see WINDOWS_NATIVE_SPEC.md section 3.3).
+    """
     if not key_file.exists():
         return "warn", f"Federation key file not found: {key_file}"
     try:
         mode = key_file.stat().st_mode & 0o777
     except OSError as exc:
         return "warn", f"Could not stat federation key file {key_file}: {exc}"
+    if sys.platform == "win32":
+        return "ok", (
+            f"Federation key: {key_file} "
+            "(NTFS ACLs govern access here -- POSIX modes are not enforced)"
+        )
     if mode & 0o077:
         return "warn", (
             f"Federation key file {key_file} is readable by others "
@@ -392,6 +410,53 @@ def check_ca_file(ca_file: Path | None) -> tuple[str, str]:
         "warn",
         f"ca_file {ca_file}: could not determine CA status from basicConstraints",
     )
+
+
+def check_hidapi_dll() -> tuple[str, str] | None:
+    """Windows-only: report which `hidapi.dll` streamdeck's loader will actually use.
+
+    Returns `None` on every other platform (nothing to check -- other OSes
+    use their own dynamic linker conventions and the check is simply
+    skipped, not appended to the doctor output).
+
+    `hidapi_win.ensure_hidapi()` can create a silent shadowing failure mode
+    if something earlier on `%PATH%` wins the load race (see that module's
+    docstring for the mechanism) -- a design that creates a failure mode
+    owes the user a way to see it, so this always prints a line on
+    Windows, not only when something is wrong (WINDOWS_NATIVE_SPEC.md
+    section 2.6).
+    """
+    if sys.platform != "win32":
+        return None
+
+    from . import hidapi_win
+
+    dll_dir = hidapi_win.ensure_hidapi()
+    if dll_dir is None:
+        return "warn", (
+            "hidapi.dll: vendored copy not found in this install (Windows "
+            "arm64, or a source checkout without the vendored binary) -- "
+            "see https://github.com/libusb/hidapi/releases"
+        )
+
+    vendored = str(hidapi_win.vendored_dll_path())
+    resolved = hidapi_win.resolved_library_path()
+    if resolved is None:
+        return "warn", (
+            f"hidapi.dll: vendored copy present at {vendored} but "
+            "ctypes.util.find_library('hidapi') did not resolve anything "
+            "(check %PATH%)"
+        )
+    # Case-insensitive: see hidhelp._windows_guidance()'s comment on the
+    # same comparison -- os.path.normcase only behaves case-insensitively
+    # when the running process actually IS Windows, not when sys.platform
+    # is merely monkeypatched (as tests, and this repo's Linux-only CI, do).
+    if resolved.lower() != vendored.lower():
+        return "warn", (
+            f"hidapi.dll: resolves to {resolved} -- NOT the vendored copy "
+            "(see the WIN-DLL-SHADOW guidance below)"
+        )
+    return "ok", f"hidapi.dll: resolves to the vendored copy ({resolved})"
 
 
 def probe_deck_status(manager: Any) -> dict:
@@ -729,6 +794,11 @@ def doctor(config_path: str | None = None) -> int:
         ca_file = config_mod._expand(raw["ca_file"])
     checks.append(check_ca_file(ca_file))
 
+    # Windows-only; None (skipped, not appended) on every other platform.
+    hidapi_check = check_hidapi_dll()
+    if hidapi_check is not None:
+        checks.append(hidapi_check)
+
     # Environment guidance (WSL/usbipd/udev-liveness) BEFORE the device
     # checks -- it explains why the next line is about to warn. Returns []
     # on a healthy platform (macOS, or native Linux with udev running), so
@@ -978,8 +1048,6 @@ def _find_uv() -> str | None:
 
 
 def _is_executable(path: str) -> bool:
-    import os
-
     return os.access(path, os.X_OK)
 
 
@@ -1069,8 +1137,6 @@ def update(*, force: bool = False) -> None:
     if was_active:
         print("  Stopping service...")
         if sys.platform == "darwin":
-            import os
-
             uid = os.getuid()
             subprocess.run(
                 ["launchctl", "bootout", f"gui/{uid}/com.muxplex-deck"],

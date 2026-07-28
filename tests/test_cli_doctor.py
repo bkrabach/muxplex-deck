@@ -76,6 +76,27 @@ class TestCheckFederationKey:
         assert status == "ok"
         assert "supersecret" not in message
 
+    def test_windows_reports_presence_only_never_prints_chmod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WINDOWS_NATIVE_SPEC.md section 3.3: `Path.chmod()` doesn't restrict
+
+        other users on Windows, so `st_mode` reads back permissive
+        regardless of what actually protects the file (NTFS ACLs) --
+        printing a `chmod` remediation that cannot work violates this
+        repo's own rule (AGENTS.md: never print a command that cannot work
+        on the machine you are printing it to). Windows must report
+        presence only, with `ok` status, and no `chmod` text.
+        """
+        key_file = tmp_path / "federation_key"
+        key_file.write_text("supersecret\n", encoding="utf-8")
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        status, message = cli.check_federation_key(key_file)
+        assert status == "ok"
+        assert "chmod" not in message
+        assert "NTFS" in message
+        assert "supersecret" not in message
+
 
 # ---------------------------------------------------------------------------
 # check_ca_file -- the CA:FALSE (leaf-cert-instead-of-CA) gotcha
@@ -148,6 +169,82 @@ class TestCheckCaFile:
         status, message = cli.check_ca_file(ca_file)
         assert status == "warn"
         assert "openssl not found" in message
+
+
+# ---------------------------------------------------------------------------
+# check_hidapi_dll -- WINDOWS_NATIVE_SPEC.md section 2.6's diagnosability
+# requirement: whichever hidapi.dll streamdeck's loader will actually use
+# must be visible in `doctor`, not just success/failure.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckHidapiDll:
+    def test_none_on_non_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli.sys, "platform", "linux")
+        assert cli.check_hidapi_dll() is None
+
+    def test_warns_when_vendored_dll_absent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from muxplex_deck import hidapi_win
+
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        monkeypatch.setattr(hidapi_win, "ensure_hidapi", lambda: None)
+        result = cli.check_hidapi_dll()
+        assert result is not None
+        status, message = result
+        assert status == "warn"
+        assert "github.com/libusb/hidapi" in message
+
+    def test_warns_when_resolved_path_differs_from_vendored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from muxplex_deck import hidapi_win
+
+        vendored = tmp_path / "x64" / "hidapi.dll"
+        shadowing = str(tmp_path / "shadow" / "hidapi.dll")
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        monkeypatch.setattr(hidapi_win, "ensure_hidapi", lambda: vendored.parent)
+        monkeypatch.setattr(hidapi_win, "vendored_dll_path", lambda: vendored)
+        monkeypatch.setattr(hidapi_win, "resolved_library_path", lambda: shadowing)
+        result = cli.check_hidapi_dll()
+        assert result is not None
+        status, message = result
+        assert status == "warn"
+        assert shadowing in message
+        assert "NOT the vendored copy" in message
+
+    def test_ok_when_resolved_matches_vendored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from muxplex_deck import hidapi_win
+
+        vendored = tmp_path / "x64" / "hidapi.dll"
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        monkeypatch.setattr(hidapi_win, "ensure_hidapi", lambda: vendored.parent)
+        monkeypatch.setattr(hidapi_win, "vendored_dll_path", lambda: vendored)
+        monkeypatch.setattr(hidapi_win, "resolved_library_path", lambda: str(vendored))
+        result = cli.check_hidapi_dll()
+        assert result is not None
+        status, message = result
+        assert status == "ok"
+        assert str(vendored) in message
+
+    def test_warns_when_nothing_resolves_at_all(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from muxplex_deck import hidapi_win
+
+        vendored = tmp_path / "x64" / "hidapi.dll"
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        monkeypatch.setattr(hidapi_win, "ensure_hidapi", lambda: vendored.parent)
+        monkeypatch.setattr(hidapi_win, "vendored_dll_path", lambda: vendored)
+        monkeypatch.setattr(hidapi_win, "resolved_library_path", lambda: None)
+        result = cli.check_hidapi_dll()
+        assert result is not None
+        status, message = result
+        assert status == "warn"
+        assert "did not resolve" in message
 
 
 # ---------------------------------------------------------------------------
