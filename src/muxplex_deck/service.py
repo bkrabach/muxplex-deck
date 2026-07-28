@@ -139,19 +139,29 @@ _LAUNCHD_PLIST_TEMPLATE = """\
 </plist>
 """
 
-# Same ✓/! 2-space-indent style as `cli.doctor()`'s `print_check` -- kept as
-# a small local duplicate (rather than importing from `cli.py`) to avoid a
-# circular import: `cli.py` already imports from this module at call time.
-_MARK_OK = "\033[32m\u2713\033[0m"
-_MARK_WARN = "\033[33m!\033[0m"
+
+# Same glyph vocabulary as `report.py` (see that module's docstring): "+"
+# for fine, becoming a UTF-8 checkmark only when the environment can render
+# one. This install/uninstall narration is step-by-step progress output,
+# not a VERDICT/STATE/ACTION report -- it intentionally keeps its own
+# simple 2-space-indent style rather than adopting the full column ladder,
+# but shares the same glyph-substitution rule so the visual language is
+# consistent across `doctor`/`status`/`service`. No ANSI color: plain text
+# only, so this stays byte-identical whether printed to a TTY or piped.
+def _mark_ok() -> str:
+    from . import report
+
+    return report._glyph_char(report.FINE, utf8=report.utf8_capable())
 
 
 def _step_ok(message: str) -> None:
-    print(f"  {_MARK_OK} {message}")
+    print(f"  {_mark_ok()}  {message}")
 
 
 def _step_warn(message: str) -> None:
-    print(f"  {_MARK_WARN} {message}")
+    from . import report
+
+    print(f"  {report.ACT}  {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +266,10 @@ def _print_guidance_block(message: str) -> None:
     uses (kept as a small local duplicate here to avoid a circular import
     with `cli.py`).
     """
+    from . import report
+
     for i, line in enumerate(message.splitlines()):
-        prefix = f"  {_MARK_WARN} " if i == 0 else "    "
+        prefix = f"  {report.ACT} " if i == 0 else "    "
         print(f"{prefix}{line}")
 
 

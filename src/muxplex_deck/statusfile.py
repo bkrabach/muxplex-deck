@@ -122,7 +122,7 @@ def build_status(
     `hidhelp.explain_open_failure`), published so `muxplex-deck status`
     can show it instead of a stale/misleading status. Older readers that
     don't know this field simply don't see it (`.get()` is used to read
-    it back -- see `cli._format_device_line`).
+    it back -- see `cli._status_device_item`).
     """
     device: dict[str, Any] = {"connected": device_connected}
     if device_connected and device_caps is not None:
