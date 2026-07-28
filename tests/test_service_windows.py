@@ -221,7 +221,18 @@ class TestWindowsPredicates:
         )
         assert service_mod.service_is_active() is False
 
-    def test_main_pid_returns_query_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_main_pid_always_none_even_when_task_running_with_a_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """VERIFIED FALSE on real hardware: `EnginePID` is the Task
+
+        Scheduler engine-HOST process, never the sidecar's own pid (see
+        `service_main_pid()`'s docstring) -- so this must return None
+        UNCONDITIONALLY on Windows, even when `_win_task_query()` reports a
+        running task with a (real, but not-ours) pid. Returning that pid
+        would be fabricating an authoritative-looking answer that is
+        actively wrong, not just imprecise.
+        """
         monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
         monkeypatch.setattr(service_mod, "_is_windows", lambda: True)
         monkeypatch.setattr(
@@ -231,7 +242,7 @@ class TestWindowsPredicates:
                 exists=True, state=service_mod._WIN_TASK_STATE_RUNNING, pid=4242
             ),
         )
-        assert service_mod.service_main_pid() == 4242
+        assert service_mod.service_main_pid() is None
 
     def test_main_pid_none_when_not_running(
         self, monkeypatch: pytest.MonkeyPatch
@@ -599,10 +610,13 @@ class TestWinRestart:
     def test_restart_waits_for_fresh_status_before_reporting_success(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
-        """The v0.5.3 restart-race fix, preserved on Windows
+        """The v0.5.3 restart-race fix, preserved on Windows -- but via a
 
-        (WINDOWS_NATIVE_SPEC.md section 1.4): never claim success until the
-        NEW process's pid is actually observed in status.json.
+        BASELINE-PID diff (WINDOWS_NATIVE_SPEC.md section 1.4's live-pid
+        plan is impossible on Windows; see `service_main_pid()`'s
+        docstring). `_win_restart()` reads the OLD pid (111) before
+        stopping; once the "new" process's write (999) appears, that's a
+        genuine pid change -- never claim success before that's observed.
         """
         from muxplex_deck import statusfile as statusfile_mod
 
@@ -610,10 +624,17 @@ class TestWinRestart:
         monkeypatch.setattr(
             service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
         )
-        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 999)
-        monkeypatch.setattr(
-            statusfile_mod, "read_status", lambda path=None: {"pid": 999}
-        )
+
+        # First read (the pre-stop baseline) sees the OLD process's pid;
+        # every read after that sees the NEW process's -- simulating an
+        # actual restart with a genuinely different pid.
+        calls = {"n": 0}
+
+        def _fake_read_status(path: Path | None = None) -> dict[str, Any]:
+            calls["n"] += 1
+            return {"pid": 111} if calls["n"] == 1 else {"pid": 999}
+
+        monkeypatch.setattr(statusfile_mod, "read_status", _fake_read_status)
 
         service_mod._win_restart()
 
@@ -624,6 +645,11 @@ class TestWinRestart:
     def test_restart_timeout_reports_honestly(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
+        """The pid never actually changes (same 111 before and after) --
+
+        the "new" process never publishes a fresh write within the
+        timeout, so this must time out honestly, never fabricate success.
+        """
         from muxplex_deck import statusfile as statusfile_mod
 
         monkeypatch.setattr(service_mod, "_RESTART_STATUS_TIMEOUT_SECONDS", 0.02)
@@ -631,7 +657,6 @@ class TestWinRestart:
         monkeypatch.setattr(
             service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
         )
-        monkeypatch.setattr(service_mod, "service_main_pid", lambda: 999)
         monkeypatch.setattr(
             statusfile_mod, "read_status", lambda path=None: {"pid": 111}
         )
@@ -642,6 +667,35 @@ class TestWinRestart:
         assert "has not published" in out
         assert "fresh" in out
         assert "Restarted the task" not in out
+
+    def test_restart_with_no_prior_status_accepts_any_fresh_pid(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """No status file existed before this restart (e.g. the very first
+
+        start) -- baseline_pid is None, so ANY freshly observed pid counts
+        as fresh, matching `_win_wait_for_fresh_status()`'s documented
+        contract.
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+
+        calls = {"n": 0}
+
+        def _fake_read_status(path: Path | None = None) -> dict[str, Any] | None:
+            calls["n"] += 1
+            return None if calls["n"] == 1 else {"pid": 999}
+
+        monkeypatch.setattr(statusfile_mod, "read_status", _fake_read_status)
+
+        service_mod._win_restart()
+
+        out = capsys.readouterr().out
+        assert "Restarted the task" in out
 
     def test_restart_run_failure_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -658,6 +712,40 @@ class TestWinRestart:
         assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "task not found" in out
+
+    def test_restart_never_calls_service_main_pid(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Regression guard: `_win_restart()` must use
+
+        `_win_wait_for_fresh_status()`'s baseline-pid diff, never
+        `service_main_pid()` -- which always returns None on Windows (see
+        its docstring) and would make this always time out.
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+
+        def _boom() -> int | None:
+            raise AssertionError("_win_restart must not call service_main_pid()")
+
+        monkeypatch.setattr(service_mod, "service_main_pid", _boom)
+
+        calls = {"n": 0}
+
+        def _fake_read_status(path: Path | None = None) -> dict[str, Any]:
+            calls["n"] += 1
+            return {"pid": 111} if calls["n"] == 1 else {"pid": 999}
+
+        monkeypatch.setattr(statusfile_mod, "read_status", _fake_read_status)
+
+        service_mod._win_restart()
+
+        out = capsys.readouterr().out
+        assert "Restarted the task" in out
 
 
 class TestWinStatus:

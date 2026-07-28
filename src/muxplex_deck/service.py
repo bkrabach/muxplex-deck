@@ -64,6 +64,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -476,7 +477,9 @@ def _failure_check(
     return report.Check("service", report.ACT, value)
 
 
-def _restart_result_check(success_message: str) -> Any:
+def _restart_result_check(
+    success_message: str, *, fresh_status_check: Callable[[], bool] | None = None
+) -> Any:
     """Build the final restart `Check`: success only once fresh status is
 
     actually observed, otherwise an honest "still waiting" warning. Shared
@@ -484,10 +487,18 @@ def _restart_result_check(success_message: str) -> Any:
     promise: never claim a step (the new process being up and reporting)
     that was not actually verified -- see AGENTS.md's restart-race
     incident, which this directly closes.
+
+    `fresh_status_check` overrides the default `_wait_for_fresh_status()`
+    call. systemd/launchd never pass it (byte-for-byte unchanged
+    behavior); `_win_restart()` passes `_win_wait_for_fresh_status` bound
+    to its pre-restart baseline pid, because Windows cannot use a live-pid
+    comparison at all -- see `service_main_pid()`'s and
+    `_win_wait_for_fresh_status()`'s docstrings for why.
     """
     from . import report
 
-    if _wait_for_fresh_status():
+    check = fresh_status_check or _wait_for_fresh_status
+    if check():
         return report.Check("service", report.FINE, success_message)
     return report.Check(
         "service",
@@ -722,6 +733,51 @@ def _wait_for_fresh_status(timeout: float | None = None) -> bool:
             data = statusfile.read_status()
             if data is not None and data.get("pid") == current_pid:
                 return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_RESTART_STATUS_POLL_INTERVAL_SECONDS)
+
+
+def _win_wait_for_fresh_status(
+    baseline_pid: int | None, timeout: float | None = None
+) -> bool:
+    """Windows analogue of `_wait_for_fresh_status()` -- a baseline-pid
+    diff, not a live-pid match.
+
+    `service_main_pid()` always returns `None` on Windows: Task
+    Scheduler's `EnginePID` names its own engine-HOST process, never the
+    sidecar it launched -- VERIFIED on real hardware, see that function's
+    docstring. A live-pid comparison can therefore never succeed on this
+    platform; reusing `_wait_for_fresh_status()` unmodified would make
+    every Windows restart report "has not published fresh status" after
+    the FULL timeout, even a perfectly healthy one -- a regression of the
+    exact contract this function exists to protect, just from the
+    opposite direction (always-fail instead of always-pass).
+
+    Instead, this compares against `baseline_pid`: the status file's
+    recorded pid from BEFORE the restart began (`_win_restart()` reads it
+    prior to calling `_win_stop()`). `_win_stop()` hard-kills the previous
+    process before `_win_start()` launches a new one, so any pid the new
+    process reports afterward is necessarily a NEW process's write, never
+    the terminated one's -- the sidecar's own self-reported pid remains
+    the authoritative signal (nothing here is fabricated), this is just a
+    different, equally reliable way of reading freshness from it.
+    `baseline_pid=None` (no status existed before this restart, e.g. the
+    very first ever start) means ANY freshly observed pid counts.
+
+    Same contract as `_wait_for_fresh_status()`: never raises, True once a
+    fresh write is observed, False if `timeout` elapses first.
+    """
+    from . import statusfile
+
+    if timeout is None:
+        timeout = _RESTART_STATUS_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        data = statusfile.read_status()
+        recorded_pid = data.get("pid") if data is not None else None
+        if recorded_pid is not None and recorded_pid != baseline_pid:
+            return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(_RESTART_STATUS_POLL_INTERVAL_SECONDS)
@@ -1336,12 +1392,22 @@ def _win_stop() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
 
 
 def _win_restart() -> None:
+    from . import statusfile
 
     items: list[Any] = []
+
+    # Freshness baseline for `_win_wait_for_fresh_status()` below -- MUST be
+    # read before `_win_stop()`, so it reflects the process about to be
+    # replaced, not the new one. See `service_main_pid()`'s docstring for
+    # why Windows cannot use a live-pid comparison here the way
+    # systemd/launchd do.
+    baseline_data = statusfile.read_status()
+    baseline_pid = baseline_data.get("pid") if baseline_data is not None else None
 
     _win_stop()
     # Unlike launchd's bootout, Task Scheduler's /End has no separate
@@ -1351,13 +1417,19 @@ def _win_restart() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         items.append(_failure_check("schtasks", "/Run", result))
         _render_service_report(items)
         sys.exit(1)
 
-    items.append(_restart_result_check("Restarted the task"))
+    items.append(
+        _restart_result_check(
+            "Restarted the task",
+            fresh_status_check=lambda: _win_wait_for_fresh_status(baseline_pid),
+        )
+    )
     _render_service_report(items)
 
 
@@ -1381,7 +1453,14 @@ def _win_status() -> None:
         task_glyph = report.ACT
         task_value = "Not registered -- run: muxplex-deck service install"
     elif info.state == _WIN_TASK_STATE_RUNNING:
-        pid_text = f" (pid {info.pid})" if info.pid else ""
+        # `info.pid` is Task Scheduler's own EnginePID, NOT the sidecar's
+        # own pid (see `service_main_pid()`'s docstring) -- labeled
+        # explicitly so this line can never be misread as "the sidecar is
+        # pid N". That exact misreading (mixed up with `muxplex-deck
+        # status`, which shows the sidecar's own self-reported pid) is
+        # what made a perfectly healthy sidecar look broken during this
+        # port's hardware bring-up.
+        pid_text = f" (scheduler engine pid {info.pid})" if info.pid else ""
         task_glyph = report.FINE
         task_value = f"Registered and running{pid_text}"
     else:
@@ -1590,11 +1669,29 @@ def service_main_pid() -> int | None:
     exited, so an age-only staleness check saw it as "recent" and reported
     it as current truth. Comparing pids is the only way to tell those apart.
 
-    On Windows, `IRunningTask.EnginePID` is the pid Task Scheduler reports
-    for the process it directly launched -- which, because the task action
-    is `pythonw.exe -m muxplex_deck run` with no `cmd.exe` wrapper (see
-    `_win_task_arguments()`), IS the sidecar's own pid. UNVERIFIED on real
-    hardware -- see this change's real-hardware sign-off checklist, item 2.
+    On Windows this ALWAYS returns None -- VERIFIED FALSE on real hardware
+    (2026-07): WINDOWS_NATIVE_SPEC.md section 1.4's item 2 assumed
+    `IRunningTask.EnginePID` would equal the sidecar's own pid because the
+    task action is a direct `pythonw.exe -m muxplex_deck run` with no
+    `cmd.exe` wrapper. A real machine running exactly one healthy sidecar
+    (confirmed via its own log: started, connected the deck, polled the
+    server, handled key presses) showed `EnginePID` reporting a DIFFERENT
+    pid than the one the sidecar itself wrote to `status.json`. This
+    matches Microsoft's own documentation, read only after the hardware
+    disproved the assumption: `EnginePID` is "the process ID for the
+    engine (process) which is running the task"
+    (learn.microsoft.com/windows/win32/taskschd/runningtask-enginepid) --
+    the Task Scheduler engine HOST process (a shared `svchost.exe -k
+    netsvcs -p -s Schedule` on modern Windows, `taskeng.exe` on older
+    versions), not the task's own launched process. Independent reports
+    going back to 2011 confirm the same thing for direct, unwrapped
+    actions, not just batch/script ones. There is no COM property that
+    names the sidecar's own live pid, and fabricating one from `EnginePID`
+    would be actively wrong, not just imprecise -- so this returns `None`
+    (the existing "cannot determine" contract) rather than a value that
+    LOOKS authoritative but isn't. Callers must not compare it against
+    anything; see `_win_wait_for_fresh_status()` for how the Windows
+    restart contract is upheld with a different, genuinely reliable signal.
     """
     if _is_darwin():
         uid = os.getuid()
@@ -1619,7 +1716,13 @@ def service_main_pid() -> int | None:
         return None
 
     if _is_windows():
-        return _win_task_query().pid
+        # See the docstring above: EnginePID is the Task Scheduler engine
+        # HOST process, never the sidecar's own pid. Returning it would be
+        # a fabricated, actively-wrong signal -- "cannot determine" (None)
+        # is the honest answer, and callers already handle that (`status()`
+        # falls back to age-based staleness; `_win_restart()` uses
+        # `_win_wait_for_fresh_status()` instead of this function).
+        return None
 
     try:
         result = subprocess.run(
