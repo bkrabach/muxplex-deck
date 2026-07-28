@@ -35,16 +35,24 @@ class _FakeCompletedProcess:
 
 
 class _RecordingRun:
-    """Stand-in for subprocess.run that records every invocation."""
+    """Stand-in for subprocess.run that records every invocation.
+
+    `calls` keeps the old shape (`list[list[str]]`, argv only) so every
+    existing assertion keeps working unchanged; `calls_with_kwargs` is
+    additive, recording the full `(argv, kwargs)` pair for tests that need
+    to assert on kwargs (e.g. `stdin=subprocess.DEVNULL`).
+    """
 
     def __init__(
         self, results: dict[tuple, _FakeCompletedProcess] | None = None
     ) -> None:
         self.calls: list[list[str]] = []
+        self.calls_with_kwargs: list[tuple[list[str], dict[str, Any]]] = []
         self._results = results or {}
 
     def __call__(self, argv: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         self.calls.append(list(argv))
+        self.calls_with_kwargs.append((list(argv), dict(kwargs)))
         return self._results.get(tuple(argv), _FakeCompletedProcess(0))
 
 
@@ -470,10 +478,23 @@ class TestWinInstall:
             c for c in recording_run.calls if c[:2] == ["schtasks", "/Create"]
         ]
         assert len(create_calls) == 1
-        assert "/RU" in create_calls[0]
+        # VERIFIED HANG on real hardware: `/RU <user>` without `/RP` makes
+        # schtasks prompt INTERACTIVELY for a password on stdin, no matter
+        # the logon type (confirmed by Microsoft's own docs -- see
+        # `_win_install()`'s comment). The XML already carries the user's
+        # identity (`<Principals><Principal><UserId>`), so `/RU` must never
+        # be passed on the command line at all.
+        assert "/RU" not in create_calls[0]
         assert not any(a == "cmd.exe" for a in create_calls[0])
         run_calls = [c for c in recording_run.calls if c[:2] == ["schtasks", "/Run"]]
         assert len(run_calls) == 1
+
+        # No Windows subprocess call may inherit our stdin -- defense in
+        # depth against exactly the hang above, for any future prompt.
+        for argv, kwargs in recording_run.calls_with_kwargs:
+            assert kwargs.get("stdin") is service_mod.subprocess.DEVNULL, (
+                f"{argv} did not close stdin"
+            )
 
         out = capsys.readouterr().out
         assert "Registered + started the task" in out

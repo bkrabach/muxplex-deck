@@ -1109,6 +1109,11 @@ def _win_task_query() -> WinTaskInfo:
     Never raises: a missing `powershell.exe` or a subprocess timeout both
     read as "not installed" (the same conservative default `_parse_win_task_query`
     uses for unparseable output), never a false positive.
+
+    `stdin=subprocess.DEVNULL`: this and every other Windows subprocess
+    call below closes stdin explicitly rather than inheriting ours -- see
+    `_win_install()`'s docstring for the real incident (a `schtasks`
+    password prompt) this defends against generally, not just there.
     """
     script = _WIN_TASK_QUERY_SCRIPT_TEMPLATE.format(task_name=_WIN_TASK_NAME)
     try:
@@ -1126,6 +1131,7 @@ def _win_task_query() -> WinTaskInfo:
             text=True,
             check=False,
             timeout=_WIN_QUERY_SUBPROCESS_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return WinTaskInfo(exists=False, state=None, pid=None)
@@ -1259,6 +1265,27 @@ def _win_install() -> None:
         _render_service_report(items)
         return
 
+    # No `/RU <user>` here -- VERIFIED HANG on real hardware (2026-07):
+    # `schtasks /Create /RU <user>` prompts INTERACTIVELY for a password on
+    # stdin unless `/RP` is also given, no matter the logon type or whether
+    # the user matches who is already logged on -- confirmed by Microsoft's
+    # own documentation ("Schtasks always prompts for a password unless you
+    # provide one, even when you schedule a task on the local computer
+    # using the current user account. This is normal behavior for
+    # schtasks." --
+    # learn.microsoft.com/windows-server/administration/windows-commands/schtasks-create).
+    # `subprocess.run` inherits our stdin by default, so a real terminal
+    # blocked silently until the user pressed Enter (submitting a blank
+    # password) -- exactly the reported "hangs with no output until I hit
+    # Enter" symptom. The XML already fully specifies the identity
+    # (`<Principals><Principal><UserId>` + `<LogonType>InteractiveToken`,
+    # which needs no password at all), and `/XML` can be used alone when
+    # the file already contains that information -- so the fix is to never
+    # pass `/RU` on the command line, not to guess an `/RP` value.
+    # `stdin=subprocess.DEVNULL` on every Windows subprocess call below is
+    # defense-in-depth: if some future schtasks/powershell invocation ever
+    # tries to read from stdin for any other reason, it fails fast and
+    # loud instead of hanging silently on whatever we happen to inherit.
     create_result = subprocess.run(
         [
             "schtasks",
@@ -1267,13 +1294,12 @@ def _win_install() -> None:
             _WIN_TASK_NAME,
             "/XML",
             str(xml_path),
-            "/RU",
-            user_id,
             "/F",
         ],
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     if create_result.returncode != 0:
         items.append(_failure_check("schtasks", "/Create", create_result))
@@ -1285,6 +1311,7 @@ def _win_install() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     if run_result.returncode != 0:
         items.append(_failure_check("schtasks", "/Run", run_result))
@@ -1325,6 +1352,7 @@ def _win_uninstall() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     items.append(
         report.Check(
@@ -1339,6 +1367,7 @@ def _win_uninstall() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     items.append(
         report.Check(
@@ -1372,6 +1401,7 @@ def _win_start() -> None:
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode == 0:
         _render_service_report(
@@ -1492,8 +1522,14 @@ def _win_logs() -> None:
     log_file = _win_default_log_path()
     command = f"Get-Content -LiteralPath '{log_file}' -Tail 50 -Wait"
     try:
+        # stdin closed (defense-in-depth, see `_win_install()`'s docstring)
+        # -- stdout/stderr stay inherited/unredirected on purpose, this is
+        # the raw passthrough stream (module docstring: "logs is -- and
+        # stays -- a raw passthrough stream").
         subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", command], check=False
+            ["powershell.exe", "-NoProfile", "-Command", command],
+            check=False,
+            stdin=subprocess.DEVNULL,
         )
     except KeyboardInterrupt:
         pass
