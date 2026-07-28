@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.10.1 (2026-07-28)
+
+### Bug Fixes
+
+- **`controls show` now works.** Running `muxplex-deck controls` on its own already listed the current bindings, but the more obvious spelling — `controls show` — was never registered and failed with an invalid-choice error. Both now work and print the same thing. Every command group was audited for the same gap and a check was added so a command that is offered but not wired up fails the test suite rather than reaching a user.
+
+- **An unrelated formatting inconsistency was corrected** that would have failed the next automated check regardless of this change.
+
+### Verification
+
+- 830 tests passed via pytest (baseline 824 + 6 new across control mapping audit and subcommand dispatch tests).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.10.0 (2026-07-28)
 
 ### Features
