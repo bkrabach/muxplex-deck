@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.2 (2026-07-28)
+
+### Bug Fixes
+
+- **`status` no longer reports a healthy Windows service as showing a previous run's data.** The process id used to identify the running sidecar came from the task scheduler, which reports the id of the scheduler's own host process — not the program the task launched. Status compared that against the id the sidecar records for itself, found two unrelated numbers, and concluded indefinitely that it was looking at stale data while everything was in fact working. On Windows the sidecar's own recorded id is now treated as the only authoritative source, and the check falls back to how recently the status was written. The guarantee added in v0.5.3 — that a restart never reports success until the newly started process has actually published its own status — is preserved by comparing against the id recorded before the restart began.
+
+- **`service install` no longer appears to hang until a key is pressed.** Registering the task named the account to run as, and the Windows scheduling command always prompts for a password when given an account name, even for the current user on the local machine, and even when the task definition needs no password. The prompt was invisible because the command's input was still attached to the terminal, so installation simply appeared to stall until Enter was pressed. The account name is now omitted, since the task definition already carries the identity, and every Windows command the tool runs now has its input closed so that any future prompt fails immediately and visibly instead of hanging.
+
+### Verification
+
+- 629 tests passed via pytest (baseline 627 + 2 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.1 (2026-07-28)
 
 ### Bug Fixes
