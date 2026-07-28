@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.3 (2026-07-28)
+
+### Bug Fixes
+
+- **`service restart` no longer leaves the Windows service stopped.** Restarting asked the scheduler to end the task and then immediately asked it to start again, on the assumption that ending a task completes synchronously. It does not. The start request arrived while the scheduler still considered the old instance to be running, and because the task is configured to ignore a new instance while one is active, the request was silently discarded — leaving the old process gone, no new one started, and the task sitting idle. Restart now waits for the scheduler to report the task as no longer running before starting it again, and says so plainly if that wait times out instead of reporting a success it cannot confirm.
+
+- **Selecting a session on Windows now raises the muxplex window instead of only flashing its taskbar button.** Windows refuses foreground changes requested by a background process, which is why the previous attempt could only flash the button. Microsoft documents that the restriction is lifted when the ALT key is pressed, so the sidecar now briefly signals ALT immediately before making the request. Nothing about the machine's settings is changed to achieve this. As before, the result is confirmed afterwards rather than assumed, and a failure to raise the window is recorded honestly.
+
+### Verification
+
+- 642 tests passed via pytest (baseline 629 + 13 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.2 (2026-07-28)
 
 ### Bug Fixes
