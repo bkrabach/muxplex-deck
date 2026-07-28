@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.9.5 (2026-07-28)
+
+### Bug Fixes
+
+- **`config set` no longer reports success while storing a value the tool cannot read back.** Setting a value inferred its type from the existing default, and any type the check didn't recognise fell through to storing the raw text as given — then printed success. No shipped setting could trigger it, but the next structured setting would have, and the file would have been quietly corrupted. Unsupported types are now refused with an explanation naming the type, before anything is written.
+
+### Internal
+
+- **Regression tests for a recurring class of defect.** Five separate releases this month fixed variations of one underlying mistake: a command reporting state it had not actually verified — trusting a value from the wrong source, trusting a value it never read, or reporting an in-progress state with no way to resolve. Three checks now guard the shape rather than the individual bugs: every command-line option must be read where commands are dispatched, every waiting loop must be bounded and able to give up, and the identifier used to decide whether the sidecar is running must come from the sidecar itself. Each check discovers what to inspect rather than working from a fixed list, so the same mistake in new code is caught too.
+
+### Verification
+
+- 681 tests passed via pytest (baseline 656 + 25 new regression tests across three modules).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.4 (2026-07-28)
 
 ### Bug Fixes
