@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.9.0 (2026-07-28)
+
+### Features
+
+- **Only one copy of the sidecar can run at a time.** Two copies competing for the same Stream Deck and the same status file produced a state that could not resolve: each wrote its own status, and `status` compared whichever wrote last against whichever the service manager reported, so it reported "waiting on the running process" indefinitely while the deck itself worked fine. A second copy now detects the first and exits immediately with a clear message, before touching the device or the server. The check asks the operating system directly rather than recording a process id in a file, so it clears the instant the first copy is gone by any means — clean exit, termination, or crash — and a restart is never blocked by a stale record.
+
+- **On Windows, selecting a session brings the muxplex window to the foreground**, matching the behaviour that already existed on macOS — including pressing the already-selected session purely to raise the window. Windows can refuse a foreground change requested by a background process, and will sometimes report success while only flashing the taskbar button, so the result is confirmed after the fact and a failure is recorded honestly rather than reported as success.
+
+### Bug Fixes
+
+- **Mistyped commands now explain themselves in the same format as everything else, and suggest what you probably meant.** Argument errors were the one path still emitting raw parser output — a wall of usage text ending in a list of valid choices — which is exactly the moment a clear next step matters most. A close match is now offered as the action (`muxplex-deck server status` suggests `muxplex-deck service status`, keeping the rest of the command intact), and when nothing is close the fallback points at `--help` rather than inventing a suggestion.
+
+- **The sidecar no longer dies silently when it cannot open its log file.** Opening the log was the first thing it did and was unguarded, so any failure there killed the process before a single line could be written — and with no console attached, that left no diagnostic anywhere at all. It now falls back through a plain file, then standard error, then no logging, rather than exiting.
+
+### Verification
+
+- 611 tests passed via pytest (baseline 572 + 39 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.8.0 (2026-07-27)
 
 ### Features
