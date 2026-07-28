@@ -132,7 +132,9 @@ def _isolate_config_default_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 @pytest.fixture(autouse=True)
 def _isolate_service_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Redirect every systemd/launchd path constant under a per-test tmp dir.
+    """Redirect every systemd/launchd/Windows service identifier under a
+
+    per-test tmp dir or unique name.
 
     ``service.py`` computes ``_SYSTEMD_UNIT_DIR``/``_SYSTEMD_UNIT_PATH``/
     ``_LAUNCHD_PLIST_DIR``/``_LAUNCHD_PLIST_PATH`` from ``Path.home()`` at
@@ -143,6 +145,15 @@ def _isolate_service_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ``~/Library/LaunchAgents/`` -- and if a real muxplex-deck unit is
     already installed there, ``service_uninstall()`` would stop, disable,
     and delete it.
+
+    Windows' artifact is not a file but a REGISTERED SCHEDULED TASK, so
+    there is no path to redirect -- instead ``_WIN_TASK_NAME`` is
+    monkeypatched to a per-test-unique value. Rail 4 (subprocess
+    neutering) is the primary protection here (no real ``schtasks.exe``
+    ever runs from a test that doesn't opt in via
+    ``@pytest.mark.allow_real_subprocess``); this is belt-and-suspenders so
+    that even an opted-in test can't accidentally delete the developer's
+    own real ``muxplex-deck`` task by name.
     """
     try:
         import muxplex_deck.service as service_mod
@@ -164,6 +175,9 @@ def _isolate_service_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "_LAUNCHD_PLIST_PATH",
         launchd_dir / "com.muxplex-deck.plist",
         raising=False,
+    )
+    monkeypatch.setattr(
+        service_mod, "_WIN_TASK_NAME", f"muxplex-deck-test-{os.getpid()}", raising=False
     )
     yield
 

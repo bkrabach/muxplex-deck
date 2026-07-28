@@ -1,7 +1,8 @@
-"""muxplex_deck/service.py -- System service management (systemd on Linux, launchd on macOS).
+"""muxplex_deck/service.py -- System service management (systemd on Linux,
+launchd on macOS, Task Scheduler on Windows).
 
 Ported near 1:1 from muxplex's own `service.py` (see that repo's
-`muxplex/service.py`), with two sidecar-specific differences:
+`muxplex/service.py`), with sidecar-specific differences:
 
 1. ``Restart=always`` (not muxplex's ``on-failure``) + a ``loginctl
    enable-linger`` attempt on install -- this is a headless, always-on
@@ -12,11 +13,32 @@ Ported near 1:1 from muxplex's own `service.py` (see that repo's
    run via ``sudo``), so `service_install()` warns loudly with a
    copy-pasteable remediation block when no matching rule exists, rather
    than silently installing a service that will fail to open the device.
+3. Windows has no analog to a background *service* at all -- see
+   WINDOWS_NATIVE_SPEC.md section 1 for why a real Windows Service is
+   disqualified (admin-only registration, LocalSystem's wrong `%USERPROFILE%`
+   or a stored password for a named account) and why an at-logon Task
+   Scheduler task in the interactive user's own context is used instead.
 
-`service_install()`/`service_uninstall()` narrate every step they take
-(unit/plist path, enable/start, resulting status) using the same ✓/!
-2-space-indent style as `cli.doctor()` -- a silent success path left a real
-user unsure whether `service install` had done anything at all.
+``service_install()``/``service_uninstall()``/``service_start()``/
+``service_restart()`` all narrate what they did through `report.py`'s
+VERDICT/STATE/ACTION renderer -- the same one `cli.doctor()`/`cli.status()`
+use (v0.7.0). This module used to print step-by-step progress with a local
+2-space-indent style as each subprocess call completed; it now collects a
+`report.Check` per step and renders ONE report at the end, for the same
+reason `doctor`/`status` do: one coherent, paste-friendly report beats a
+scroll of print statements, and it is the only way a Windows implementation
+with nothing resembling ``systemctl status``'s own formatting can present
+itself consistently with the other two platforms. `service_stop()` and
+`service_logs()` are unchanged in kind: `stop` was always silent (nothing of
+ours to narrate) and `logs` is -- and remains -- a raw passthrough stream
+(`journalctl -f` / `tail -f` / Windows' `Get-Content -Wait`). `service_status()`
+keeps macOS/Linux's raw passthrough to `launchctl print` / `systemctl status`
+(deliberately -- their own output carries more detail than we could
+reconstruct, and it is display-only, never parsed for a decision); Windows'
+`service_status()` has no analogous rich external command to shell out to
+(`schtasks /Query /V` is explicitly rejected -- see WINDOWS_NATIVE_SPEC.md
+section 1.6 -- because its output is localized and verbose) so it renders
+its own report natively.
 
 `launchctl bootstrap` idempotency: unlike `systemctl start` (idempotent --
 starting an already-active unit just succeeds), `launchctl bootstrap` exits
@@ -42,7 +64,9 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import config as config_mod
 
@@ -83,8 +107,21 @@ _LAUNCHD_BOOTOUT_TIMEOUT_SECONDS = 5.0
 # exited). `restart` polls for a status write from the NEW process (by pid,
 # via `service_main_pid()`) before reporting success, bounded so a genuinely
 # slow-starting sidecar can't hang the command forever.
-_RESTART_STATUS_POLL_INTERVAL_SECONDS = 0.2
-_RESTART_STATUS_TIMEOUT_SECONDS = 5.0
+#
+# Windows-specific timing: `_win_task_query()` shells out to `powershell.exe`
+# (~200-400ms per spawn, versus a direct `systemctl`/`launchctl` call), so
+# the same 0.2s/5s budget on POSIX would poll too aggressively and time out
+# too early on Windows. WINDOWS_NATIVE_SPEC.md section 1.4 recommends 0.5s/
+# 10s (20 polls) there instead. Set once at import time from `sys.platform`;
+# `_wait_for_fresh_status()` re-reads these module globals at call/loop time
+# (not as bound default arguments), so tests can still monkeypatch them
+# directly regardless of which platform default was picked at import.
+if sys.platform == "win32":
+    _RESTART_STATUS_POLL_INTERVAL_SECONDS = 0.5
+    _RESTART_STATUS_TIMEOUT_SECONDS = 10.0
+else:
+    _RESTART_STATUS_POLL_INTERVAL_SECONDS = 0.2
+    _RESTART_STATUS_TIMEOUT_SECONDS = 5.0
 
 # Elgato Stream Deck USB vendor id -- used to detect an existing udev rule.
 _ELGATO_VENDOR_ID = "0fd9"
@@ -139,29 +176,100 @@ _LAUNCHD_PLIST_TEMPLATE = """\
 </plist>
 """
 
+# Windows Task Scheduler task name, root folder ("\\muxplex-deck"). Kept as
+# a module-level variable (not a plain constant) so tests can monkeypatch it
+# to a per-test-unique value -- see conftest.py's Rail 2 extension -- and so
+# a real developer machine's own registered task is never at risk from a
+# test that forgets to mock `subprocess.run` (Rail 4 is the primary guard;
+# this is belt-and-suspenders for the identifier itself).
+_WIN_TASK_NAME = "muxplex-deck"
 
-# Same glyph vocabulary as `report.py` (see that module's docstring): "+"
-# for fine, becoming a UTF-8 checkmark only when the environment can render
-# one. This install/uninstall narration is step-by-step progress output,
-# not a VERDICT/STATE/ACTION report -- it intentionally keeps its own
-# simple 2-space-indent style rather than adopting the full column ladder,
-# but shares the same glyph-substitution rule so the visual language is
-# consistent across `doctor`/`status`/`service`. No ANSI color: plain text
-# only, so this stays byte-identical whether printed to a TTY or piped.
-def _mark_ok() -> str:
-    from . import report
+# Schedule.Service COM API's TASK_STATE_RUNNING enum value (verified against
+# the Task Scheduler Schema documentation -- NOT executed on real hardware,
+# see this change's real-hardware sign-off checklist).
+_WIN_TASK_STATE_RUNNING = 4
 
-    return report._glyph_char(report.FINE, utf8=report.utf8_capable())
+_WIN_QUERY_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
+# One PowerShell/COM query answers `is_installed`/`is_active`/`main_pid` at
+# once -- see WINDOWS_NATIVE_SPEC.md section 1.4 for why this must be COM
+# (`Schedule.Service`) and never `schtasks /Query` text: `schtasks`' console
+# output is LOCALIZED ("Status:"/"Running" are translated on non-English
+# Windows), so parsing it for a correctness-critical predicate would silently
+# break on any non-English machine. `.format()`-escaped literal braces
+# (`{{`/`}}`) are PowerShell script-block delimiters, not template fields.
+_WIN_TASK_QUERY_SCRIPT_TEMPLATE = (
+    "$s = New-Object -ComObject Schedule.Service; $s.Connect(); "
+    "try {{ $t = $s.GetFolder('\\').GetTask('{task_name}') }} "
+    "catch {{ 'MISSING'; exit }} "
+    "$p = 0; foreach ($i in $t.GetInstances(0)) {{ $p = $i.EnginePID }} "
+    "'OK ' + $t.State + ' ' + $p"
+)
 
-def _step_ok(message: str) -> None:
-    print(f"  {_mark_ok()}  {message}")
-
-
-def _step_warn(message: str) -> None:
-    from . import report
-
-    print(f"  {report.ACT}  {message}")
+# WINDOWS_NATIVE_SPEC.md section 1.2 -- every setting here is load-bearing,
+# not decorative:
+#   - LogonTrigger + UserId: no stored password, `~` resolves to the real
+#     user's profile (not LocalSystem's wrong one).
+#   - Repetition PT1M + MultipleInstancesPolicy IgnoreNew: ONE restart
+#     mechanism that covers every death mode (hang, hard kill, clean exit),
+#     unlike `<RestartOnFailure>` which only fires on a nonzero exit.
+#   - ExecutionTimeLimit PT0S: the default is 3 DAYS, after which Task
+#     Scheduler kills the task outright -- a sidecar that silently dies
+#     after 72h is worse than one that never started.
+#   - DisallowStartIfOnBatteries=false / StopIfGoingOnBatteries=false: both
+#     default to true, which would refuse to start (or kill mid-session) on
+#     a laptop running on battery.
+#   - LogonType InteractiveToken + RunLevel LeastPrivilege: registration in
+#     one's own context needs no admin, and this never elevates.
+_WIN_TASK_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>muxplex-deck -- drives an Elgato Stream Deck against a muxplex server</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user_id}</UserId>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user_id}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{pythonw_path}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +282,11 @@ def _is_darwin() -> bool:
     return sys.platform == "darwin"
 
 
+def _is_windows() -> bool:
+    """Return True if running on native Windows."""
+    return sys.platform == "win32"
+
+
 def _have_systemctl() -> bool:
     """Return True if systemctl is on PATH (gates all systemd service operations)."""
     return shutil.which("systemctl") is not None
@@ -182,10 +295,9 @@ def _have_systemctl() -> bool:
 def service_manager_available() -> bool:
     """Whether ANY supported service manager exists on this machine.
 
-    True on macOS (launchd) and Linux with systemd; False on native
-    Windows today (Task Scheduler support is a separate, not-yet-built
-    increment -- see WINDOWS_NATIVE_SPEC.md section 1) and on any Linux
-    without `systemctl` (containers, minimal distros).
+    True on macOS (launchd), native Windows (Task Scheduler, at-logon --
+    see WINDOWS_NATIVE_SPEC.md section 1), and Linux with systemd; False on
+    any Linux without `systemctl` (containers, minimal distros).
 
     Callers that are about to OFFER `service install` -- not merely
     dispatch to it -- must check this first and skip the offer entirely
@@ -194,7 +306,7 @@ def service_manager_available() -> bool:
     is the same class of bug as the v0.5.2 crash-loop incident: presenting
     an action that provably cannot succeed on this machine (see AGENTS.md).
     """
-    return _is_darwin() or _have_systemctl()
+    return _is_darwin() or _is_windows() or _have_systemctl()
 
 
 def _resolve_muxplex_deck_bin() -> str:
@@ -258,193 +370,65 @@ def udev_rule_exists() -> bool:
     return False
 
 
-def _print_guidance_block(message: str) -> None:
-    """Print a multi-line guidance message in `print_check`'s ✓/! style.
+def _udev_install_check() -> Any | None:
+    """Build the install report's "udev" `Check`, or `None` if there's nothing to say.
 
-    First line gets the warn mark + 2-space indent; continuation lines
-    get a bare 4-space indent -- the same convention `cli.print_check`
-    uses (kept as a small local duplicate here to avoid a circular import
-    with `cli.py`).
+    Replaces the old `_warn_if_no_udev_rule()` (which printed directly) --
+    same branching, but returns a `report.Check` for the caller to fold
+    into the single end-of-command report instead of printing mid-flight.
+
+    `None` when a rule already exists, and (matching the previous
+    behavior exactly) when udev isn't live and this isn't WSL: the U-DEAD
+    guidance -- if any -- still comes from `explain_environment()` calls
+    elsewhere (e.g. `doctor()`), never duplicated here. `hidhelp.udev_guidance()`
+    itself returns `None` both when udev isn't actually running (never
+    print a command known to fail here) and on WSL (the reload can report
+    success there while the rule still never fires for a usbip-attached
+    device -- see AGENTS.md "U7"); on WSL this falls back to the proven
+    per-attach `chown` guidance from `explain_environment()` instead of the
+    raw udev block.
     """
     from . import report
 
-    for i, line in enumerate(message.splitlines()):
-        prefix = f"  {report.ACT} " if i == 0 else "    "
-        print(f"{prefix}{line}")
-
-
-def _warn_if_no_udev_rule() -> None:
-    """Print the udev remediation block (non-fatal) if no rule is present.
-
-    Delegates the actual guidance text to `hidhelp.udev_guidance()` -- the
-    single home for this string (see WSL_COLD_START_SPEC.md P6). That
-    function now returns `None` both when udev isn't actually running
-    (P4: never print a command known to fail here) and when this is WSL
-    (the reload can report success there while the rule still never
-    fires for a usbip-attached device -- see AGENTS.md "U7"; a real WSL
-    user followed this exact block and lost ~40 minutes). On a healthy
-    non-WSL platform this prints nothing, exactly as before. On WSL,
-    show the environment-appropriate guidance instead (the proven
-    per-attach `chown`) rather than leaving the user with nothing.
-    """
     if udev_rule_exists():
-        return
+        return None
     from . import hidhelp
 
     guidance = hidhelp.udev_guidance()
     if guidance is not None:
-        _print_guidance_block(guidance.message)
-        return
+        return report.Check("udev", report.ACT, guidance.message)
 
     from . import wsl as wsl_mod
 
     if wsl_mod.detect().is_wsl:
-        _print_environment_guidance()
+        env_guidances = hidhelp.explain_environment()
+        if env_guidances:
+            combined = "\n".join(g.message for g in env_guidances)
+            return report.Check("udev", report.ACT, combined)
+
+    return None
 
 
-def _print_environment_guidance() -> None:
-    """Print any WSL / permission guidance relevant to this environment.
-
-    Read-only: only queries (e.g. `usbipd.exe list`), never mutates --
-    `service install` may observe the environment but must never attach a
-    device (see WSL_COLD_START_SPEC.md section 6.2). Prints nothing on a
-    healthy platform (macOS, or native Linux with udev running) -- this is
-    what keeps output unchanged for those users.
-    """
-    from . import hidhelp
-
-    for guidance in hidhelp.explain_environment():
-        print()
-        _print_guidance_block(guidance.message)
-
-
-def service_is_active() -> bool:
-    """Best-effort: is the muxplex-deck service currently active/running?
-
-    Public (moved here from `cli._service_is_active`) so both `cli.update()`
-    and `cli.check_hid_openable()` share one implementation -- the latter
-    needs it to distinguish "our own service holds the device" (expected,
-    not a failure) from a genuine HID-permission problem. Never raises:
-    a missing service manager or a not-installed service both read as
-    "not active", which is the correct doctor/status answer either way.
-    """
-    if _is_darwin():
-        uid = os.getuid()
-        try:
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
-            return False
-        return result.returncode == 0
-
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "is-active", "muxplex-deck"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return False
-    return result.returncode == 0
-
-
-def service_main_pid() -> int | None:
-    """Best-effort PID of the currently-running muxplex-deck service process.
-
-    Never raises -- matches `service_is_active()`'s contract: any failure
-    (service manager missing, service not running, unexpected/unparseable
-    output) reads as "cannot determine", which callers must treat as "don't
-    know", never as a false positive or negative on its own.
-
-    This is what lets `status()` (and `_wait_for_fresh_status()` below) tell
-    whether a published `status.json` (`statusfile.build_status()`'s own
-    `pid` field) was written by the process running RIGHT NOW under the
-    service, or by a PREVIOUS incarnation whose last write can look
-    deceptively fresh by age alone -- see the restart-race incident in
-    AGENTS.md: the old process's last write happened moments before it
-    exited, so an age-only staleness check saw it as "recent" and reported
-    it as current truth. Comparing pids is the only way to tell those apart.
-    """
-    if _is_darwin():
-        uid = os.getuid()
-        try:
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
-            return None
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("pid = "):
-                try:
-                    return int(stripped[len("pid = ") :].strip())
-                except ValueError:
-                    return None
-        return None
-
-    try:
-        result = subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "show",
-                "muxplex-deck",
-                "--property=MainPID",
-                "--value",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        pid = int(result.stdout.strip())
-    except ValueError:
-        return None
-    return pid if pid > 0 else None
-
-
-def service_is_installed() -> bool:
-    """Is the muxplex-deck unit/plist file present on disk?
-
-    Independent of `service_is_active()` -- a service that is installed but
-    crash-looping (or simply stopped) is still installed. `doctor`'s
-    `check_service_status` used to conflate "not active" with "not
-    installed" and recommend `service install` for a service that was
-    already installed and failing; this is the file-existence half of the
-    fix (see AGENTS.md for the incident: 1113 restarts, then told to
-    "install" a service that was already there).
-    """
-    if _is_darwin():
-        return _LAUNCHD_PLIST_PATH.exists()
-    return _SYSTEMD_UNIT_PATH.exists()
-
-
-def _enable_linger() -> None:
+def _enable_linger() -> Any:
     """Best-effort `loginctl enable-linger` so the service survives logout.
 
-    muxplex has no analog to this -- it's a normal user-triggered server, not
-    a headless always-on sidecar. Failure (no loginctl, no systemd-logind,
-    permission denied) is reported but never fatal to install.
+    Returns a `report.Check` for the install report instead of printing
+    directly (see the module docstring on the report-based narration
+    rewrite). muxplex has no analog to this -- it's a normal
+    user-triggered server, not a headless always-on sidecar. Failure (no
+    loginctl, no systemd-logind, permission denied) is reported but never
+    fatal to install.
     """
+    from . import report
+
     if shutil.which("loginctl") is None:
-        print("  ! loginctl not found -- skipping enable-linger (service may")
-        print("    stop when you log out; install systemd-logind or enable")
-        print("    lingering manually if this is a headless always-on box)")
-        return
+        return report.Check(
+            "linger",
+            report.ACT,
+            "loginctl not found -- skipping enable-linger (service may stop "
+            "when you log out; install systemd-logind or enable lingering "
+            "manually if this is a headless always-on box)",
+        )
     user = getpass.getuser()
     result = subprocess.run(
         ["loginctl", "enable-linger", user],
@@ -453,23 +437,118 @@ def _enable_linger() -> None:
         check=False,
     )
     if result.returncode == 0:
-        print(f"  Linger enabled for {user} (service survives logout)")
-    else:
-        print(f"  ! Could not enable linger for {user}: {result.stderr.strip()}")
-        print("    The service may stop when you log out of this session.")
+        return report.Check(
+            "linger",
+            report.FINE,
+            f"Linger enabled for {user} (service survives logout)",
+        )
+    return report.Check(
+        "linger",
+        report.ACT,
+        f"Could not enable linger for {user}: {result.stderr.strip()} -- "
+        "the service may stop when you log out of this session.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report-based narration -- shared by systemd/launchd/Windows install,
+# uninstall, start, and restart. See the module docstring for why this
+# replaced the old print-as-you-go `_step_ok`/`_step_warn` style.
+# ---------------------------------------------------------------------------
+
+
+def _failure_check(
+    tool: str, action: str, result: subprocess.CompletedProcess[str]
+) -> Any:
+    """Build an ACT `Check` from a genuine (non-idempotent) command failure.
+
+    The underlying tool's own stderr is folded into the Check's value
+    (which may be multi-line -- `report.format_check_line` wraps/hangs
+    multi-line values correctly) so the real diagnostic stays visible,
+    exactly as it was when this printed straight to stderr.
+    """
+    from . import report
+
+    stderr = (result.stderr or "").strip()
+    value = f"{tool} {action} failed (exit {result.returncode})"
+    if stderr:
+        value = f"{value}\n{stderr}"
+    return report.Check("service", report.ACT, value)
+
+
+def _restart_result_check(success_message: str) -> Any:
+    """Build the final restart `Check`: success only once fresh status is
+
+    actually observed, otherwise an honest "still waiting" warning. Shared
+    by systemd/launchd/Windows so all three platforms make the same
+    promise: never claim a step (the new process being up and reporting)
+    that was not actually verified -- see AGENTS.md's restart-race
+    incident, which this directly closes.
+    """
+    from . import report
+
+    if _wait_for_fresh_status():
+        return report.Check("service", report.FINE, success_message)
+    return report.Check(
+        "service",
+        report.ACT,
+        "Restart command sent, but the service has not published fresh "
+        f"status within {_RESTART_STATUS_TIMEOUT_SECONDS:.0f}s -- it may "
+        "still be starting. run: muxplex-deck status",
+    )
+
+
+def _service_decision(check: Any) -> Any:
+    """Build the ACTION decision for a service report's first act-now check."""
+    from . import report
+
+    if check.subject == "config":
+        return report.Decision(
+            commands=["muxplex-deck init"],
+            prose="Creates the config so the service can start without crash-looping.",
+        )
+    command = report.extract_run_command(check.value)
+    if command:
+        return report.Decision(commands=[command])
+    return report.Decision(commands=[], prose=check.value)
+
+
+def _build_service_action(collapsed: list[Any]) -> list[str] | None:
+    from . import report
+
+    act_items = [c for c in collapsed if c.glyph == report.ACT]
+    if not act_items:
+        return None
+    overflow = None
+    if len(act_items) > 1:
+        overflow = f"{len(act_items) - 1} more after this -- rerun the command."
+    action = report.Action(
+        decision=_service_decision(act_items[0]), overflow_note=overflow
+    )
+    return report.render_action(action)
+
+
+def _render_service_report(items: list[Any]) -> None:
+    """Render ONE VERDICT/STATE/ACTION report for a service command and print it.
+
+    Shared by install/uninstall/start/restart on all three platforms --
+    see the module docstring. Reuses `report.verdict_readiness()` (the same
+    "Ready."/"Not ready -- N things to do." phrasing `doctor()` uses)
+    rather than inventing a bespoke verdict vocabulary per verb.
+    """
+    from . import report
+
+    collapsed = report.collapsed_checks(items)
+    action_count = report.count_actions([c.glyph for c in collapsed])
+    verdict = report.verdict_readiness(action_count)
+    state_lines = report.render_items(items, show_all=False, utf8=report.utf8_capable())
+    action_lines = _build_service_action(collapsed)
+    sys.stdout.write(report.render(verdict, state_lines, action_lines))
 
 
 # ---------------------------------------------------------------------------
 # Private implementations -- systemd (Linux)
 # ---------------------------------------------------------------------------
-
-
-def _print_next_steps() -> None:
-    print()
-    print("  Next:")
-    print("    muxplex-deck status        -- see connected hardware + connection state")
-    print("    muxplex-deck service logs  -- tail live logs")
-    print()
 
 
 def _config_ready() -> tuple[bool, str | None]:
@@ -479,10 +558,10 @@ def _config_ready() -> tuple[bool, str | None]:
     `ExecStart` (`... run`, no `--config` flag) will call at startup, so
     "ready to install" and "ready to run" can never diverge. A config that
     fails this check would make the service crash immediately once
-    started, and `Restart=always` (`KeepAlive` on launchd) would then
-    restart it every few seconds forever -- see the `service install`
-    crash-loop incident in AGENTS.md (1113 restarts on a fresh machine
-    with no config yet).
+    started, and `Restart=always` (`KeepAlive` on launchd, the `IgnoreNew`
+    repetition trigger on Windows) would then restart it every few seconds
+    forever -- see the `service install` crash-loop incident in AGENTS.md
+    (1113 restarts on a fresh machine with no config yet).
     """
     try:
         config_mod.load_config(None)
@@ -491,20 +570,10 @@ def _config_ready() -> tuple[bool, str | None]:
     return True, None
 
 
-def _print_config_not_ready(config_error: str | None) -> None:
-    """Explain why install is stopping short of enabling/starting the service."""
-    _print_guidance_block(
-        "Not enabling or starting yet -- configuration is incomplete:\n"
-        + (config_error or "unknown configuration error")
-    )
-    print()
-    print("  Run muxplex-deck init to create it, then run this command again:")
-    print("    muxplex-deck service install")
-    print()
-
-
 def _systemd_install() -> None:
-    print("\nmuxplex-deck service install (systemd --user)\n")
+    from . import report
+
+    items: list[Any] = []
 
     bin_path = _resolve_muxplex_deck_bin()
     safe_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -514,10 +583,14 @@ def _systemd_install() -> None:
     )
     _SYSTEMD_UNIT_DIR.mkdir(parents=True, exist_ok=True)
     _SYSTEMD_UNIT_PATH.write_text(unit_content)
-    _step_ok(f"Wrote unit file: {_SYSTEMD_UNIT_PATH}")
+    items.append(
+        report.Check("unit", report.FINE, f"Wrote unit file: {_SYSTEMD_UNIT_PATH}")
+    )
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    _step_ok("Reloaded the systemd user daemon")
+    items.append(
+        report.Check("daemon", report.FINE, "Reloaded the systemd user daemon")
+    )
 
     # Never enable/start a unit whose config we already know will make it
     # crash on launch -- see `_config_ready()`. The unit file above is
@@ -525,71 +598,78 @@ def _systemd_install() -> None:
     # gated.
     config_ready, config_error = _config_ready()
     if not config_ready:
-        _print_config_not_ready(config_error)
+        items.append(
+            report.Check(
+                "config", report.ACT, config_error or "unknown configuration error"
+            )
+        )
+        _render_service_report(items)
         return
 
     subprocess.run(
         ["systemctl", "--user", "enable", "--now", "muxplex-deck"], check=True
     )
-    _step_ok("Enabled + started the service")
+    items.append(report.Check("enable", report.FINE, "Enabled + started the service"))
 
-    _enable_linger()
-    _warn_if_no_udev_rule()
+    items.append(_enable_linger())
+    udev_item = _udev_install_check()
+    if udev_item is not None:
+        items.append(udev_item)
 
     if service_is_active():
-        _step_ok("Service is running")
+        items.append(report.Check("service", report.FINE, "Service is running"))
     else:
-        _step_warn(
-            "Service was started but is not reporting active -- check: "
-            "muxplex-deck service logs"
+        items.append(
+            report.Check(
+                "service",
+                report.ACT,
+                "Service was started but is not reporting active -- run: "
+                "muxplex-deck service logs",
+            )
         )
 
-    _print_next_steps()
+    _render_service_report(items)
 
 
 def _systemd_uninstall() -> None:
-    print("\nmuxplex-deck service uninstall (systemd --user)\n")
+    from . import report
+
+    items: list[Any] = []
 
     result = subprocess.run(
         ["systemctl", "--user", "stop", "muxplex-deck"], check=False
     )
-    if result.returncode == 0:
-        _step_ok("Stopped the service")
-    else:
-        _step_warn("Service was not running (nothing to stop)")
+    items.append(
+        report.Check(
+            "stop",
+            report.FINE,
+            "Stopped the service"
+            if result.returncode == 0
+            else "Service was not running (nothing to stop)",
+        )
+    )
 
     subprocess.run(["systemctl", "--user", "disable", "muxplex-deck"], check=False)
-    _step_ok("Disabled the service")
+    items.append(report.Check("disable", report.FINE, "Disabled the service"))
 
     had_unit = _SYSTEMD_UNIT_PATH.exists()
     _SYSTEMD_UNIT_PATH.unlink(missing_ok=True)
-    _step_ok(
-        f"Removed unit file: {_SYSTEMD_UNIT_PATH}"
-        if had_unit
-        else "Unit file already absent"
+    items.append(
+        report.Check(
+            "unit",
+            report.FINE,
+            f"Removed unit file: {_SYSTEMD_UNIT_PATH}"
+            if had_unit
+            else "Unit file already absent",
+        )
     )
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    _step_ok("Reloaded the systemd user daemon")
-    print()
-
-
-def _report_systemctl_failure(
-    action: str, result: subprocess.CompletedProcess[str]
-) -> None:
-    """Print systemctl's own diagnostics for a genuine (non-idempotent) failure.
-
-    The most common ordinary-user trigger here is running `start`/`restart`
-    before `install` (unit not found) -- a real failure, but one that should
-    surface as a clear message, not a raw `CalledProcessError` traceback.
-    """
-    stderr = (result.stderr or "").strip()
-    print(
-        f"  ERROR: systemctl {action} failed (exit {result.returncode})",
-        file=sys.stderr,
+    items.append(
+        report.Check("daemon", report.FINE, "Reloaded the systemd user daemon")
     )
-    if stderr:
-        print(f"    {stderr}", file=sys.stderr)
+
+    _render_service_report(items)
 
 
 def _systemd_start() -> None:
@@ -599,14 +679,20 @@ def _systemd_start() -> None:
         text=True,
         check=False,
     )
+    from . import report
+
     if result.returncode == 0:
-        _step_ok("Started the service")
+        _render_service_report(
+            [report.Check("service", report.FINE, "Started the service")]
+        )
     else:
-        _report_systemctl_failure("start", result)
+        _render_service_report([_failure_check("systemctl", "start", result)])
         sys.exit(1)
 
 
 def _systemd_stop() -> None:
+    # No narration -- this was always silent (nothing of ours to report),
+    # and stays that way for consistency with launchd/Windows.
     subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"], check=False)
 
 
@@ -641,25 +727,6 @@ def _wait_for_fresh_status(timeout: float | None = None) -> bool:
         time.sleep(_RESTART_STATUS_POLL_INTERVAL_SECONDS)
 
 
-def _report_restart_result(success_message: str) -> None:
-    """Print the final restart line: success only once fresh status is
-    actually observed, otherwise an honest "still waiting" warning.
-
-    Shared by systemd and launchd so both platforms make the same promise:
-    never print a success line for a step (the new process being up and
-    reporting) that was not actually verified -- see AGENTS.md's restart-
-    race incident, which this directly closes.
-    """
-    if _wait_for_fresh_status():
-        _step_ok(success_message)
-    else:
-        _step_warn(
-            "Restart command sent, but the service has not published fresh "
-            f"status within {_RESTART_STATUS_TIMEOUT_SECONDS:.0f}s -- it may "
-            "still be starting. Check: muxplex-deck status"
-        )
-
-
 def _systemd_restart() -> None:
     # `systemctl restart` is a single atomic transaction (unlike launchd's
     # separate bootout + bootstrap), so it needs no unload-race handling --
@@ -672,13 +739,18 @@ def _systemd_restart() -> None:
         check=False,
     )
     if result.returncode != 0:
-        _report_systemctl_failure("restart", result)
+        _render_service_report([_failure_check("systemctl", "restart", result)])
         sys.exit(1)
 
-    _report_restart_result("Restarted the service")
+    _render_service_report([_restart_result_check("Restarted the service")])
 
 
 def _systemd_status() -> None:
+    # Raw passthrough of systemctl's own (richer) status output --
+    # deliberately NOT converted to the report renderer. See the module
+    # docstring: this is display-only, never parsed for a decision, and
+    # carries detail (enabled/loaded state, recent journal lines) we could
+    # not reconstruct without re-parsing it ourselves.
     subprocess.run(
         ["systemctl", "--user", "status", "muxplex-deck", "--no-pager"], check=False
     )
@@ -717,26 +789,6 @@ def _launchd_bootstrap() -> subprocess.CompletedProcess[str]:
     )
 
 
-def _report_launchctl_failure(
-    action: str, result: subprocess.CompletedProcess[str]
-) -> None:
-    """Print launchctl's own diagnostics for a genuine (non-idempotent) failure.
-
-    Only the well-known "already loaded" exit code is treated as benign by
-    callers; every other nonzero exit prints launchctl's own stderr (which
-    already includes its "re-run as root for richer errors" hint) so the
-    real failure is still visible -- just as a clear message instead of an
-    unhandled `CalledProcessError` traceback.
-    """
-    stderr = (result.stderr or "").strip()
-    print(
-        f"  ERROR: launchctl {action} failed (exit {result.returncode})",
-        file=sys.stderr,
-    )
-    if stderr:
-        print(f"    {stderr}", file=sys.stderr)
-
-
 def _wait_for_launchd_unload(timeout: float | None = None) -> bool:
     """Poll until the launchd job is no longer loaded, or `timeout` elapses.
 
@@ -764,7 +816,9 @@ def _wait_for_launchd_unload(timeout: float | None = None) -> bool:
 
 
 def _launchd_install() -> None:
-    print("\nmuxplex-deck service install (launchd)\n")
+    from . import report
+
+    items: list[Any] = []
 
     bin_args = _resolve_bin_for_launchd()
     argv = [*bin_args, "run"]
@@ -781,7 +835,9 @@ def _launchd_install() -> None:
     )
     _LAUNCHD_PLIST_DIR.mkdir(parents=True, exist_ok=True)
     _LAUNCHD_PLIST_PATH.write_text(plist_content)
-    _step_ok(f"Wrote plist: {_LAUNCHD_PLIST_PATH}")
+    items.append(
+        report.Check("plist", report.FINE, f"Wrote plist: {_LAUNCHD_PLIST_PATH}")
+    )
 
     # Never bootstrap (load + start) a job whose config we already know will
     # make it crash on launch -- see `_config_ready()`. `KeepAlive` would
@@ -789,61 +845,105 @@ def _launchd_install() -> None:
     # have on disk either way; only the "make it run" step is gated.
     config_ready, config_error = _config_ready()
     if not config_ready:
-        _print_config_not_ready(config_error)
+        items.append(
+            report.Check(
+                "config", report.ACT, config_error or "unknown configuration error"
+            )
+        )
+        _render_service_report(items)
         return
 
     result = _launchd_bootstrap()
     if result.returncode == 0:
-        _step_ok("Loaded + started the service (launchctl bootstrap)")
+        items.append(
+            report.Check(
+                "service",
+                report.FINE,
+                "Loaded + started the service (launchctl bootstrap)",
+            )
+        )
     elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
-        _step_ok(
-            "Service was already loaded -- plist rewritten; run "
-            "`muxplex-deck service restart` to apply changes"
+        items.append(
+            report.Check(
+                "service",
+                report.FINE,
+                "Was already loaded -- plist rewritten; run: muxplex-deck service restart",
+            )
         )
     else:
-        _report_launchctl_failure("bootstrap", result)
+        items.append(_failure_check("launchctl", "bootstrap", result))
 
     if service_is_active():
-        _step_ok("Service is running")
+        items.append(report.Check("running", report.FINE, "Service is running"))
     else:
-        _step_warn(
-            "Service was started but is not reporting active -- check: "
-            "muxplex-deck service logs"
+        items.append(
+            report.Check(
+                "running",
+                report.ACT,
+                "Service was started but is not reporting active -- run: "
+                "muxplex-deck service logs",
+            )
         )
 
-    _print_next_steps()
+    _render_service_report(items)
 
 
 def _launchd_uninstall() -> None:
-    print("\nmuxplex-deck service uninstall (launchd)\n")
+    from . import report
+
+    items: list[Any] = []
 
     uid = os.getuid()
     result = subprocess.run(
         ["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False
     )
-    if result.returncode == 0:
-        _step_ok("Stopped + unloaded the service")
-    else:
-        _step_warn("Service was not loaded (nothing to unload)")
+    items.append(
+        report.Check(
+            "stop",
+            report.FINE,
+            "Stopped + unloaded the service"
+            if result.returncode == 0
+            else "Service was not loaded (nothing to unload)",
+        )
+    )
 
     had_plist = _LAUNCHD_PLIST_PATH.exists()
     _LAUNCHD_PLIST_PATH.unlink(missing_ok=True)
-    _step_ok(
-        f"Removed plist: {_LAUNCHD_PLIST_PATH}"
-        if had_plist
-        else "Plist file already absent"
+    items.append(
+        report.Check(
+            "plist",
+            report.FINE,
+            f"Removed plist: {_LAUNCHD_PLIST_PATH}"
+            if had_plist
+            else "Plist file already absent",
+        )
     )
-    print()
+
+    _render_service_report(items)
 
 
 def _launchd_start() -> None:
+    from . import report
+
     result = _launchd_bootstrap()
     if result.returncode == 0:
-        _step_ok("Started the service (launchctl bootstrap)")
+        _render_service_report(
+            [
+                report.Check(
+                    "service", report.FINE, "Started the service (launchctl bootstrap)"
+                )
+            ]
+        )
     elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
-        _step_ok("Service was already running (nothing to start)")
+        _render_service_report(
+            [
+                report.Check(
+                    "service", report.FINE, "Was already running (nothing to start)"
+                )
+            ]
+        )
     else:
-        _report_launchctl_failure("bootstrap", result)
+        _render_service_report([_failure_check("launchctl", "bootstrap", result)])
         sys.exit(1)
 
 
@@ -853,11 +953,19 @@ def _launchd_stop() -> None:
 
 
 def _launchd_restart() -> None:
+    from . import report
+
+    items: list[Any] = []
+
     _launchd_stop()
     if not _wait_for_launchd_unload():
-        _step_warn(
-            f"Service did not fully unload within "
-            f"{_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS:.0f}s -- attempting restart anyway"
+        items.append(
+            report.Check(
+                "unload",
+                report.ACT,
+                f"Service did not fully unload within {_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS:.0f}s "
+                "-- attempting restart anyway",
+            )
         )
 
     result = _launchd_bootstrap()
@@ -866,13 +974,17 @@ def _launchd_restart() -> None:
     elif result.returncode == _LAUNCHD_ALREADY_LOADED_EXIT:
         success_message = "Service is running"
     else:
-        _report_launchctl_failure("bootstrap", result)
+        items.append(_failure_check("launchctl", "bootstrap", result))
+        _render_service_report(items)
         sys.exit(1)
 
-    _report_restart_result(success_message)
+    items.append(_restart_result_check(success_message))
+    _render_service_report(items)
 
 
 def _launchd_status() -> None:
+    # Raw passthrough of launchctl's own status output -- see
+    # `_systemd_status()`'s comment; the same reasoning applies here.
     uid = os.getuid()
     subprocess.run(["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False)
 
@@ -885,15 +997,445 @@ def _launchd_logs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Private implementations -- Task Scheduler (native Windows)
+#
+# See WINDOWS_NATIVE_SPEC.md section 1 for the full design rationale. In
+# short: a real Windows Service is disqualified before HID access is even
+# considered (S1: creating/deleting one needs admin; S2: it runs as
+# LocalSystem, whose %USERPROFILE% is the wrong home for ~/.config and the
+# federation key, or as a named account whose password would have to be
+# stored in the SCM; S3: Python needs pywin32's pythonservice.exe or a
+# third-party wrapper). A scheduled task registered in the CURRENT USER's
+# own context via `schtasks /Create /XML`, triggered at logon, needs no
+# admin and no stored password.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WinTaskInfo:
+    """One COM query's answer to all three service predicates at once."""
+
+    exists: bool
+    state: int | None
+    pid: int | None
+
+
+def _parse_win_task_query(stdout: str) -> WinTaskInfo:
+    """Parse `_win_task_query()`'s PowerShell output. Pure -- never raises.
+
+    Matches `service_main_pid()`'s existing never-raise contract: any
+    unparseable output (garbage, empty, a truncated line) reads as "cannot
+    determine" -- the conservative default of `exists=False` -- rather than
+    guessing. Handles, without raising: "MISSING", "OK 4 12345", "OK 3 0"
+    (state parses, pid 0 means no running instance -> None), garbage, and
+    an empty string.
+    """
+    text = (stdout or "").strip()
+    if not text.startswith("OK"):
+        return WinTaskInfo(exists=False, state=None, pid=None)
+    parts = text.split()
+    if len(parts) < 3:
+        return WinTaskInfo(exists=True, state=None, pid=None)
+    try:
+        state = int(parts[1])
+    except ValueError:
+        state = None
+    try:
+        pid_raw = int(parts[2])
+    except ValueError:
+        pid_raw = 0
+    return WinTaskInfo(exists=True, state=state, pid=pid_raw if pid_raw > 0 else None)
+
+
+def _win_task_query() -> WinTaskInfo:
+    """Query Task Scheduler via COM for existence/state/pid, all in one spawn.
+
+    Never raises: a missing `powershell.exe` or a subprocess timeout both
+    read as "not installed" (the same conservative default `_parse_win_task_query`
+    uses for unparseable output), never a false positive.
+    """
+    script = _WIN_TASK_QUERY_SCRIPT_TEMPLATE.format(task_name=_WIN_TASK_NAME)
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_WIN_QUERY_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return WinTaskInfo(exists=False, state=None, pid=None)
+    return _parse_win_task_query(result.stdout)
+
+
+def _resolve_pythonw() -> str:
+    """Resolve `pythonw.exe` next to `sys.executable`; fall back to `sys.executable`.
+
+    WINDOWS_NATIVE_SPEC.md section 1.2: `pythonw.exe` is the GUI-subsystem
+    interpreter (no console window) -- required, because the task runs in
+    the logged-on user's own interactive session and a console-subsystem
+    binary (the `muxplex-deck.exe` shim, or plain `sys.executable`) would
+    show a console window sitting on the desktop for the sidecar's whole
+    life. UNVERIFIED whether `pythonw.exe` actually exists inside a `uv
+    tool install` venv on Windows -- see this change's real-hardware
+    sign-off checklist, item 1. Never fails install over this: falls back
+    to `sys.executable` and lets the caller warn instead.
+    """
+    candidate = Path(sys.executable).with_name("pythonw.exe")
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+def _win_user_id() -> str:
+    """Best-effort `DOMAIN\\username` (or bare username) for the task's UserId."""
+    domain = os.environ.get("USERDOMAIN")
+    name = os.environ.get("USERNAME") or getpass.getuser()
+    return f"{domain}\\{name}" if domain else name
+
+
+def _win_default_log_path() -> Path:
+    """`<status_dir>/muxplex-deck.log` -- one state directory, not two.
+
+    `pythonw.exe` leaves `sys.stdout`/`sys.stderr` as `None`
+    (WINDOWS_NATIVE_SPEC.md section 1.5), so the task's `--log-file`
+    argument must point somewhere; alongside `status.json` keeps every bit
+    of this sidecar's runtime state in one place.
+    """
+    from . import statusfile
+
+    return statusfile.default_status_dir() / "muxplex-deck.log"
+
+
+def _win_task_xml_path() -> Path:
+    """Where the generated Task Scheduler XML is written, for `schtasks /Create /XML`."""
+    from . import statusfile
+
+    return statusfile.default_status_dir() / "muxplex-deck-task.xml"
+
+
+def _xml_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _win_task_arguments(log_file: Path) -> str:
+    """The task action's `<Arguments>` -- no `cmd.exe` wrapper, no shell redirection.
+
+    WINDOWS_NATIVE_SPEC.md section 1.2 constraint 2: a wrapper would break
+    the PID contract (`EnginePID` would report the wrapper's pid, not the
+    sidecar's) and show a console window. Logging goes to a file from
+    inside Python instead of via shell redirection -- see `--log-file`.
+    """
+    return f'-m muxplex_deck run --log-file "{log_file}"'
+
+
+def _win_task_xml(*, pythonw_path: str, log_file: Path, user_id: str) -> str:
+    arguments = _win_task_arguments(log_file)
+    return _WIN_TASK_XML_TEMPLATE.format(
+        user_id=_xml_escape(user_id),
+        pythonw_path=_xml_escape(pythonw_path),
+        arguments=_xml_escape(arguments),
+    )
+
+
+def _write_win_task_xml(path: Path, content: str) -> None:
+    """Write Task Scheduler XML as UTF-16 LE with a BOM.
+
+    WINDOWS_NATIVE_SPEC.md section 10.3: multiple independent reports say
+    `schtasks /Create /XML` requires the file to be UTF-16 LE with a BOM
+    (`FF FE`) or it is rejected as malformed; others report plain UTF-8
+    working. This is the ONE place this repo's blanket `encoding="utf-8"`
+    convention (IMPLEMENTATION_PHILOSOPHY.md) is deliberately violated, and
+    it is UNVERIFIED on real hardware -- see this change's real-hardware
+    sign-off checklist, item 3. Writing "utf-16-le" plus an explicit BOM
+    character makes the byte order deterministic regardless of the host's
+    native byte order, rather than relying on Python's "utf-16" codec's
+    native-endian default.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\ufeff" + content, encoding="utf-16-le")
+
+
+def _win_install() -> None:
+    from . import report
+
+    items: list[Any] = []
+
+    pythonw = _resolve_pythonw()
+    if not pythonw.lower().endswith("pythonw.exe"):
+        items.append(
+            report.Check(
+                "pythonw",
+                report.ACT,
+                f"pythonw.exe not found next to this Python install -- falling "
+                f"back to {pythonw}, which shows a console window for the "
+                "sidecar's whole life. Cosmetic only -- the task still works.",
+            )
+        )
+
+    log_file = _win_default_log_path()
+    user_id = _win_user_id()
+    xml_content = _win_task_xml(
+        pythonw_path=pythonw, log_file=log_file, user_id=user_id
+    )
+    xml_path = _win_task_xml_path()
+    _write_win_task_xml(xml_path, xml_content)
+    items.append(report.Check("task", report.FINE, f"Wrote task XML: {xml_path}"))
+
+    # Never register a task whose config we already know will make it
+    # crash-loop -- see `_config_ready()`. The XML above is harmless to
+    # have on disk either way; only actually registering it is gated.
+    config_ready, config_error = _config_ready()
+    if not config_ready:
+        items.append(
+            report.Check(
+                "config", report.ACT, config_error or "unknown configuration error"
+            )
+        )
+        _render_service_report(items)
+        return
+
+    create_result = subprocess.run(
+        [
+            "schtasks",
+            "/Create",
+            "/TN",
+            _WIN_TASK_NAME,
+            "/XML",
+            str(xml_path),
+            "/RU",
+            user_id,
+            "/F",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if create_result.returncode != 0:
+        items.append(_failure_check("schtasks", "/Create", create_result))
+        _render_service_report(items)
+        sys.exit(1)
+
+    run_result = subprocess.run(
+        ["schtasks", "/Run", "/TN", _WIN_TASK_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if run_result.returncode != 0:
+        items.append(_failure_check("schtasks", "/Run", run_result))
+    elif service_is_active():
+        items.append(
+            report.Check("service", report.FINE, "Registered + started the task")
+        )
+    else:
+        items.append(
+            report.Check(
+                "service",
+                report.ACT,
+                "Task was started but is not reporting active -- run: "
+                "muxplex-deck service logs",
+            )
+        )
+
+    # Honest trade-offs, surfaced where the user will see them (never
+    # buried) -- WINDOWS_NATIVE_SPEC.md section 1.7.
+    items.append(
+        report.Check(
+            "starts",
+            report.FINE,
+            "Starts at logon, not boot; worst-case restart latency ~60s vs systemd's ~5s",
+        )
+    )
+
+    _render_service_report(items)
+
+
+def _win_uninstall() -> None:
+    from . import report
+
+    items: list[Any] = []
+
+    end_result = subprocess.run(
+        ["schtasks", "/End", "/TN", _WIN_TASK_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    items.append(
+        report.Check(
+            "stop",
+            report.FINE,
+            "Stopped the task" if end_result.returncode == 0 else "Was not running",
+        )
+    )
+
+    delete_result = subprocess.run(
+        ["schtasks", "/Delete", "/TN", _WIN_TASK_NAME, "/F"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    items.append(
+        report.Check(
+            "delete",
+            report.FINE,
+            "Removed the scheduled task"
+            if delete_result.returncode == 0
+            else "Was not registered",
+        )
+    )
+
+    xml_path = _win_task_xml_path()
+    had_xml = xml_path.exists()
+    xml_path.unlink(missing_ok=True)
+    items.append(
+        report.Check(
+            "xml",
+            report.FINE,
+            f"Removed task XML: {xml_path}" if had_xml else "Already absent",
+        )
+    )
+
+    _render_service_report(items)
+
+
+def _win_start() -> None:
+    from . import report
+
+    result = subprocess.run(
+        ["schtasks", "/Run", "/TN", _WIN_TASK_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        _render_service_report(
+            [report.Check("service", report.FINE, "Started the task")]
+        )
+    else:
+        _render_service_report([_failure_check("schtasks", "/Run", result)])
+        sys.exit(1)
+
+
+def _win_stop() -> None:
+    # No narration -- consistent with systemd/launchd's silent stop().
+    # `schtasks /End` is a hard stop (TerminateProcess); Windows delivers
+    # no SIGTERM, so the deck is not blanked -- see WINDOWS_NATIVE_SPEC.md
+    # section 1.7. Failure is ignored, matching the spec's per-verb table.
+    subprocess.run(
+        ["schtasks", "/End", "/TN", _WIN_TASK_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _win_restart() -> None:
+
+    items: list[Any] = []
+
+    _win_stop()
+    # Unlike launchd's bootout, Task Scheduler's /End has no separate
+    # unload race to wait out -- /Run can follow immediately.
+    result = subprocess.run(
+        ["schtasks", "/Run", "/TN", _WIN_TASK_NAME],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        items.append(_failure_check("schtasks", "/Run", result))
+        _render_service_report(items)
+        sys.exit(1)
+
+    items.append(_restart_result_check("Restarted the task"))
+    _render_service_report(items)
+
+
+def _win_status() -> None:
+    """Render our own report -- no external command's output is passed through.
+
+    WINDOWS_NATIVE_SPEC.md section 1.6: `schtasks /Query /V` is explicitly
+    rejected as the status source (localized, verbose console text), so
+    unlike `_systemd_status()`/`_launchd_status()` there is no richer
+    external command worth shelling out to display. Manually assembles
+    STATE lines (mixing a `Check` for the task's state with `Readout`s for
+    the XML/log paths) rather than going through `render_items()`, the
+    same way `cli.status()` does when its output mixes both kinds of line.
+    """
+    from . import report
+
+    utf8 = report.utf8_capable()
+    info = _win_task_query()
+
+    if not info.exists:
+        task_glyph = report.ACT
+        task_value = "Not registered -- run: muxplex-deck service install"
+    elif info.state == _WIN_TASK_STATE_RUNNING:
+        pid_text = f" (pid {info.pid})" if info.pid else ""
+        task_glyph = report.FINE
+        task_value = f"Registered and running{pid_text}"
+    else:
+        state_text = str(info.state) if info.state is not None else "unknown"
+        task_glyph = report.ACT
+        task_value = (
+            f"Registered but not running (state {state_text}) -- run: "
+            "muxplex-deck service logs"
+        )
+
+    state_lines = [
+        report.format_check_line(task_glyph, "task", task_value, utf8=utf8),
+        report.format_readout_line("xml", str(_win_task_xml_path())),
+        report.format_readout_line("log", str(_win_default_log_path())),
+    ]
+
+    action_count = report.count_actions([task_glyph])
+    verdict = report.verdict_readiness(action_count)
+    action_lines: list[str] | None = None
+    if task_glyph == report.ACT:
+        command = report.extract_run_command(task_value)
+        decision = report.Decision(commands=[command] if command else [], prose=None)
+        action_lines = report.render_action(report.Action(decision=decision))
+
+    sys.stdout.write(report.render(verdict, state_lines, action_lines))
+
+
+def _win_logs() -> None:
+    log_file = _win_default_log_path()
+    command = f"Get-Content -LiteralPath '{log_file}' -Tail 50 -Wait"
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", command], check=False
+        )
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Public API -- platform-dispatching wrappers
+#
+# Dispatch order is darwin -> windows -> systemd -> unsupported: platform
+# IDENTITY beats tool-presence probing (see WINDOWS_NATIVE_SPEC.md section
+# 1.6). Today, on Windows, `_have_systemctl()` is always False anyway, so
+# this ordering is not currently load-bearing for correctness -- but it is
+# the documented, future-proof shape.
 # ---------------------------------------------------------------------------
 
 
 def _unsupported_platform_error(command: str) -> None:
-    """Print a clear error when neither launchd nor systemd is available."""
+    """Print a clear error when no supported service manager is available."""
     print(
-        f"  ERROR: 'muxplex-deck service {command}' requires systemd (Linux) or "
-        "launchd (macOS), neither of which was found.",
+        f"  ERROR: 'muxplex-deck service {command}' requires systemd (Linux), "
+        "launchd (macOS), or Task Scheduler (Windows), none of which was found.",
         file=sys.stderr,
     )
     print(
@@ -904,9 +1446,11 @@ def _unsupported_platform_error(command: str) -> None:
 
 
 def service_install() -> None:
-    """Install the muxplex-deck service unit for the current user."""
+    """Install the muxplex-deck service/task for the current user."""
     if _is_darwin():
         _launchd_install()
+    elif _is_windows():
+        _win_install()
     elif _have_systemctl():
         _systemd_install()
     else:
@@ -914,9 +1458,11 @@ def service_install() -> None:
 
 
 def service_uninstall() -> None:
-    """Remove the muxplex-deck service unit for the current user."""
+    """Remove the muxplex-deck service/task for the current user."""
     if _is_darwin():
         _launchd_uninstall()
+    elif _is_windows():
+        _win_uninstall()
     elif _have_systemctl():
         _systemd_uninstall()
     else:
@@ -924,9 +1470,11 @@ def service_uninstall() -> None:
 
 
 def service_start() -> None:
-    """Start the muxplex-deck service."""
+    """Start the muxplex-deck service/task."""
     if _is_darwin():
         _launchd_start()
+    elif _is_windows():
+        _win_start()
     elif _have_systemctl():
         _systemd_start()
     else:
@@ -934,9 +1482,11 @@ def service_start() -> None:
 
 
 def service_stop() -> None:
-    """Stop the muxplex-deck service."""
+    """Stop the muxplex-deck service/task."""
     if _is_darwin():
         _launchd_stop()
+    elif _is_windows():
+        _win_stop()
     elif _have_systemctl():
         _systemd_stop()
     else:
@@ -944,9 +1494,11 @@ def service_stop() -> None:
 
 
 def service_restart() -> None:
-    """Restart the muxplex-deck service."""
+    """Restart the muxplex-deck service/task."""
     if _is_darwin():
         _launchd_restart()
+    elif _is_windows():
+        _win_restart()
     elif _have_systemctl():
         _systemd_restart()
     else:
@@ -954,9 +1506,11 @@ def service_restart() -> None:
 
 
 def service_status() -> None:
-    """Print the current status of the muxplex-deck service."""
+    """Print the current status of the muxplex-deck service/task."""
     if _is_darwin():
         _launchd_status()
+    elif _is_windows():
+        _win_status()
     elif _have_systemctl():
         _systemd_status()
     else:
@@ -964,10 +1518,147 @@ def service_status() -> None:
 
 
 def service_logs() -> None:
-    """Stream or print logs for the muxplex-deck service."""
+    """Stream or print logs for the muxplex-deck service/task."""
     if _is_darwin():
         _launchd_logs()
+    elif _is_windows():
+        _win_logs()
     elif _have_systemctl():
         _systemd_logs()
     else:
         _unsupported_platform_error("logs")
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform predicates -- installed / active / main pid
+# ---------------------------------------------------------------------------
+
+
+def service_is_active() -> bool:
+    """Best-effort: is the muxplex-deck service/task currently active/running?
+
+    Public (moved here from `cli._service_is_active`) so both `cli.update()`
+    and `cli.check_hid_openable()` share one implementation -- the latter
+    needs it to distinguish "our own service holds the device" (expected,
+    not a failure) from a genuine HID-permission problem. Never raises:
+    a missing service manager or a not-installed service both read as
+    "not active", which is the correct doctor/status answer either way.
+    """
+    if _is_darwin():
+        uid = os.getuid()
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return False
+        return result.returncode == 0
+
+    if _is_windows():
+        info = _win_task_query()
+        return info.exists and info.state == _WIN_TASK_STATE_RUNNING
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "muxplex-deck"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
+def service_main_pid() -> int | None:
+    """Best-effort PID of the currently-running muxplex-deck service process.
+
+    Never raises -- matches `service_is_active()`'s contract: any failure
+    (service manager missing, service not running, unexpected/unparseable
+    output) reads as "cannot determine", which callers must treat as "don't
+    know", never as a false positive or negative on its own.
+
+    This is what lets `status()` (and `_wait_for_fresh_status()` below) tell
+    whether a published `status.json` (`statusfile.build_status()`'s own
+    `pid` field) was written by the process running RIGHT NOW under the
+    service, or by a PREVIOUS incarnation whose last write can look
+    deceptively fresh by age alone -- see the restart-race incident in
+    AGENTS.md: the old process's last write happened moments before it
+    exited, so an age-only staleness check saw it as "recent" and reported
+    it as current truth. Comparing pids is the only way to tell those apart.
+
+    On Windows, `IRunningTask.EnginePID` is the pid Task Scheduler reports
+    for the process it directly launched -- which, because the task action
+    is `pythonw.exe -m muxplex_deck run` with no `cmd.exe` wrapper (see
+    `_win_task_arguments()`), IS the sidecar's own pid. UNVERIFIED on real
+    hardware -- see this change's real-hardware sign-off checklist, item 2.
+    """
+    if _is_darwin():
+        uid = os.getuid()
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{_LAUNCHD_LABEL}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return None
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pid = "):
+                try:
+                    return int(stripped[len("pid = ") :].strip())
+                except ValueError:
+                    return None
+        return None
+
+    if _is_windows():
+        return _win_task_query().pid
+
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "muxplex-deck",
+                "--property=MainPID",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def service_is_installed() -> bool:
+    """Is the muxplex-deck unit/plist/task present?
+
+    Independent of `service_is_active()` -- a service that is installed but
+    crash-looping (or simply stopped) is still installed. `doctor`'s
+    `check_service_status` used to conflate "not active" with "not
+    installed" and recommend `service install` for a service that was
+    already installed and failing; this is the file-existence half of the
+    fix (see AGENTS.md for the incident: 1113 restarts, then told to
+    "install" a service that was already there).
+    """
+    if _is_darwin():
+        return _LAUNCHD_PLIST_PATH.exists()
+    if _is_windows():
+        return _win_task_query().exists
+    return _SYSTEMD_UNIT_PATH.exists()

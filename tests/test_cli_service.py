@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from muxplex_deck import report as report_mod
 from muxplex_deck import service as service_mod
 
 
@@ -123,8 +124,12 @@ class TestSystemdInstall:
             service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
         )
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
-        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(
+            service_mod,
+            "_enable_linger",
+            lambda: report_mod.Check("linger", report_mod.FINE, "linger ok"),
+        )
+        monkeypatch.setattr(service_mod, "_udev_install_check", lambda: None)
         monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
@@ -162,14 +167,17 @@ class TestSystemdInstall:
         )
 
         calls: dict[str, bool] = {"linger": False, "udev": False}
-        monkeypatch.setattr(
-            service_mod, "_enable_linger", lambda: calls.__setitem__("linger", True)
-        )
-        monkeypatch.setattr(
-            service_mod,
-            "_warn_if_no_udev_rule",
-            lambda: calls.__setitem__("udev", True),
-        )
+
+        def _fake_linger() -> Any:
+            calls["linger"] = True
+            return report_mod.Check("linger", report_mod.FINE, "linger ok")
+
+        def _fake_udev() -> Any:
+            calls["udev"] = True
+            return None
+
+        monkeypatch.setattr(service_mod, "_enable_linger", _fake_linger)
+        monkeypatch.setattr(service_mod, "_udev_install_check", _fake_udev)
         monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
@@ -308,19 +316,23 @@ class TestUdevRuleDetection:
 
 
 # ---------------------------------------------------------------------------
-# _warn_if_no_udev_rule() on WSL -- the rule is unproven there (AGENTS.md
+# _udev_install_check() on WSL -- the rule is unproven there (AGENTS.md
 # "U7"): a real WSL user followed the udev remediation `service install`
 # printed and lost ~40 minutes, because the rule never actually fires for a
 # usbip-attached device even when udev itself reports as "live". On WSL this
-# must show the proven per-attach guidance instead of the raw udev block.
+# must return the proven per-attach guidance instead of the raw udev block.
+#
+# Renamed from `_warn_if_no_udev_rule()` (which printed directly) as part of
+# the report-based narration rewrite (v0.7.1) -- same branching, but now
+# returns a `report.Check` (or None) for the install report to fold in,
+# instead of printing mid-flight. These tests assert on the returned Check
+# rather than captured stdout.
 # ---------------------------------------------------------------------------
 
 
-class TestWarnIfNoUdevRuleWslAware:
+class TestUdevInstallCheckWslAware:
     def test_wsl_shows_environment_guidance_not_raw_udev_block(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from muxplex_deck import hidhelp, wsl
 
@@ -338,17 +350,15 @@ class TestWarnIfNoUdevRuleWslAware:
             ],
         )
 
-        service_mod._warn_if_no_udev_rule()
+        check = service_mod._udev_install_check()
 
-        out = capsys.readouterr().out
-        assert "chown guidance line" in out
-        assert "70-streamdeck.rules" not in out
-        assert "<<'EOF'" not in out
+        assert check is not None
+        assert check.glyph == report_mod.ACT
+        assert "chown guidance line" in check.value
+        assert "70-streamdeck.rules" not in check.value
 
-    def test_wsl_with_no_environment_guidance_prints_nothing(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture,
+    def test_wsl_with_no_environment_guidance_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from muxplex_deck import hidhelp, wsl
 
@@ -358,22 +368,16 @@ class TestWarnIfNoUdevRuleWslAware:
         )
         monkeypatch.setattr(hidhelp, "explain_environment", lambda **_k: [])
 
-        service_mod._warn_if_no_udev_rule()
-
-        out = capsys.readouterr().out
-        assert out == ""
+        assert service_mod._udev_install_check() is None
 
     def test_native_linux_container_udev_dead_is_unchanged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Regression guard: non-WSL behavior must stay exactly as before --
 
-        no guidance printed by `_warn_if_no_udev_rule()` itself when udev
-        isn't live and this isn't WSL (the U-DEAD guidance -- if any --
-        still comes from `explain_environment()` calls elsewhere, e.g.
-        `doctor()`, never duplicated here).
+        no Check returned when udev isn't live and this isn't WSL (the
+        U-DEAD guidance -- if any -- still comes from `explain_environment()`
+        calls elsewhere, e.g. `doctor()`, never duplicated here).
         """
         from muxplex_deck import usbnode, wsl
 
@@ -385,15 +389,10 @@ class TestWarnIfNoUdevRuleWslAware:
         )
         monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: False)
 
-        service_mod._warn_if_no_udev_rule()
-
-        out = capsys.readouterr().out
-        assert out == ""
+        assert service_mod._udev_install_check() is None
 
     def test_native_linux_udev_live_shows_raw_udev_block_unchanged(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Regression guard: healthy native Linux still gets the udev block."""
         from muxplex_deck import usbnode, wsl
@@ -406,10 +405,10 @@ class TestWarnIfNoUdevRuleWslAware:
         )
         monkeypatch.setattr(usbnode, "udev_is_live", lambda **_k: True)
 
-        service_mod._warn_if_no_udev_rule()
+        check = service_mod._udev_install_check()
 
-        out = capsys.readouterr().out
-        assert "70-streamdeck.rules" in out
+        assert check is not None
+        assert "70-streamdeck.rules" in check.value
 
 
 # ---------------------------------------------------------------------------
@@ -569,8 +568,12 @@ class TestSystemdInstallConfigGate:
         monkeypatch.setattr(
             service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
         )
-        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
-        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(
+            service_mod,
+            "_enable_linger",
+            lambda: report_mod.Check("linger", report_mod.FINE, "linger ok"),
+        )
+        monkeypatch.setattr(service_mod, "_udev_install_check", lambda: None)
 
     def test_missing_config_does_not_enable_or_start(
         self,
@@ -598,10 +601,12 @@ class TestSystemdInstallConfigGate:
         )
 
         out = capsys.readouterr().out
-        assert "Not enabling or starting yet" in out
+        # Report-based narration (v0.7.1): the real invariant is that the
+        # gate stops short of enabling, shows the real config error, and
+        # directs the user to the fix -- not the old literal phrasing.
+        assert "Not ready" in out
         assert "Config file not found: X" in out
         assert "muxplex-deck init" in out
-        assert "service install" in out
 
     def test_ready_config_still_enables_and_starts(
         self,
@@ -663,7 +668,11 @@ class TestLaunchdInstallConfigGate:
         )
 
         out = capsys.readouterr().out
-        assert "Not enabling or starting yet" in out
+        # Report-based narration (v0.7.1): the real invariant is that the
+        # gate stops short of bootstrapping, shows the real config error,
+        # and directs the user to the fix.
+        assert "Not ready" in out
+        assert "Config file not found: X" in out
         assert "muxplex-deck init" in out
 
     def test_ready_config_still_bootstraps(
@@ -715,21 +724,26 @@ class TestSystemdInstallNarration:
         monkeypatch.setattr(
             service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
         )
-        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
-        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(
+            service_mod,
+            "_enable_linger",
+            lambda: report_mod.Check("linger", report_mod.FINE, "linger ok"),
+        )
+        monkeypatch.setattr(service_mod, "_udev_install_check", lambda: None)
         monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
         monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
         service_mod._systemd_install()
 
         out = capsys.readouterr().out
-        assert "service install (systemd" in out
+        # Report-based narration (v0.7.1): one VERDICT/STATE/ACTION report
+        # instead of a header + step-by-step prints + always-on "Next:"
+        # banner -- the healthy case is quiet on success, matching
+        # doctor()/status()'s own convention.
         assert "Wrote unit file" in out
         assert "Reloaded the systemd user daemon" in out
         assert "Enabled + started the service" in out
         assert "Service is running" in out
-        assert "muxplex-deck status" in out
-        assert "muxplex-deck service logs" in out
 
     def test_install_warns_when_not_reporting_active(
         self,
@@ -749,8 +763,12 @@ class TestSystemdInstallNarration:
         monkeypatch.setattr(
             service_mod.shutil, "which", lambda name: "/usr/bin/muxplex-deck"
         )
-        monkeypatch.setattr(service_mod, "_enable_linger", lambda: None)
-        monkeypatch.setattr(service_mod, "_warn_if_no_udev_rule", lambda: None)
+        monkeypatch.setattr(
+            service_mod,
+            "_enable_linger",
+            lambda: report_mod.Check("linger", report_mod.FINE, "linger ok"),
+        )
+        monkeypatch.setattr(service_mod, "_udev_install_check", lambda: None)
         monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
         monkeypatch.setattr(service_mod, "_config_ready", lambda: (True, None))
 
@@ -775,7 +793,6 @@ class TestSystemdUninstallNarration:
         service_mod._systemd_uninstall()
 
         out = capsys.readouterr().out
-        assert "service uninstall (systemd" in out
         assert "Stopped the service" in out
         assert "Disabled the service" in out
         assert "Removed unit file" in out
@@ -829,12 +846,9 @@ class TestLaunchdInstallNarration:
         service_mod._launchd_install()
 
         out = capsys.readouterr().out
-        assert "service install (launchd)" in out
         assert "Wrote plist" in out
         assert "Loaded + started the service" in out
         assert "Service is running" in out
-        assert "muxplex-deck status" in out
-        assert "muxplex-deck service logs" in out
 
 
 class TestLaunchdUninstallNarration:
@@ -853,7 +867,6 @@ class TestLaunchdUninstallNarration:
         service_mod._launchd_uninstall()
 
         out = capsys.readouterr().out
-        assert "service uninstall (launchd)" in out
         assert "Stopped + unloaded the service" in out
         assert "Removed plist" in out
         assert not plist_path.exists()
@@ -894,13 +907,16 @@ class TestServiceManagerAvailable:
         monkeypatch.setattr(service_mod, "_have_systemctl", lambda: True)
         assert service_mod.service_manager_available() is True
 
-    def test_false_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Native Windows has no supported service manager yet (Task
-        Scheduler support is a separate, not-yet-built increment).
+    def test_true_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Task Scheduler support (WINDOWS_NATIVE_SPEC.md section 1) makes
+
+        this True on native Windows now -- it was False before this
+        increment, when Windows had no supported service manager at all.
         """
         monkeypatch.setattr(service_mod, "_is_darwin", lambda: False)
+        monkeypatch.setattr(service_mod, "_is_windows", lambda: True)
         monkeypatch.setattr(service_mod, "_have_systemctl", lambda: False)
-        assert service_mod.service_manager_available() is False
+        assert service_mod.service_manager_available() is True
 
     def test_false_on_linux_without_systemctl(
         self, monkeypatch: pytest.MonkeyPatch
@@ -968,9 +984,13 @@ class TestLaunchdStart:
         with pytest.raises(SystemExit) as exc_info:
             service_mod._launchd_start()
         assert exc_info.value.code == 1
-        err = capsys.readouterr().err
-        assert "ERROR" in err
-        assert "Operation not permitted" in err
+        # Report-based narration (v0.7.1): the diagnostic now prints via
+        # the report renderer on stdout, not a bare stderr "ERROR:" line --
+        # the real invariant (the tool's own diagnostic stays visible, and
+        # the process exits nonzero) is what's tested here.
+        out = capsys.readouterr().out
+        assert "bootstrap failed" in out
+        assert "Operation not permitted" in out
 
 
 class TestLaunchdInstallBootstrapIdempotency:
@@ -1032,9 +1052,11 @@ class TestLaunchdInstallBootstrapIdempotency:
 
         service_mod._launchd_install()  # must not raise -- no check=True crash
 
-        err = capsys.readouterr().err
-        assert "ERROR: launchctl bootstrap failed" in err
-        assert "Operation not permitted" in err
+        # Report-based narration (v0.7.1): stdout, not a bare stderr "ERROR:"
+        # line -- see the equivalent comment in TestLaunchdStart above.
+        out = capsys.readouterr().out
+        assert "bootstrap failed" in out
+        assert "Operation not permitted" in out
 
 
 class TestLaunchdRestart:
@@ -1112,8 +1134,9 @@ class TestLaunchdRestart:
         with pytest.raises(SystemExit) as exc_info:
             service_mod._launchd_restart()
         assert exc_info.value.code == 1
-        err = capsys.readouterr().err
-        assert "ERROR: launchctl bootstrap failed" in err
+        # Report-based narration (v0.7.1): stdout, not stderr.
+        out = capsys.readouterr().out
+        assert "bootstrap failed" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1147,9 +1170,9 @@ class TestSystemdStart:
         with pytest.raises(SystemExit) as exc_info:
             service_mod._systemd_start()
         assert exc_info.value.code == 1
-        err = capsys.readouterr().err
-        assert "ERROR" in err
-        assert "Unit not found" in err
+        # Report-based narration (v0.7.1): stdout, not stderr.
+        out = capsys.readouterr().out
+        assert "Unit not found" in out
 
 
 class TestSystemdRestart:
@@ -1181,9 +1204,9 @@ class TestSystemdRestart:
         with pytest.raises(SystemExit) as exc_info:
             service_mod._systemd_restart()
         assert exc_info.value.code == 1
-        err = capsys.readouterr().err
-        assert "ERROR" in err
-        assert "Unit not found" in err
+        # Report-based narration (v0.7.1): stdout, not stderr.
+        out = capsys.readouterr().out
+        assert "Unit not found" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1374,8 @@ class TestRestartWaitsForFreshStatus:
         service_mod._systemd_restart()  # must not raise
 
         out = capsys.readouterr().out
-        assert "has not published fresh status" in out
+        assert "has not published" in out
+        assert "fresh" in out
         assert "Restarted the service" not in out
 
     def test_restart_failure_short_circuits_before_freshness_wait(
