@@ -20,9 +20,11 @@ Platform dispatch happens here and only here:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import subprocess
 import sys
+from ctypes import wintypes
 from typing import Protocol
 
 logger = logging.getLogger("muxplex_deck")
@@ -114,26 +116,111 @@ def _focus_macos(name: str) -> None:
 # position (see `config.py`'s updated docstring/validation message); only
 # its Windows *meaning* differs. Existing macOS configs are untouched.
 #
-# Windows also restricts which process may steal the foreground -- a bare
-# `SetForegroundWindow()` call from a background process is documented to
-# either be refused outright, or (the more common and more confusing
-# failure) report success while the OS only flashes the target's taskbar
-# icon and never actually raises the window. This is a deliberate
-# anti-focus-stealing measure (see
-# https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setforegroundwindow),
-# not a bug to brute-force around. The one documented, widely-used
-# technique that reliably works from a background process is
-# `AttachThreadInput`: temporarily fuse this thread's input queue with the
-# CURRENT foreground window's thread (which satisfies the "received the
-# last input event" exemption Microsoft's own docs describe as one of the
-# conditions that allows a foreground switch), call
-# `SetForegroundWindow`, then detach. It is still best-effort -- verified
-# afterward by comparing `GetForegroundWindow()` to the target, with a
-# logged (never raised) notice on a miss, exactly as the module docstring
-# promises for `focus_app` as a whole.
+# Windows also restricts which process may steal the foreground. Per
+# Microsoft's own documentation
+# (https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setforegroundwindow),
+# `SetForegroundWindow` only succeeds if the calling process is itself the
+# foreground process, was started by it, there is currently no foreground
+# window, the calling process received the last input event, the
+# foreground lock timeout has expired, or either process is being debugged
+# -- otherwise Windows silently downgrades the call to a taskbar-icon
+# flash. A windowless background process like this sidecar's connect
+# thread satisfies NONE of those by default, which is a deliberate
+# anti-focus-stealing measure, not a bug to brute-force around.
+#
+# Two DOCUMENTED techniques are combined here, in order, real-hardware-
+# VERIFIED as insufficient individually (2026-07-28: `AttachThreadInput`
+# alone requested the switch but Windows only flashed the taskbar icon):
+#
+# 1. `SendInput` synthesizes a lone ALT keydown/keyup. This is not a
+#    brute-force hack -- Microsoft's own `LockSetForegroundWindow` Remarks
+#    state plainly: "The system automatically enables calls to
+#    SetForegroundWindow if the user presses the ALT key or takes some
+#    action that causes the system itself to change the foreground
+#    window" (learn.microsoft.com/windows/win32/api/winuser/
+#    nf-winuser-locksetforegroundwindow). `SendInput` is documented as the
+#    way to synthesize that keypress without a real keyboard
+#    (learn.microsoft.com/windows/win32/api/winuser/nf-winuser-sendinput).
+#    This is almost certainly what `AttachThreadInput` alone was missing:
+#    a background process with no window and no prior input has nothing
+#    to "attach" that satisfies the exemption on its own -- see
+#    stackoverflow.com/questions/19136365 ("doesn't work if your app is a
+#    background process without any windows and input focus"). No window,
+#    no message pump, and (critically, per the user's own requirement) NO
+#    system-wide setting change -- the effect is scoped to this one call,
+#    unlike `SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0)`, which
+#    was considered and REJECTED: that call persists a registry value
+#    (`HKCU\Control Panel\Desktop\ForegroundLockTimeout`) affecting every
+#    application on the machine, not just this one, and was never made
+#    opt-in -- unacceptable for a background sidecar to do silently.
+# 2. `AttachThreadInput` (kept, harmless, still may help): temporarily fuse
+#    this thread's input queue with the CURRENT foreground window's thread
+#    (an independent way of satisfying the "received the last input
+#    event" exemption), call `SetForegroundWindow`, then detach.
+#
+# The combination is still best-effort -- verified afterward by comparing
+# `GetForegroundWindow()` to the target, with a logged (never raised)
+# notice on a miss, exactly as the module docstring promises for
+# `focus_app` as a whole. UNVERIFIED on real Windows hardware whether the
+# `SendInput` step closes the gap the 2026-07-28 report found --
+# `AttachThreadInput` alone was proven insufficient there; the analysis
+# above is Microsoft-documentation-grounded, not yet hardware-confirmed.
 # ---------------------------------------------------------------------------
 
 _SW_RESTORE = 9
+
+# SendInput's ALT-tap technique (see the module section comment above).
+# ctypes.wintypes is a plain-data module (DWORD/WORD/LONG are just
+# c_ulong/c_ushort/c_long aliases) importable and usable on ANY platform --
+# unlike `ctypes.windll`, it needs no real Windows process, so these
+# structures are safe to define unconditionally at module import time.
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_VK_MENU = 0x12  # ALT
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    )
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    )
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class _INPUTUnion(ctypes.Union):
+    # Real Windows `INPUT` unions mi/ki/hi -- MOUSEINPUT is the largest
+    # member, so the union (and therefore `ctypes.sizeof(_INPUT)`) must
+    # include all three or `SendInput`'s `cbSize` check rejects the call.
+    _fields_ = (
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    )
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = (("type", wintypes.DWORD), ("union", _INPUTUnion))
 
 
 class _Win32Api(Protocol):
@@ -167,6 +254,14 @@ class _Win32Api(Protocol):
     ) -> bool: ...
 
     def set_foreground_window(self, hwnd: int) -> bool: ...
+
+    def tap_alt_key(self) -> None:
+        """Synthesize a lone ALT keydown+keyup via `SendInput`.
+
+        See the module section comment above `_SW_RESTORE` for why this
+        exists and what documented Windows behavior it relies on.
+        """
+        ...
 
 
 class _RealWin32Api:
@@ -230,6 +325,20 @@ class _RealWin32Api:
     def set_foreground_window(self, hwnd: int) -> bool:
         return bool(self._user32.SetForegroundWindow(hwnd))
 
+    def tap_alt_key(self) -> None:
+        inputs = (_INPUT * 2)()
+        inputs[0].type = _INPUT_KEYBOARD
+        inputs[0].union.ki = _KEYBDINPUT(
+            wVk=_VK_MENU, wScan=0, dwFlags=0, time=0, dwExtraInfo=None
+        )
+        inputs[1].type = _INPUT_KEYBOARD
+        inputs[1].union.ki = _KEYBDINPUT(
+            wVk=_VK_MENU, wScan=0, dwFlags=_KEYEVENTF_KEYUP, time=0, dwExtraInfo=None
+        )
+        self._user32.SendInput(
+            2, self._ctypes.byref(inputs), self._ctypes.sizeof(_INPUT)
+        )
+
 
 def _real_win32_api() -> _Win32Api:
     return _RealWin32Api()
@@ -245,15 +354,26 @@ def _find_window(api: _Win32Api, name: str) -> int | None:
 
 
 def _raise_to_foreground(api: _Win32Api, hwnd: int) -> bool:
-    """Best-effort foreground steal via the `AttachThreadInput` technique.
+    """Best-effort foreground steal, combining two documented techniques.
 
     Returns True only if `GetForegroundWindow()` actually reports `hwnd`
-    afterward -- see the module section docstring above: a bare
+    afterward -- see the module section comment above: a bare
     `SetForegroundWindow` return value is NOT proof the switch took,
     Windows can report success while only flashing the taskbar button.
+
+    Order matters: `tap_alt_key()` runs FIRST, unconditionally -- it is
+    Microsoft's own documented mechanism for re-enabling
+    `SetForegroundWindow` system-wide (see the module section comment),
+    and real hardware showed `AttachThreadInput` alone is not sufficient
+    for a windowless background process. `AttachThreadInput` is kept
+    afterward as a second, independent way of satisfying the "received
+    the last input event" exemption -- harmless if the ALT tap already
+    cleared the block, and still worth attempting if it didn't.
     """
     if api.is_iconic(hwnd):
         api.restore(hwnd)
+
+    api.tap_alt_key()
 
     current_thread = api.get_current_thread_id()
     fg_hwnd = api.get_foreground_window()

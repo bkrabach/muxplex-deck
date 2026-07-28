@@ -16,6 +16,8 @@ the private helpers in isolation.
 
 from __future__ import annotations
 
+import ctypes
+
 import pytest
 
 from muxplex_deck import focus
@@ -52,6 +54,10 @@ class _FakeWin32Api:
         self.restored: list[int] = []
         self.attach_calls: list[tuple[int, int, bool]] = []
         self.set_foreground_calls: list[int] = []
+        self.alt_tap_calls = 0
+
+    def tap_alt_key(self) -> None:
+        self.alt_tap_calls += 1
 
     def list_window_titles(self) -> list[tuple[int, str]]:
         return list(self._windows)
@@ -201,6 +207,79 @@ class TestFindAndFocusWindow:
         assert api.attach_calls == []
 
 
+class TestAltKeyTap:
+    """The 2026-07-28 fix: `AttachThreadInput` alone was proven insufficient
+
+    on real hardware (Windows only flashed the taskbar icon). `tap_alt_key()`
+    -- a `SendInput`-synthesized ALT keydown/keyup -- is Microsoft's own
+    documented mechanism for re-enabling `SetForegroundWindow`
+    (`LockSetForegroundWindow`'s Remarks) and must run on every focus
+    attempt, before `AttachThreadInput`/`SetForegroundWindow`.
+    """
+
+    def test_alt_tap_runs_exactly_once_per_focus_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        api = _FakeWin32Api(
+            windows=[(7, "muxplex - Chrome")],
+            foreground_hwnd=1,
+            foreground_thread_id=42,
+        )
+        _use_windows(monkeypatch, api)
+        focus.focus_app("muxplex")
+        assert api.alt_tap_calls == 1
+
+    def test_alt_tap_runs_even_when_no_attach_is_needed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same-thread case (no AttachThreadInput) must still tap ALT --
+
+        it is an independent, unconditional step, not a fallback only used
+        when AttachThreadInput would apply.
+        """
+        api = _FakeWin32Api(
+            windows=[(7, "muxplex - Chrome")],
+            foreground_hwnd=1,
+            foreground_thread_id=99,
+            current_thread_id=99,
+        )
+        _use_windows(monkeypatch, api)
+        focus.focus_app("muxplex")
+        assert api.alt_tap_calls == 1
+
+    def test_alt_tap_runs_before_set_foreground_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+
+        class _OrderTrackingApi(_FakeWin32Api):
+            def tap_alt_key(self) -> None:
+                order.append("alt_tap")
+                super().tap_alt_key()
+
+            def set_foreground_window(self, hwnd: int) -> bool:
+                order.append("set_foreground")
+                return super().set_foreground_window(hwnd)
+
+        api = _OrderTrackingApi(
+            windows=[(7, "muxplex - Chrome")],
+            foreground_hwnd=1,
+            foreground_thread_id=42,
+        )
+        _use_windows(monkeypatch, api)
+        focus.focus_app("muxplex")
+        assert order == ["alt_tap", "set_foreground"]
+
+    def test_no_window_found_never_taps_alt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing to focus -- don't synthesize input for no reason."""
+        api = _FakeWin32Api(windows=[(1, "Inbox - Outlook")])
+        _use_windows(monkeypatch, api)
+        focus.focus_app("muxplex")
+        assert api.alt_tap_calls == 0
+
+
 class TestForegroundConfirmationIsHonest:
     """The module's central honesty claim: a `SetForegroundWindow` call
     that Windows silently downgrades to a taskbar flash must be reported
@@ -236,6 +315,58 @@ class TestForegroundConfirmationIsHonest:
         assert any(
             "did not" in r.message and "confirm" in r.message for r in caplog.records
         )
+
+
+class TestInputStructureLayout:
+    """Pure ctypes layout checks for `SendInput`'s `INPUT` structure --
+
+    no `ctypes.windll` involved, so these run on any platform (unlike
+    `_RealWin32Api`, which this module's own docstring says tests never
+    construct). `ctypes.wintypes` is a plain-data module importable
+    anywhere; only `ctypes.windll` (the actual DLL loader) is Windows-only.
+    """
+
+    def test_input_union_is_large_enough_for_mouseinput(self) -> None:
+        """MOUSEINPUT is the largest union member on real Windows -- if the
+
+        union were sized to KEYBDINPUT alone, `cbSize` would mismatch what
+        `SendInput` expects and the real call would be rejected.
+        """
+        assert ctypes.sizeof(focus._INPUTUnion) >= ctypes.sizeof(focus._MOUSEINPUT)
+        assert ctypes.sizeof(focus._INPUTUnion) >= ctypes.sizeof(focus._KEYBDINPUT)
+
+    def test_keybdinput_can_be_constructed_for_alt_keydown_and_keyup(self) -> None:
+        down = focus._KEYBDINPUT(
+            wVk=focus._VK_MENU, wScan=0, dwFlags=0, time=0, dwExtraInfo=None
+        )
+        up = focus._KEYBDINPUT(
+            wVk=focus._VK_MENU,
+            wScan=0,
+            dwFlags=focus._KEYEVENTF_KEYUP,
+            time=0,
+            dwExtraInfo=None,
+        )
+        assert down.wVk == up.wVk == focus._VK_MENU
+        assert down.dwFlags == 0
+        assert up.dwFlags == focus._KEYEVENTF_KEYUP
+
+    def test_input_array_of_two_assigns_type_and_union_independently(self) -> None:
+        inputs = (focus._INPUT * 2)()
+        inputs[0].type = focus._INPUT_KEYBOARD
+        inputs[0].union.ki = focus._KEYBDINPUT(
+            wVk=focus._VK_MENU, wScan=0, dwFlags=0, time=0, dwExtraInfo=None
+        )
+        inputs[1].type = focus._INPUT_KEYBOARD
+        inputs[1].union.ki = focus._KEYBDINPUT(
+            wVk=focus._VK_MENU,
+            wScan=0,
+            dwFlags=focus._KEYEVENTF_KEYUP,
+            time=0,
+            dwExtraInfo=None,
+        )
+        assert inputs[0].type == focus._INPUT_KEYBOARD
+        assert inputs[0].union.ki.dwFlags == 0
+        assert inputs[1].union.ki.dwFlags == focus._KEYEVENTF_KEYUP
 
 
 class TestNeverRaises:
