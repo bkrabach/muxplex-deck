@@ -108,6 +108,7 @@ def build_status(
     active_view: str | None,
     page: int | None,
     hint: str | None = None,
+    unapplied: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the status dict written to disk. Pure -- no I/O, easy to test.
 
@@ -123,12 +124,21 @@ def build_status(
     can show it instead of a stale/misleading status. Older readers that
     don't know this field simply don't see it (`.get()` is used to read
     it back -- see `cli._status_device_item`).
+
+    `unapplied` (optional, additive) is the control-mapping Gate 2
+    diagnostics (`layout.LayoutPlan.unapplied`, JSON-serialized as
+    `[{"address": ..., "reason": ...}, ...]`) -- one of the four surfaces
+    docs/CONTROL_MAPPING_DESIGN.md §6 requires so a binding that can't
+    apply to the connected deck is never silently discarded. Published so
+    `muxplex-deck status`/`controls` can show it with no deck attached.
     """
     device: dict[str, Any] = {"connected": device_connected}
     if device_connected and device_caps is not None:
         device["capabilities"] = device_caps
     if hint is not None:
         device["hint"] = hint
+    if unapplied:
+        device["unapplied"] = unapplied
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -212,6 +222,7 @@ class StatusReporter:
             "active_view": None,
             "page": None,
             "hint": None,
+            "unapplied": None,
         }
 
     def update(self, **fields: Any) -> None:

@@ -35,7 +35,7 @@ from muxplex_client import (
 )
 from PIL import Image
 
-from muxplex_deck.device import DeckDevice, DialEventType
+from muxplex_deck.device import DeckDevice
 from muxplex_deck.interaction import PickerMode, ViewCycler
 from muxplex_deck.layout import MODE_FULL, MODE_REDUCED
 from muxplex_deck.main import _ActiveRuntime
@@ -671,23 +671,23 @@ class TestFullRuntime:
 
     def test_page_dial_turns_and_clamps(self, full) -> None:
         _deck, client, ctx = full
-        ctx.handle_page_dial(DialEventType.TURN, 1)
+        ctx.handle_dial_turn(1, "page_cycle", 1)
         assert ctx.pager.page == 2
-        ctx.handle_page_dial(DialEventType.TURN, 5)
+        ctx.handle_dial_turn(1, "page_cycle", 5)
         assert ctx.pager.page == 3  # clamped at last page
-        ctx.handle_page_dial(DialEventType.TURN, -10)
+        ctx.handle_dial_turn(1, "page_cycle", -10)
         assert ctx.pager.page == 1  # clamped at first page
         assert client.connected_names == []
 
     def test_view_dial_turn_commits_debounced_patch(self, full) -> None:
         _deck, client, ctx = full
-        ctx.handle_view_dial(DialEventType.TURN, 1)
+        ctx.handle_dial_turn(0, "view_cycle", 1)
         assert client.view_patch_event.wait(_WAIT_SECONDS)
         assert client.view_patches == ["focus"]
 
     def test_page_resets_on_view_change(self, full) -> None:
         _deck, client, ctx = full
-        ctx.handle_page_dial(DialEventType.TURN, 1)
+        ctx.handle_dial_turn(1, "page_cycle", 1)
         assert ctx.pager.page == 2
         client.active_view = "focus"
         ctx.refresh()

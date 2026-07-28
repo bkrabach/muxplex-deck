@@ -53,7 +53,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -68,6 +68,7 @@ from muxplex_client import (
 )
 
 from . import attention, focus, interaction, layout, rendering, views
+from . import controls as controls_mod
 from .config import Config
 from .device import (
     DeckDevice,
@@ -94,7 +95,59 @@ AUTH_RETRY_SECONDS = 30.0
 # replug) rather than trusting whatever the deck inherited.
 FULL_BRIGHTNESS_PERCENT = 100
 
+# `brightness_up`/`brightness_down`/`brightness_cycle` step size and floor.
+# The floor is 10, not 0: a user walking `brightness_down` to a black
+# screen would have no way to see which key restores it -- see
+# docs/CONTROL_MAPPING_DESIGN.md §2.5. 0% remains reachable
+# programmatically (e.g. a future `display_toggle`); it just isn't
+# reachable by holding down a bound control.
+BRIGHTNESS_STEP_PERCENT = 10
+BRIGHTNESS_FLOOR_PERCENT = 10
+
 _MAX_VIEW_LABEL_CHARS = 20
+
+# Static (title, body) display for control-key actions whose label never
+# changes at runtime -- everything else (view_picker, page_picker,
+# page_prev, page_next) carries live state and is special-cased in
+# `_control_key_display`. Relative-only actions (view_cycle, page_cycle,
+# brightness_cycle) never appear here: Gate 1 (config.py) rejects them on
+# any address but `dial.N.turn`, so they can never be the resolved action
+# for a `key.N` or `dial.N.push` control needing a key-paint spec.
+_STATIC_CONTROL_LABELS: dict[str, tuple[str, str]] = {
+    "view_all": ("VIEW", "ALL"),
+    "page_first": ("PAGE", "FIRST"),
+    "page_last": ("PAGE", "LAST"),
+    "view_prev": ("VIEW", "< PREV"),
+    "view_next": ("VIEW", "NEXT >"),
+    "focus_app": ("", "FOCUS"),
+    "refresh_now": ("", "REFRESH"),
+    "toggle_last": ("", "TOGGLE"),
+    "brightness_up": ("BRIGHT", "+"),
+    "brightness_down": ("BRIGHT", "-"),
+}
+
+
+def _control_key_display(
+    action: str, *, view_label: str, turning: bool, hostname: str, page_text: str
+) -> tuple[str, str, str]:
+    """(title, body, footer) for a non-"session"/"none" control key's paint.
+
+    `view_picker`/`page_picker`/`page_prev`/`page_next` carry live state
+    (the current view name, or the page footer) and are special-cased;
+    everything else in the catalog has a fixed label from
+    `_STATIC_CONTROL_LABELS`.
+    """
+    if action == "view_picker":
+        body = f"> {view_label}" if turning else view_label
+        return "VIEW", body, hostname
+    if action == "page_picker":
+        return "PAGE", "PAGE", page_text
+    if action == "page_prev":
+        return "", "< PREV", page_text
+    if action == "page_next":
+        return "", "NEXT >", page_text
+    title, body = _STATIC_CONTROL_LABELS.get(action, ("", action))
+    return title, body, ""
 
 
 def _build_log_file_handler(log_file: Path) -> logging.Handler:
@@ -355,6 +408,7 @@ class _ActiveRuntime:
         hostname: str,
         sort_mode: str,
         focus_app_name: str = "",
+        controls: Mapping[str, str] | None = None,
     ) -> None:
         self.deck = deck
         self.client = client
@@ -373,8 +427,11 @@ class _ActiveRuntime:
 
         # Capability-driven layout: FULL (Stream Deck+: dials + strip) keeps
         # the pre-existing behavior; REDUCED (Original/MK2/XL/Mini: no
-        # dials/strip) reserves VIEW/PREV/NEXT keys instead. See `.layout`.
-        self.plan = layout.plan_layout(layout.read_capabilities(deck))
+        # dials/strip) reserves VIEW/PREV/NEXT keys instead -- both are now
+        # a computed default table of (address -> action) bindings, with
+        # `controls` (Gate-1-validated config overrides) merged on top. See
+        # `.layout` and docs/CONTROL_MAPPING_DESIGN.md.
+        self.plan = layout.plan_layout(layout.read_capabilities(deck), controls)
 
         self.view_cycler = ViewCycler()
         self.pager = Pager(page_size=max(1, self.plan.sessions_per_page))
@@ -382,8 +439,21 @@ class _ActiveRuntime:
 
         self.ordered: list[Session] = []
         self.active_session: str | None = None
+        # Most recently displaced active session -- powers `toggle_last`.
+        # Updated in lockstep with `active_session` via
+        # `_note_active_session_locked`, both on local key-press connects
+        # and on a server-side switch observed through `_process`.
+        self.previous_session: str | None = None
         self.active_view: str = "all"
         self.session_names: list[str] = []  # current page's key-index -> session name
+
+        # Session-local, never persisted: real hardware powers on dim
+        # (`FULL_BRIGHTNESS_PERCENT` is asserted fresh on every bring-up in
+        # `_run_active`), so writing a dimmed value to config.json would
+        # fight that deliberate reset and could leave a deck that looks
+        # dead after a replug with the cause stored invisibly in a file.
+        # See docs/CONTROL_MAPPING_DESIGN.md §2.5.
+        self.brightness: int = FULL_BRIGHTNESS_PERCENT
 
         self.last_key_state: list[object] = [None] * deck.key_count()
         self.last_strip: str | None = None
@@ -478,8 +548,12 @@ class _ActiveRuntime:
             )
             with self.deck:
                 self._paint_keys(page_sessions, active_session)
-                if self.plan.mode == layout.MODE_REDUCED:
-                    self._paint_control_keys(view_label, turning)
+                # Unconditional in both modes: the default FULL-mode plan
+                # has zero non-"session" key bindings, so this loop does
+                # nothing there -- byte-identical to the old REDUCED-only
+                # gate -- unless the user has remapped a FULL-mode key
+                # away from "session".
+                self._paint_control_keys(view_label, turning)
                 if self.plan.use_strip:
                     message = _build_strip_message(
                         view_label=view_label,
@@ -609,6 +683,7 @@ class _ActiveRuntime:
             (self.plan.prev_key, "", "< PREV", page_text),
             (self.plan.next_key, "", "NEXT >", page_text),
         ]
+        handled = {key_index for key_index, *_ in specs if key_index is not None}
         for key_index, title, body, footer in specs:
             if key_index is None:
                 continue
@@ -622,6 +697,21 @@ class _ActiveRuntime:
                 ),
             )
             self.last_key_state[key_index] = control_identity
+
+        # Any OTHER remapped control key (e.g. a REDUCED-layout key bound to
+        # "focus_app" instead of one of the three defaults) is inert while a
+        # picker is open (§7's default-deny table) -- blank it so it never
+        # shows stale normal-mode content. In the default config this set is
+        # always empty (every non-session key IS one of the three specs
+        # above), so this adds no extra paint calls for an unconfigured deck.
+        for key_index in range(self.deck.key_count()):
+            if key_index in handled or key_index in self.plan.session_slots:
+                continue
+            blank_identity: object = ("picker-blank",)
+            if self.last_key_state[key_index] == blank_identity:
+                continue
+            self.deck.set_key_image(key_index, rendering.render_empty_key(self.deck))
+            self.last_key_state[key_index] = blank_identity
 
     def _paint_keys(
         self, page_sessions: list[Session], active_session: str | None
@@ -666,30 +756,43 @@ class _ActiveRuntime:
             self.last_key_state[key_index] = identity
 
     def _paint_control_keys(self, view_label: str, turning: bool) -> None:
-        """Paint the reserved VIEW/PREV/NEXT keys (REDUCED mode only), diffed.
+        """Paint every key whose resolved action isn't "session", diffed.
 
-        The VIEW key carries what the Deck+'s touch strip showed -- the
-        current view name (with the same "> " turn echo the strip used;
-        ASCII, because the default PIL font renders arrows as .notdef
-        boxes -- real-hardware feedback) plus the server label. PREV/NEXT
-        carry a pN/M footer whenever a view has more than one page,
-        matching the strip's own "only show page info when it matters"
-        convention.
+        This is the generalized replacement for the old hardcoded
+        VIEW/PREV/NEXT-only painter (docs/CONTROL_MAPPING_DESIGN.md calls
+        this out as the riskiest edit in the whole change): it iterates
+        every key index, skips the ones already painted as session tiles
+        by `_paint_keys` (via `session_slots`), and for the rest either
+        blanks a "none"-bound key or renders a labeled control key via
+        `_control_key_display`. Unconditional in both layout modes -- see
+        the call site in `_repaint_sessions`.
         """
         page = self.pager.page
         page_count = self.pager.page_count
         page_text = f"p{page}/{page_count}" if page_count > 1 else ""
-        view_body = f"> {view_label}" if turning else view_label
 
-        specs: list[tuple[int | None, str, str, str]] = [
-            (self.plan.view_key, "VIEW", view_body, self.hostname),
-            (self.plan.prev_key, "", "< PREV", page_text),
-            (self.plan.next_key, "", "NEXT >", page_text),
-        ]
-        for key_index, title, body, footer in specs:
-            if key_index is None:
+        session_slot_set = set(self.plan.session_slots)
+        for key_index in range(self.deck.key_count()):
+            if key_index in session_slot_set:
                 continue
-            identity: object = ("control", title, body, footer)
+            action = self.plan.bindings.get(f"key.{key_index}", "none")
+            if action == "none":
+                identity: object = ("control", "none")
+                if self.last_key_state[key_index] == identity:
+                    continue
+                self.deck.set_key_image(
+                    key_index, rendering.render_empty_key(self.deck)
+                )
+                self.last_key_state[key_index] = identity
+                continue
+            title, body, footer = _control_key_display(
+                action,
+                view_label=view_label,
+                turning=turning,
+                hostname=self.hostname,
+                page_text=page_text,
+            )
+            identity = ("control", title, body, footer)
             if self.last_key_state[key_index] == identity:
                 continue
             self.deck.set_key_image(
@@ -702,25 +805,51 @@ class _ActiveRuntime:
 
     # --- dial handling ------------------------------------------------
 
-    def handle_view_dial(self, event_type: DialEventType, value: object) -> None:
-        if event_type == DialEventType.TURN:
-            ticks = int(value)  # type: ignore[arg-type]
+    def handle_dial_turn(self, dial: int, action: str, ticks: int) -> None:
+        """Dispatch a dial turn by its resolved (relative-kind) action.
+
+        `view_cycle`/`page_cycle` reuse the exact pre-existing behavior
+        (normal-mode turn, or -- while their matching picker is open --
+        scrolling that picker's window); `brightness_cycle` is new. Any
+        other value (including "none", the default for an unassigned
+        dial) is a no-op. `repaint()` is called unconditionally afterward,
+        matching the pre-existing behavior of always refreshing the
+        strip/keys even on an ignored turn.
+        """
+        label = f"dial[{dial}]"
+        if action == "view_cycle":
             if self.picker.mode == PickerMode.VIEW:
                 total = len(self.view_cycler.names())
                 self.picker.scroll(ticks, total=total, page_size=self.deck.key_count())
             elif self.picker.mode == PickerMode.NONE:
                 # Normal-mode turn behavior is unchanged -- only PRESS
                 # changes meaning (see `PickerController`'s docstring).
-                self.view_cycler.turn(int(value), self._commit_view)  # type: ignore[arg-type]
-            # else: PAGE picker is open -- dial 0 isn't its owner, ignore the turn.
+                self.view_cycler.turn(ticks, self._commit_view)
+            # else: PAGE picker is open -- this dial isn't its owner, ignore.
             self.repaint()
-        elif event_type == DialEventType.PUSH and value:
-            logger.info("dial[0] pressed -> %s", self.picker.press_view_dial())
+        elif action == "page_cycle":
+            if self.picker.mode == PickerMode.PAGE:
+                total = self.pager.page_count
+                self.picker.scroll(ticks, total=total, page_size=self.deck.key_count())
+            elif self.picker.mode == PickerMode.NONE:
+                self.pager.turn(ticks)
+            # else: VIEW picker is open -- this dial isn't its owner, ignore.
             self.repaint()
+        elif action == "brightness_cycle":
+            self._adjust_brightness(ticks * BRIGHTNESS_STEP_PERCENT, label)
+        elif action == controls_mod.NONE_ACTION:
+            logger.info("%s turn %+d (unassigned)", label, ticks)
+        else:
+            logger.info(
+                "%s turn %+d -> action %r is not a dial-turn action (ignoring)",
+                label,
+                ticks,
+                action,
+            )
 
     def _commit_view(self, view: str) -> None:
-        """Debounced (or press-immediate) dial-0 commit: PATCH, then refresh fast."""
-        logger.info("dial[0] view cycle commit -> %r", view)
+        """Debounced (or press-immediate) view-cycle commit: PATCH, then refresh fast."""
+        logger.info("view cycle commit -> %r", view)
         try:
             with self.client_lock:
                 self.client.set_active_view(view)
@@ -732,35 +861,23 @@ class _ActiveRuntime:
                 rendering.paint_status_strip(self.deck, message)
                 self.last_strip = message
 
-    def handle_page_dial(self, event_type: DialEventType, value: object) -> None:
-        if event_type == DialEventType.TURN:
-            ticks = int(value)  # type: ignore[arg-type]
-            if self.picker.mode == PickerMode.PAGE:
-                total = self.pager.page_count
-                self.picker.scroll(ticks, total=total, page_size=self.deck.key_count())
-            elif self.picker.mode == PickerMode.NONE:
-                # Normal-mode turn behavior is unchanged -- only PRESS
-                # changes meaning (see `PickerController`'s docstring).
-                self.pager.turn(int(value))  # type: ignore[arg-type]
-            # else: VIEW picker is open -- dial 1 isn't its owner, ignore the turn.
-            self.repaint()
-        elif event_type == DialEventType.PUSH and value:
-            logger.info("dial[1] pressed -> %s", self.picker.press_page_dial())
-            self.repaint()
+    def handle_dial_push(self, dial: int, action: str) -> None:
+        """Dispatch a dial push by its resolved (momentary-kind) action."""
+        self._dispatch_control_action(action, slot=None, label=f"dial[{dial}]")
 
     # --- key handling ------------------------------------------------------
 
     def handle_key(self, key: int) -> None:
-        """Dispatch a physical key press to its role under the layout plan.
+        """Dispatch a physical key press to its resolved action under the plan.
 
-        In FULL mode every key is a session slot (`classify_key` maps key N
-        to slot N), so this is the pre-existing connect path unchanged. In
-        REDUCED mode the reserved VIEW/PREV/NEXT keys perform their control
-        action and never connect. Picker mode takes priority: in FULL mode
-        (pickers open via dial presses) a tap selects an option; in REDUCED
-        mode (the VIEW key opens the view picker) taps dispatch through the
-        pure `interaction.handle_picker_key` -- BACK cancels, PREV/NEXT
-        page, a view-slot tap selects.
+        Picker mode takes priority: in FULL mode (pickers open via dial
+        presses) a tap always selects an option/page slot regardless of
+        that key's normal-mode binding -- there's no reserved "BACK" key
+        on an all-session-tile deck, so cancellation is always the
+        owning dial's second push (see `PickerController`). In REDUCED
+        mode (the VIEW key opens the view picker) taps dispatch through
+        the pure `interaction.handle_picker_key`, which derives BACK/PAGE/
+        SELECT/IGNORE from each pressed key's normal-mode action (§7).
         """
         mode = self.picker.mode
         if mode == PickerMode.VIEW:
@@ -773,42 +890,173 @@ class _ActiveRuntime:
             self._select_page_option(key)
             return
 
-        kind, slot = layout.classify_key(self.plan, key)
-        if kind == layout.KEY_VIEW:
-            # Open the paged view picker (replaces the old tap-to-cycle):
-            # the session-slot keys become view choices, VIEW becomes BACK,
-            # PREV/NEXT page the list. Selection PATCHes the server-global
-            # `active_view` -- same effect a dial-0 pick has on the Deck+.
-            self.picker.press_view_dial()
-            logger.info("key[%d] VIEW pressed -> view picker opened", key)
-            self.repaint()
+        action, slot = layout.classify_key(self.plan, key)
+        self._dispatch_control_action(action, slot=slot, label=f"key[{key}]")
+
+    def _dispatch_control_action(
+        self, action: str, *, slot: int | None, label: str
+    ) -> None:
+        """Shared dispatch for one momentary-action press, from a key or a dial push.
+
+        `slot` is only meaningful for `"session"` (always None for a dial
+        push, since a dial isn't a session tile -- see the module note
+        below on binding `"session"`/`"none"` to a dial push).
+        """
+        if action == controls_mod.NONE_ACTION:
+            logger.info("%s pressed (unassigned, ignoring)", label)
             return
-        if kind == layout.KEY_PREV:
+        if action == controls_mod.SESSION_ACTION:
+            if slot is None:
+                logger.info(
+                    "%s bound to 'session' but has no session slot -- ignoring",
+                    label,
+                )
+                return
+            self.connect_slot(slot, label)
+            return
+        if action == "view_picker":
+            logger.info("%s -> %s", label, self.picker.press_view_dial())
+            self.repaint()
+        elif action == "page_picker":
+            logger.info("%s -> %s", label, self.picker.press_page_dial())
+            self.repaint()
+        elif action == "page_prev":
             page = self.pager.turn(-1)
-            logger.info("key[%d] PREV pressed -> page %d", key, page)
+            logger.info("%s -> page %d", label, page)
             self.repaint()
-            return
-        if kind == layout.KEY_NEXT:
+        elif action == "page_next":
             page = self.pager.turn(1)
-            logger.info("key[%d] NEXT pressed -> page %d", key, page)
+            logger.info("%s -> page %d", label, page)
             self.repaint()
-            return
+        elif action == "view_all":
+            logger.info("%s -> view ALL", label)
+            threading.Thread(target=self._trigger_view_all, daemon=True).start()
+        elif action == "page_first":
+            page = self.pager.press()
+            logger.info("%s -> page %d", label, page)
+            self.repaint()
+        elif action == "page_last":
+            page = self.pager.go_to(self.pager.page_count)
+            logger.info("%s -> page %d", label, page)
+            self.repaint()
+        elif action == "view_prev":
+            logger.info("%s -> view prev", label)
+            self.view_cycler.turn(-1, self._commit_view)
+            self.repaint()
+        elif action == "view_next":
+            logger.info("%s -> view next", label)
+            self.view_cycler.turn(1, self._commit_view)
+            self.repaint()
+        elif action == "focus_app":
+            logger.info("%s -> focus", label)
+            threading.Thread(
+                target=focus.focus_app, args=(self.focus_app_name,), daemon=True
+            ).start()
+        elif action == "refresh_now":
+            logger.info("%s -> refresh now", label)
+            threading.Thread(target=self._refresh_now, daemon=True).start()
+        elif action == "toggle_last":
+            self._toggle_last(label)
+        elif action == "brightness_up":
+            self._adjust_brightness(BRIGHTNESS_STEP_PERCENT, label)
+        elif action == "brightness_down":
+            self._adjust_brightness(-BRIGHTNESS_STEP_PERCENT, label)
+        else:
+            logger.warning(
+                "%s: action %r has no key/dial-push dispatch (relative-only "
+                "action bound to a momentary address? Gate 1 should have "
+                "rejected this)",
+                label,
+                action,
+            )
 
-        if slot is None:
-            logger.info("key[%d] pressed (unassigned, ignoring)", key)
-            return
-        self.connect_slot(slot, key)
+    def _trigger_view_all(self) -> None:
+        """Background-thread body for `view_all` -- jump to "all", no debounce.
 
-    def connect_slot(self, slot: int, key: int) -> None:
-        """Connect the session shown in `slot` (pressed via physical `key`)."""
+        Revives `ViewCycler.press` (previously 0 callers -- see
+        docs/CONTROL_MAPPING_DESIGN.md §1.3). Backgrounded like
+        `_do_connect`/`focus_app`: `press()` calls `_commit_view`
+        synchronously, which does a blocking PATCH+refresh -- never do
+        that on the HID callback thread.
+        """
+        self.view_cycler.press(self._commit_view)
+        self.repaint()
+
+    def _refresh_now(self) -> None:
+        """Background-thread body for `refresh_now`.
+
+        No poll-loop surgery needed (§2.4): `refresh()` is already called
+        from a non-poll thread elsewhere in this class (`_commit_view`),
+        and serializes through `client_lock`/`paint_lock` exactly like a
+        concurrent poll tick would.
+        """
+        try:
+            self.refresh()
+        except MuxplexError:
+            logger.exception("refresh_now failed")
+
+    def _toggle_last(self, label: str) -> None:
+        """Connect the previously-active session, with a dead-session guard.
+
+        `previous_session` is tracked by `_note_active_session_locked`
+        every time `active_session` changes -- both from a local key-press
+        connect and from a server-side switch observed via `_process`
+        (someone switched sessions from the PWA).
+        """
+        target = self.previous_session
+        if target is None:
+            logger.info("%s TOGGLE pressed (no previous session)", label)
+            return
+        with self.paint_lock:
+            exists = any(s.name == target for s in self.ordered)
+        if not exists:
+            logger.info(
+                "%s TOGGLE pressed -> %r no longer exists, ignoring", label, target
+            )
+            return
+        logger.info("%s TOGGLE pressed -> connect session %r", label, target)
+        with self.paint_lock:
+            self._note_active_session_locked(target)
+        self.repaint()
+        threading.Thread(target=self._do_connect, args=(target,), daemon=True).start()
+
+    def _adjust_brightness(self, delta: int, label: str) -> None:
+        """Step `self.brightness` by `delta`, clamped to [floor, 100], and apply it.
+
+        Session-local only -- never written to config.json (see
+        `self.brightness`'s field docstring).
+        """
+        self.brightness = max(
+            BRIGHTNESS_FLOOR_PERCENT, min(100, self.brightness + delta)
+        )
+        logger.info("%s -> brightness %d%%", label, self.brightness)
+        try:
+            self.deck.set_brightness(self.brightness)
+        except Exception:
+            logger.exception("failed to set brightness to %d%%", self.brightness)
+
+    def _note_active_session_locked(self, new_name: str | None) -> None:
+        """Update `active_session` + `previous_session` together.
+
+        Caller must hold `paint_lock`. The single home for this pairing so
+        `toggle_last` sees every active-session change, whether it came
+        from a local key-press connect (`connect_slot`) or a server-side
+        switch observed by `_process` (someone switched in the PWA).
+        """
+        if new_name != self.active_session and self.active_session is not None:
+            self.previous_session = self.active_session
+        self.active_session = new_name
+
+    def connect_slot(self, slot: int, label: str) -> None:
+        """Connect the session shown in `slot` (pressed via `label`, e.g. "key[3]")."""
         with self.paint_lock:
             names = list(self.session_names)
         if slot >= len(names):
-            logger.info("key[%d] pressed (empty slot, ignoring)", key)
+            logger.info("%s pressed (empty slot, ignoring)", label)
             return
         name = names[slot]
         logger.info(
-            "key[%d] pressed -> connect session %r (optimistic highlight)", key, name
+            "%s pressed -> connect session %r (optimistic highlight)", label, name
         )
         # Move the highlight NOW (don't wait for the next poll tick) and run
         # the actual HTTP connect on a background thread -- real-hardware
@@ -817,7 +1065,7 @@ class _ActiveRuntime:
         # input and delayed the highlight by up to a full poll interval. The
         # PWA already does this optimistically; this mirrors it.
         with self.paint_lock:
-            self.active_session = name
+            self._note_active_session_locked(name)
         self.repaint()
         threading.Thread(target=self._do_connect, args=(name,), daemon=True).start()
 
@@ -932,15 +1180,28 @@ def _make_key_callback(ctx: _ActiveRuntime):
 
 
 def _make_dial_callback(ctx: _ActiveRuntime):
+    """Dispatch a dial event by its RESOLVED ACTION, not a hardcoded dial index.
+
+    Every dial index looks up its own `dial.N.turn`/`dial.N.push` binding
+    from the plan -- there is nothing dial-0/dial-1-specific left here.
+    Reclaiming the Deck+'s dials 2/3 (previously always logged as
+    "unassigned") is exactly this generalization; see
+    docs/CONTROL_MAPPING_DESIGN.md §4.4.
+    """
+
     def on_dial(
         _deck: DeckDevice, dial: int, event_type: DialEventType, value: object
     ) -> None:
-        if dial == 0:
-            ctx.handle_view_dial(event_type, value)
-        elif dial == 1:
-            ctx.handle_page_dial(event_type, value)
-        else:
-            logger.info("dial[%d] %s %r (unassigned)", dial, event_type, value)
+        if event_type == DialEventType.TURN:
+            action = ctx.plan.bindings.get(
+                f"dial.{dial}.turn", controls_mod.NONE_ACTION
+            )
+            ctx.handle_dial_turn(dial, action, int(value))  # type: ignore[arg-type]
+        elif event_type == DialEventType.PUSH and value:
+            action = ctx.plan.bindings.get(
+                f"dial.{dial}.push", controls_mod.NONE_ACTION
+            )
+            ctx.handle_dial_push(dial, action)
 
     return on_dial
 
@@ -969,6 +1230,13 @@ def _describe_deck_caps(deck: DeckDevice) -> dict | None:
         return None
 
 
+def _unapplied_for_status(plan: layout.LayoutPlan) -> list[dict[str, str]] | None:
+    """JSON-serializable form of `plan.unapplied`, or None when empty."""
+    if not plan.unapplied:
+        return None
+    return [{"address": u.address, "reason": u.reason} for u in plan.unapplied]
+
+
 def _run_active(
     deck: DeckDevice,
     client: MuxplexClient,
@@ -978,6 +1246,7 @@ def _run_active(
     sort_mode: str,
     focus_app_name: str,
     reporter: StatusReporter,
+    controls: Mapping[str, str] | None = None,
 ) -> None:
     """Run one connected-device session against the muxplex server.
 
@@ -995,11 +1264,28 @@ def _run_active(
         # but a device that just went away mid-open shouldn't be fatal here,
         # the outer loop's is_open()/connected() checks handle that.
         logger.exception("failed to set brightness to %d%%", FULL_BRIGHTNESS_PERCENT)
-    ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name)
+    ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name, controls)
     logger.info("%s", layout.describe_plan(ctx.plan))
+    # Gate 2 diagnostics (§6): reported, never fatal -- a binding that
+    # doesn't apply to THIS deck may be perfectly valid for a different one
+    # the user swaps in later (hotplug). Surfaced at WARNING here (surface
+    # 1 of 4: bring-up log), in `status.json` below (surface 2), and via
+    # `doctor`/`muxplex-deck controls` (surfaces 3-4, in cli.py).
+    for unapplied in ctx.plan.unapplied:
+        logger.warning(
+            "control binding %s does not apply to this deck: %s",
+            unapplied.address,
+            unapplied.reason,
+        )
+    for advisory in ctx.plan.advisories:
+        logger.warning("control binding advisory: %s", advisory)
     _paint_status_only(deck, "connecting to muxplex...", ctx.plan)
 
-    reporter.update(device_connected=True, device_caps=_describe_deck_caps(deck))
+    reporter.update(
+        device_connected=True,
+        device_caps=_describe_deck_caps(deck),
+        unapplied=_unapplied_for_status(ctx.plan),
+    )
 
     deck.set_key_callback(_make_key_callback(ctx))
     if ctx.plan.use_dials:
@@ -1084,7 +1370,10 @@ def _run_active(
                 return
     finally:
         reporter.update(
-            device_connected=False, device_caps=None, server_connected=False
+            device_connected=False,
+            device_caps=None,
+            unapplied=None,
+            server_connected=False,
         )
         _safe_close(deck)
 
@@ -1306,6 +1595,7 @@ def _run(config: Config, manager: DeviceManager) -> int:
                         config.sort,
                         config.focus_app,
                         reporter,
+                        config.controls,
                     )
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")

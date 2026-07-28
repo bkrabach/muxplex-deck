@@ -329,6 +329,7 @@ def _make_config(tmp_path: Path) -> Config:
         ca_file=None,
         poll_interval=2.0,
         sort="attention",
+        controls={},
         focus_app="",
     )
 
