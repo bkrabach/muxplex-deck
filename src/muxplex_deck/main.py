@@ -195,6 +195,62 @@ def _safe_close(deck: DeckDevice) -> None:
         logger.exception("Unexpected error while closing deck")
 
 
+def _shutdown_cleanup(deck: DeckDevice | None) -> None:
+    """Blank the Stream Deck's screen on the way out of `_run()`.
+
+    Real-world report: `muxplex-deck service stop` stopped the process, but
+    the deck's LCD keys kept showing whatever session icons were painted at
+    the moment of shutdown -- indefinitely, since nothing ever repaints a
+    physically-powered deck once its only driver has exited. `reset()` is
+    the right primitive for this (not a hand-painted blank image per key):
+    per the `streamdeck` library's own contract ("Resets the StreamDeck,
+    clearing all button images and showing the standby image") it's a
+    single firmware-level command that blanks every key and the touch
+    strip in one call, and it's the same call `_safe_close` already uses
+    for the disconnect-recovery path -- one reset semantics, not two.
+
+    Called from `_run()`'s own outermost `finally`, which fires on every
+    exit path from that function: a clean loop exit (`shutting_down` set by
+    SIGTERM/SIGINT -- see `_install_signal_handler`), a normal return, or an
+    uncaught exception propagating out of the loop. This is deliberately
+    IN ADDITION TO (not instead of) `_run_active`'s own per-session
+    `_safe_close` call: that one exists for disconnect/error recovery mid
+    loop-iteration (so the outer hotplug loop can cleanly search for a
+    replacement device) and fires on every session end, not just shutdown.
+    This function is the single place that's *guaranteed* to run exactly
+    once per `_run()` call, independent of which nested branch was active
+    when shutdown was requested -- including the narrow windows where a
+    device was found/opened but a session's own try/finally hadn't been
+    entered yet. Calling `_safe_close` twice on the same already-closed
+    device is harmless: `is_open()` is False by then, so the redundant
+    `reset()` is skipped, and a redundant `close()` is swallowed by
+    `_safe_close`'s own exception guard.
+
+    Best-effort, like `_safe_close`: never raises, even if the device was
+    unplugged, already closed, or claimed by another process by the time
+    this runs -- a cleanup path that raises during shutdown would be worse
+    than a stale screen. `deck` is None when shutdown happens before any
+    device was ever found (or after the most recent one was unplugged),
+    in which case there is nothing to blank and this is a no-op.
+
+    Platform note: this only fires when the process gets a chance to run
+    Python code at all. A hard kill -- SIGKILL, or Windows `TerminateProcess`
+    (what `schtasks /End` uses against a Task Scheduler-launched process,
+    since it isn't a console app `/End` can send WM_CLOSE to) -- bypasses
+    the interpreter entirely; there is no hook point available for that
+    case, and none is faked here.
+    """
+    if deck is None:
+        return
+    try:
+        _safe_close(deck)
+    except Exception:
+        # Last-resort guard: _safe_close already catches its own internal
+        # errors, but shutdown must never raise regardless of what future
+        # changes might do to _safe_close.
+        logger.exception("Unexpected error while blanking deck during shutdown")
+
+
 def _interruptible_wait(
     deck: DeckDevice, shutting_down: threading.Event, seconds: float
 ) -> bool:
@@ -1143,6 +1199,14 @@ def _run(config: Config, manager: DeviceManager) -> int:
     logged_waiting = False
     last_heartbeat = 0.0
 
+    # The most recently found device (or None, if absent/never found yet).
+    # Tracked here -- not just inside `_run_active` -- so the `finally`
+    # below can blank the screen on shutdown regardless of which nested
+    # branch was executing when `shutting_down` was set: waiting for
+    # hardware (None, nothing to blank), between `_find_deck` and
+    # `deck.open()`, or mid `_run_active` session. See `_shutdown_cleanup`.
+    current_deck: DeckDevice | None = None
+
     # Published for `muxplex-deck status` to read -- see `.statusfile`'s
     # docstring for why a running sidecar publishes its own status instead
     # of `status` probing the (possibly exclusively-held) device directly.
@@ -1173,6 +1237,7 @@ def _run(config: Config, manager: DeviceManager) -> int:
                 shutting_down.wait(DEVICE_POLL_SECONDS)
                 continue
 
+            current_deck = deck
             if deck is None:
                 reporter.update(
                     device_connected=False,
@@ -1254,6 +1319,7 @@ def _run(config: Config, manager: DeviceManager) -> int:
                 shutting_down.wait(DEVICE_POLL_SECONDS)
     finally:
         logger.info("muxplex-deck shutting down")
+        _shutdown_cleanup(current_deck)
 
     return 0
 

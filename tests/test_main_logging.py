@@ -564,3 +564,223 @@ class TestRunSingleInstanceGuard:
 
         expected_lock_path = tmp_path / "state" / "muxplex-deck" / "muxplex-deck.lock"
         assert expected_lock_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# _shutdown_cleanup / device blanking on shutdown -- real user report:
+# `muxplex-deck service stop` stopped the process but the deck's LCD keys
+# kept showing the last-painted session state indefinitely. Fires on every
+# `_run()` exit path (SIGTERM/SIGINT via `_install_signal_handler`, or a
+# normal/exceptional return) via `_run()`'s own outermost `finally` --
+# independent of whether a device happened to be mid-active-session.
+# Never fires on a hard kill (SIGKILL, Windows TerminateProcess) -- there is
+# no Python hook point for that, and none is faked here.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDeck:
+    """Minimal fake `DeckDevice` that records reset()/close() calls and can
+
+    simulate an error from either, without ever raising past _safe_close.
+    """
+
+    def __init__(
+        self,
+        *,
+        open_state: bool = True,
+        raise_on_reset: Exception | None = None,
+        raise_on_close: Exception | None = None,
+    ) -> None:
+        self._open = open_state
+        self._raise_on_reset = raise_on_reset
+        self._raise_on_close = raise_on_close
+        self.reset_calls = 0
+        self.close_calls = 0
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def connected(self) -> bool:
+        return self._open
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+        if self._raise_on_reset is not None:
+            raise self._raise_on_reset
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._open = False
+        if self._raise_on_close is not None:
+            raise self._raise_on_close
+
+
+class TestShutdownCleanup:
+    def test_none_deck_is_a_safe_no_op(self) -> None:
+        main_mod._shutdown_cleanup(None)  # must not raise
+
+    def test_open_deck_is_reset_and_closed(self) -> None:
+        deck = _RecordingDeck(open_state=True)
+        main_mod._shutdown_cleanup(deck)  # type: ignore[arg-type]
+        assert deck.reset_calls == 1
+        assert deck.close_calls == 1
+
+    def test_already_closed_deck_skips_reset_but_still_closes(self) -> None:
+        """`_safe_close`'s existing `is_open()` guard: a device that was
+
+        already reset+closed earlier (e.g. by `_run_active`'s own
+        finally) must not be reset a second time, but close() is still
+        called -- harmless on an already-closed handle.
+        """
+        deck = _RecordingDeck(open_state=False)
+        main_mod._shutdown_cleanup(deck)  # type: ignore[arg-type]
+        assert deck.reset_calls == 0
+        assert deck.close_calls == 1
+
+    def test_reset_error_is_swallowed_and_close_still_runs(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        deck = _RecordingDeck(
+            open_state=True, raise_on_reset=RuntimeError("device unplugged")
+        )
+        with caplog.at_level(logging.ERROR, logger="muxplex_deck"):
+            main_mod._shutdown_cleanup(deck)  # type: ignore[arg-type] -- must not raise
+        assert deck.close_calls == 1
+        assert any(
+            "Unexpected error while resetting deck" in r.message for r in caplog.records
+        )
+
+    def test_close_error_is_swallowed(self, caplog: pytest.LogCaptureFixture) -> None:
+        deck = _RecordingDeck(
+            open_state=True, raise_on_close=RuntimeError("handle already gone")
+        )
+        with caplog.at_level(logging.ERROR, logger="muxplex_deck"):
+            main_mod._shutdown_cleanup(deck)  # type: ignore[arg-type] -- must not raise
+        assert deck.reset_calls == 1
+        assert any(
+            "Unexpected error while closing deck" in r.message for r in caplog.records
+        )
+
+    def test_a_completely_broken_device_never_raises_out_of_shutdown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Defense in depth: even if `is_open()` itself blows up (a future
+
+        backend bug, or a device object in a genuinely broken state), the
+        shutdown path must still complete cleanly -- never make shutdown
+        itself the thing that crashes.
+        """
+
+        class _ExplodingDeck:
+            def is_open(self) -> bool:
+                raise RuntimeError("completely broken")
+
+            def close(self) -> None:
+                raise RuntimeError("also broken")
+
+        with caplog.at_level(logging.ERROR, logger="muxplex_deck"):
+            main_mod._shutdown_cleanup(_ExplodingDeck())  # type: ignore[arg-type] -- must not raise
+
+
+class TestRunCallsShutdownCleanupOnEveryExitPath:
+    """Integration: `main.run()` -> `_run()` actually wires `current_deck`
+
+    through to `_shutdown_cleanup` on the way out, regardless of which
+    branch was executing when `shutting_down` was set.
+    """
+
+    def test_shutdown_while_device_absent_is_a_no_op(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No device was ever found -- nothing to blank, and no crash."""
+        monkeypatch.setattr(
+            statusfile, "default_status_path", lambda: tmp_path / "status.json"
+        )
+        config = _make_config(tmp_path)
+
+        shutting_down = threading.Event()
+        call_count = {"n": 0}
+
+        def _wait(seconds: float) -> bool:
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                shutting_down.set()
+            return False
+
+        monkeypatch.setattr(shutting_down, "wait", _wait)
+        monkeypatch.setattr(main_mod, "_install_signal_handler", lambda: shutting_down)
+
+        cleanup_calls: list[Any] = []
+        real_cleanup = main_mod._shutdown_cleanup
+
+        def _spy(deck: Any) -> None:
+            cleanup_calls.append(deck)
+            real_cleanup(deck)
+
+        monkeypatch.setattr(main_mod, "_shutdown_cleanup", _spy)
+
+        result = main_mod.run(
+            config, _NeverFindsDevice(), lock_path=tmp_path / "l.lock"
+        )
+        assert result == 0
+        assert cleanup_calls == [None]
+
+    def test_shutdown_while_open_keeps_failing_still_blanks_the_known_device(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Proves the fix's actual value over relying solely on
+
+        `_run_active`'s own per-session cleanup: a device that was found
+        but never made it into an active session (every `deck.open()`
+        attempt failed) still gets passed to `_shutdown_cleanup` when
+        shutdown fires -- because `current_deck` is set right after
+        `_find_deck` succeeds, independent of whether `_run_active` was
+        ever entered.
+        """
+        from muxplex_deck import hidhelp
+
+        monkeypatch.setattr(
+            hidhelp,
+            "explain_open_failure",
+            lambda error, **k: hidhelp.Guidance(
+                status="warn", message="fake guidance", state="W7"
+            ),
+        )
+        monkeypatch.setattr(
+            statusfile, "default_status_path", lambda: tmp_path / "status.json"
+        )
+        config = _make_config(tmp_path)
+
+        deck = _AlwaysFailsToOpenDeck()
+        manager = _FakeManagerAlwaysFindsDevice(deck)
+
+        shutting_down = threading.Event()
+        call_count = {"n": 0}
+        real_wait = shutting_down.wait
+
+        def _wait(seconds: float) -> bool:
+            call_count["n"] += 1
+            if call_count["n"] >= 3:
+                shutting_down.set()
+            return real_wait(0)
+
+        monkeypatch.setattr(shutting_down, "wait", _wait)
+        monkeypatch.setattr(main_mod, "_install_signal_handler", lambda: shutting_down)
+
+        cleanup_calls: list[Any] = []
+        real_cleanup = main_mod._shutdown_cleanup
+
+        def _spy(candidate: Any) -> None:
+            cleanup_calls.append(candidate)
+            real_cleanup(candidate)
+
+        monkeypatch.setattr(main_mod, "_shutdown_cleanup", _spy)
+
+        result = main_mod.run(config, manager, lock_path=tmp_path / "l.lock")
+        assert result == 0
+        # The last call is the one that matters (fires from the finally);
+        # it must be the actual device, not None, even though open() never
+        # once succeeded.
+        assert cleanup_calls[-1] is deck
