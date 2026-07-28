@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from muxplex_deck import report as report_mod
 from muxplex_deck import service as service_mod
 
 
@@ -611,20 +612,113 @@ class TestWinStart:
 
 
 class TestWinStop:
-    def test_stop_is_silent_and_ignores_failure(
+    """`_win_stop()` -- confirmed-stop gate + best-effort deck-screen reset.
+
+    v0.9.3 and earlier: stop was fully silent (nothing narrated). Fixed:
+    `schtasks /End` is `TerminateProcess`, which bypasses
+    `main._shutdown_cleanup()` entirely, so the deck's LCD keys kept
+    showing the last-painted frame indefinitely after `service stop`. Now
+    `_win_stop()` waits for `_win_wait_for_task_stopped()` to confirm the
+    task is genuinely gone (never race a not-yet-dead process for the
+    device), then best-effort clears the screen via
+    `_reset_deck_best_effort()` and narrates the outcome.
+    """
+
+    def test_end_failure_is_still_ignored(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
-        """Consistent with systemd/launchd's silent stop() -- nothing of ours
+        """`schtasks /End` failing (task not running) is not itself an
 
-        to report, and `schtasks /End` failing (task not running) is not an
-        error worth surfacing.
+        error worth surfacing -- the confirmed-stopped gate below still
+        runs and decides whether to attempt the reset.
         """
         monkeypatch.setattr(
             service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(1)
         )
+        monkeypatch.setattr(
+            service_mod, "_win_wait_for_task_stopped", lambda timeout=None: True
+        )
+        monkeypatch.setattr(
+            service_mod,
+            "_reset_deck_best_effort",
+            lambda: report_mod.Check(
+                "deck",
+                report_mod.FINE,
+                "No Stream Deck detected -- nothing to clear",
+            ),
+        )
         service_mod._win_stop()  # must not raise
         out = capsys.readouterr().out
-        assert out == ""
+        assert "nothing to clear" in out
+
+    def test_confirmed_stopped_attempts_reset(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_win_wait_for_task_stopped", lambda timeout=None: True
+        )
+        calls = {"n": 0}
+
+        def _fake_reset() -> Any:
+            calls["n"] += 1
+            return report_mod.Check(
+                "deck", report_mod.FINE, "Cleared the Stream Deck screen"
+            )
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _fake_reset)
+
+        service_mod._win_stop()  # must not raise
+
+        assert calls["n"] == 1
+        out = capsys.readouterr().out
+        assert "Cleared the Stream Deck screen" in out
+
+    def test_unconfirmed_stop_skips_reset_never_races_the_device(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_win_wait_for_task_stopped", lambda timeout=None: False
+        )
+
+        def _blow_up_if_called() -> Any:
+            raise AssertionError(
+                "must not attempt reset before the task is confirmed stopped"
+            )
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _blow_up_if_called)
+
+        service_mod._win_stop()  # must not raise
+
+        out = capsys.readouterr().out
+        assert "skipping screen clear" in out
+
+    def test_device_error_during_reset_does_not_fail_stop(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_win_wait_for_task_stopped", lambda timeout=None: True
+        )
+
+        def _boom() -> Any:
+            raise RuntimeError("device claimed elsewhere")
+
+        monkeypatch.setattr(device_real_mod, "RealDeviceManager", _boom)
+
+        service_mod._win_stop()  # must not raise, must not exit
+
+        out = capsys.readouterr().out
+        assert "could not access the Stream Deck" in out
 
 
 class TestWinWaitForTaskStopped:

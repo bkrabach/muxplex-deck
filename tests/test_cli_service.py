@@ -1404,3 +1404,271 @@ class TestRestartWaitsForFreshStatus:
         with pytest.raises(SystemExit) as exc_info:
             service_mod._systemd_restart()
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# `_reset_deck_best_effort()` -- the CLI-side fix for the deck staying lit
+# after `service stop` hard-kills the sidecar (schtasks /End's
+# TerminateProcess on Windows; a SIGKILL escalation on systemd/launchd).
+# `main._shutdown_cleanup()` never runs on a hard kill, so THIS process
+# opens the now-free device and resets it instead. Real HID is neutralized
+# by `tests/conftest.py`'s autouse `_neutralize_real_hid` rail; these tests
+# override `device_real.RealDeviceManager` explicitly per case, exactly the
+# pattern `test_cli_doctor.py` already uses for `probe_deck_status`.
+# ---------------------------------------------------------------------------
+
+
+class _ResetFakeDeck:
+    """Minimal fake `DeckDevice` for `_reset_deck_best_effort()` tests.
+
+    `is_open()` reflects real open()/close() state (not just a flag some
+    test flips) so `main._safe_close`'s own "never double-reset an
+    already-closed device" guard is exercised honestly, not assumed.
+    """
+
+    def __init__(self, *, openable: bool = True) -> None:
+        self._openable = openable
+        self._open = False
+        self.open_calls = 0
+        self.reset_calls = 0
+        self.close_calls = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+        if not self._openable:
+            raise RuntimeError("Permission denied")
+        self._open = True
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._open = False
+
+
+class _ResetFakeManager:
+    def __init__(self, deck: _ResetFakeDeck | None) -> None:
+        self._deck = deck
+
+    def find_device(self) -> _ResetFakeDeck | None:
+        return self._deck
+
+
+class TestResetDeckBestEffort:
+    def test_no_device_is_fine_not_an_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _ResetFakeManager(None)
+        )
+        check = service_mod._reset_deck_best_effort()
+        assert check.glyph == report_mod.FINE
+        assert "nothing to clear" in check.value
+
+    def test_device_found_is_opened_reset_and_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        deck = _ResetFakeDeck(openable=True)
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _ResetFakeManager(deck)
+        )
+        check = service_mod._reset_deck_best_effort()
+        assert check.glyph == report_mod.FINE
+        assert "Cleared the Stream Deck screen" in check.value
+        assert deck.open_calls == 1
+        assert deck.reset_calls == 1
+        assert deck.close_calls == 1
+
+    def test_open_failure_is_reported_but_never_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        deck = _ResetFakeDeck(openable=False)
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _ResetFakeManager(deck)
+        )
+        check = service_mod._reset_deck_best_effort()  # must not raise
+        assert check.glyph == report_mod.ACT
+        assert "could not be opened" in check.value
+        assert deck.reset_calls == 0
+
+    def test_manager_construction_failure_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        def _boom() -> Any:
+            raise RuntimeError("hidapi missing")
+
+        monkeypatch.setattr(device_real_mod, "RealDeviceManager", _boom)
+        check = service_mod._reset_deck_best_effort()  # must not raise
+        assert check.glyph == report_mod.ACT
+        assert "could not access the Stream Deck" in check.value
+
+    def test_enumeration_failure_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        class _BrokenManager:
+            def find_device(self) -> None:
+                raise RuntimeError("usb bus error")
+
+        monkeypatch.setattr(
+            device_real_mod, "RealDeviceManager", lambda: _BrokenManager()
+        )
+        check = service_mod._reset_deck_best_effort()  # must not raise
+        assert check.glyph == report_mod.ACT
+        assert "could not look for a Stream Deck" in check.value
+
+
+# ---------------------------------------------------------------------------
+# `_systemd_stop()` / `_launchd_stop()` -- reset only after the sidecar is
+# CONFIRMED stopped, never before (never race a still-running process for
+# the exclusive HID handle). Windows' equivalent gating lives in
+# test_service_windows.py's TestWinStop.
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdStopResetsDeck:
+    def test_confirmed_stopped_attempts_reset(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+        calls = {"n": 0}
+
+        def _fake_reset() -> Any:
+            calls["n"] += 1
+            return report_mod.Check(
+                "deck", report_mod.FINE, "Cleared the Stream Deck screen"
+            )
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _fake_reset)
+
+        service_mod._systemd_stop()
+
+        assert calls["n"] == 1
+        out = capsys.readouterr().out
+        assert "Cleared the Stream Deck screen" in out
+
+    def test_still_active_skips_reset_never_races_the_device(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: True)
+
+        def _blow_up_if_called() -> Any:
+            raise AssertionError("must not attempt reset while still active")
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _blow_up_if_called)
+
+        service_mod._systemd_stop()  # must not raise
+
+        out = capsys.readouterr().out
+        assert "skipping screen clear" in out
+
+    def test_device_error_during_reset_does_not_fail_stop(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(service_mod, "service_is_active", lambda: False)
+
+        def _boom() -> Any:
+            raise RuntimeError("device claimed elsewhere")
+
+        monkeypatch.setattr(device_real_mod, "RealDeviceManager", _boom)
+
+        service_mod._systemd_stop()  # must not raise, must not exit
+
+        out = capsys.readouterr().out
+        assert "could not access the Stream Deck" in out
+
+
+class TestLaunchdStopResetsDeck:
+    def test_confirmed_unloaded_attempts_reset(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_wait_for_launchd_unload", lambda timeout=None: True
+        )
+        calls = {"n": 0}
+
+        def _fake_reset() -> Any:
+            calls["n"] += 1
+            return report_mod.Check(
+                "deck", report_mod.FINE, "Cleared the Stream Deck screen"
+            )
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _fake_reset)
+
+        service_mod._launchd_stop()
+
+        assert calls["n"] == 1
+        out = capsys.readouterr().out
+        assert "Cleared the Stream Deck screen" in out
+
+    def test_unload_timeout_skips_reset_never_races_the_device(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_wait_for_launchd_unload", lambda timeout=None: False
+        )
+
+        def _blow_up_if_called() -> Any:
+            raise AssertionError("must not attempt reset before unload is confirmed")
+
+        monkeypatch.setattr(service_mod, "_reset_deck_best_effort", _blow_up_if_called)
+
+        service_mod._launchd_stop()  # must not raise
+
+        out = capsys.readouterr().out
+        assert "skipping screen clear" in out
+
+    def test_device_error_during_reset_does_not_fail_stop(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        import muxplex_deck.device_real as device_real_mod
+
+        monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+        monkeypatch.setattr(
+            service_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0)
+        )
+        monkeypatch.setattr(
+            service_mod, "_wait_for_launchd_unload", lambda timeout=None: True
+        )
+
+        def _boom() -> Any:
+            raise RuntimeError("device claimed elsewhere")
+
+        monkeypatch.setattr(device_real_mod, "RealDeviceManager", _boom)
+
+        service_mod._launchd_stop()  # must not raise, must not exit
+
+        out = capsys.readouterr().out
+        assert "could not access the Stream Deck" in out

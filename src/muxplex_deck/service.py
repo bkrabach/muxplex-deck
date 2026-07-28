@@ -20,18 +20,31 @@ Ported near 1:1 from muxplex's own `service.py` (see that repo's
    Scheduler task in the interactive user's own context is used instead.
 
 ``service_install()``/``service_uninstall()``/``service_start()``/
-``service_restart()`` all narrate what they did through `report.py`'s
-VERDICT/STATE/ACTION renderer -- the same one `cli.doctor()`/`cli.status()`
-use (v0.7.0). This module used to print step-by-step progress with a local
-2-space-indent style as each subprocess call completed; it now collects a
-`report.Check` per step and renders ONE report at the end, for the same
-reason `doctor`/`status` do: one coherent, paste-friendly report beats a
-scroll of print statements, and it is the only way a Windows implementation
-with nothing resembling ``systemctl status``'s own formatting can present
-itself consistently with the other two platforms. `service_stop()` and
-`service_logs()` are unchanged in kind: `stop` was always silent (nothing of
-ours to narrate) and `logs` is -- and remains -- a raw passthrough stream
-(`journalctl -f` / `tail -f` / Windows' `Get-Content -Wait`). `service_status()`
+``service_restart()``/``service_stop()`` all narrate what they did through
+`report.py`'s VERDICT/STATE/ACTION renderer -- the same one
+`cli.doctor()`/`cli.status()` use (v0.7.0). This module used to print
+step-by-step progress with a local 2-space-indent style as each subprocess
+call completed; it now collects a `report.Check` per step and renders ONE
+report at the end, for the same reason `doctor`/`status` do: one coherent,
+paste-friendly report beats a scroll of print statements, and it is the
+only way a Windows implementation with nothing resembling
+``systemctl status``'s own formatting can present itself consistently with
+the other two platforms. `service_logs()` is unchanged in kind: a raw
+passthrough stream (`journalctl -f` / `tail -f` / Windows'
+`Get-Content -Wait`) -- and remains one. `service_stop()` is NO LONGER
+silent, as it used to be (v0.9.3 and earlier): each platform's stop
+function now also attempts a best-effort deck-screen clear once the
+sidecar is CONFIRMED stopped (never before -- see `_reset_deck_best_effort()`
+and each `_*_stop()`'s own docstring), and reports whether that succeeded.
+Real-world report: `muxplex-deck service stop` (Windows) left the Stream
+Deck's LCD keys showing the last-painted session icons indefinitely,
+because `schtasks /End` (`TerminateProcess`) bypasses the Python
+interpreter entirely -- no signal handler, no `finally`, no
+`main._shutdown_cleanup()` ever runs. The same bypass-Python risk exists
+on systemd/launchd too, just less often: both escalate to `SIGKILL` if the
+sidecar doesn't exit within their own stop timeout (`TimeoutStopSec`/
+`ExitTimeOut`), so the reset is applied uniformly on all three platforms,
+not just Windows. `service_status()`
 keeps macOS/Linux's raw passthrough to `launchctl print` / `systemctl status`
 (deliberately -- their own output carries more detail than we could
 reconstruct, and it is display-only, never parsed for a decision); Windows'
@@ -567,6 +580,88 @@ def _render_service_report(items: list[Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Deck-screen reset after a CONFIRMED stop -- shared by all three platforms.
+# ---------------------------------------------------------------------------
+
+
+def _reset_deck_best_effort() -> Any:
+    """Best-effort: open the (now-free) Stream Deck from THIS process and
+    reset it, clearing whatever the sidecar had painted on its LCD keys.
+
+    Real-world report: `muxplex-deck service stop` (Windows) stopped the
+    scheduled task, but the deck's LCD keys kept showing the last-painted
+    session icons indefinitely. Root cause -- see `main._shutdown_cleanup()`'s
+    own docstring: a hard kill (Windows `schtasks /End`'s `TerminateProcess`,
+    or a `SIGKILL` systemd/launchd escalate to after their own stop-timeout
+    elapses) bypasses the Python interpreter entirely -- no signal handler,
+    no `finally`, no `_shutdown_cleanup()` ever runs. The only way to blank
+    the screen after a hard kill is for a DIFFERENT process to open the
+    device afterward and reset it, so this function exists to be that
+    different process.
+
+    MUST only be called once the sidecar is CONFIRMED no longer running --
+    see each `_*_stop()`'s own docstring for how confirmation is
+    established on that platform (reusing the same unload/stopped-poll each
+    platform's `restart` already relies on). Calling this while the sidecar
+    might still be alive would race it for the exclusive HID handle.
+
+    Best-effort and non-fatal, exactly like `main._safe_close`: a missing
+    or unplugged deck, a deck still held by something else, or a hidapi
+    load failure are all reported here (via the returned `Check`, so the
+    caller can tell whether the screen was actually cleared) but this
+    function itself never raises -- a failed reset must never turn a
+    successful `service stop` into a reported failure, since the service is
+    stopped either way, screen or no screen.
+
+    Reuses `main._safe_close()` (reset() + close(), with its own
+    TransportError/exception swallowing) rather than re-implementing that
+    error handling a second time here -- one reset semantics, not two, per
+    `_shutdown_cleanup`'s own docstring. Both imports are per-call (not
+    module-level) so tests can patch `device_real.RealDeviceManager` the
+    same way `main._build_manager`/`cli.py`'s hardware checks already rely
+    on (see `tests/conftest.py`'s `_neutralize_real_hid` rail).
+    """
+    from . import report
+
+    try:
+        from .device_real import RealDeviceManager
+
+        manager = RealDeviceManager()
+    except Exception as exc:  # noqa: BLE001 -- e.g. DeviceProbeError (hidapi missing)
+        return report.Check(
+            "deck",
+            report.ACT,
+            f"could not access the Stream Deck to clear its screen: {exc}",
+        )
+
+    try:
+        deck = manager.find_device()
+    except Exception as exc:  # noqa: BLE001 -- enumeration failure, never fatal
+        return report.Check(
+            "deck", report.ACT, f"could not look for a Stream Deck to clear: {exc}"
+        )
+
+    if deck is None:
+        return report.Check(
+            "deck", report.FINE, "No Stream Deck detected -- nothing to clear"
+        )
+
+    try:
+        deck.open()
+    except Exception as exc:  # noqa: BLE001 -- unplugged/claimed mid-race, never fatal
+        return report.Check(
+            "deck",
+            report.ACT,
+            f"Stream Deck detected but could not be opened to clear its screen: {exc}",
+        )
+
+    from .main import _safe_close
+
+    _safe_close(deck)  # never raises -- reset() + close(), errors swallowed inside
+    return report.Check("deck", report.FINE, "Cleared the Stream Deck screen")
+
+
+# ---------------------------------------------------------------------------
 # Private implementations -- systemd (Linux)
 # ---------------------------------------------------------------------------
 
@@ -711,9 +806,38 @@ def _systemd_start() -> None:
 
 
 def _systemd_stop() -> None:
-    # No narration -- this was always silent (nothing of ours to report),
-    # and stays that way for consistency with launchd/Windows.
+    """Stop the service, then best-effort clear the deck's screen.
+
+    `systemctl --user stop` blocks until the unit is confirmed stopped --
+    systemd itself escalates to `SIGKILL` if the sidecar doesn't exit
+    within `TimeoutStopSec` (see the unit template's `KillMode=mixed`), so
+    by the time this call returns the sidecar is genuinely gone, one way
+    or the other. `service_is_active()` is still checked explicitly before
+    attempting the reset (cheap, and mirrors launchd/Windows' own explicit
+    confirmation below) rather than trusting the blocking call alone.
+
+    This is NOT a Windows-only concern: a `SIGKILL` escalation bypasses
+    Python exactly like Windows' `TerminateProcess` does (`main.
+    _shutdown_cleanup()` never runs), just less often, since a sidecar
+    that notices `shutting_down` promptly exits on its own SIGTERM first.
+    See `_reset_deck_best_effort()`'s docstring for the full reasoning.
+    """
+    from . import report
+
     subprocess.run(["systemctl", "--user", "stop", "muxplex-deck"], check=False)
+
+    items: list[Any] = []
+    if not service_is_active():
+        items.append(_reset_deck_best_effort())
+    else:
+        items.append(
+            report.Check(
+                "deck",
+                report.ACT,
+                "Could not confirm the service fully stopped -- skipping screen clear",
+            )
+        )
+    _render_service_report(items)
 
 
 def _wait_for_fresh_status(timeout: float | None = None) -> bool:
@@ -1013,8 +1137,35 @@ def _launchd_start() -> None:
 
 
 def _launchd_stop() -> None:
+    """Stop the service, then best-effort clear the deck's screen.
+
+    `launchctl bootout` returns before the job has necessarily finished
+    tearing down (see `_wait_for_launchd_unload()`'s docstring -- the exact
+    race `_launchd_restart()` already guards against), so this polls for
+    the job to actually disappear before attempting the reset below --
+    never race a still-shutting-down sidecar for the exclusive HID handle.
+    If launchd itself eventually escalates to `SIGKILL` (its default
+    `ExitTimeOut`), that bypasses Python exactly like Windows'
+    `TerminateProcess` does; see `_reset_deck_best_effort()`'s docstring.
+    """
+    from . import report
+
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{_LAUNCHD_LABEL}"], check=False)
+
+    items: list[Any] = []
+    if _wait_for_launchd_unload():
+        items.append(_reset_deck_best_effort())
+    else:
+        items.append(
+            report.Check(
+                "deck",
+                report.ACT,
+                "Could not confirm the service fully stopped within "
+                f"{_LAUNCHD_BOOTOUT_TIMEOUT_SECONDS:.0f}s -- skipping screen clear",
+            )
+        )
+    _render_service_report(items)
 
 
 def _launchd_restart() -> None:
@@ -1422,10 +1573,21 @@ def _win_start() -> None:
 
 
 def _win_stop() -> None:
-    # No narration -- consistent with systemd/launchd's silent stop().
-    # `schtasks /End` is a hard stop (TerminateProcess); Windows delivers
-    # no SIGTERM, so the deck is not blanked -- see WINDOWS_NATIVE_SPEC.md
-    # section 1.7. Failure is ignored, matching the spec's per-verb table.
+    """Stop the task, then best-effort clear the deck's screen.
+
+    `schtasks /End` is a hard stop (`TerminateProcess`); Windows delivers
+    no SIGTERM, so `main._shutdown_cleanup()` never runs and the deck's
+    LCD keys keep showing their last-painted frame indefinitely (real-
+    world report -- see AGENTS.md and `_reset_deck_best_effort()`'s
+    docstring). `/End` itself does not wait for Task Scheduler's own "is
+    this task running" bookkeeping to catch up with the killed process
+    (the exact lag `_win_wait_for_task_stopped()`'s docstring documents,
+    proven by the restart-race incident), so this polls that same helper
+    to confirm the task is genuinely no longer running before attempting
+    the reset below -- never race a not-yet-dead process for the device.
+    """
+    from . import report
+
     subprocess.run(
         ["schtasks", "/End", "/TN", _WIN_TASK_NAME],
         capture_output=True,
@@ -1433,6 +1595,20 @@ def _win_stop() -> None:
         check=False,
         stdin=subprocess.DEVNULL,
     )
+
+    items: list[Any] = []
+    if _win_wait_for_task_stopped():
+        items.append(_reset_deck_best_effort())
+    else:
+        items.append(
+            report.Check(
+                "deck",
+                report.ACT,
+                "Could not confirm the task fully stopped within "
+                f"{_WIN_STOP_POLL_TIMEOUT_SECONDS:.0f}s -- skipping screen clear",
+            )
+        )
+    _render_service_report(items)
 
 
 def _win_wait_for_task_stopped(timeout: float | None = None) -> bool:

@@ -364,3 +364,39 @@ product. See `README.md` for setup, config, and verification checklists.
   is Microsoft-doc-grounded, not yet hardware-confirmed) -- next real-deck
   session should confirm `focus_app` now raises the PWA window instead of
   only flashing its taskbar icon.
+- **`service stop` left the deck showing its last-painted frame forever --
+  VERIFIED on real Windows hardware (2026-07-28); fix implemented,
+  screen-clear NOT yet hardware-confirmed (needs a real deck + a hard-killed
+  sidecar to prove).** `service restart` now leaves the task running
+  (previous fix), but a plain `muxplex-deck service stop` still left the
+  Stream Deck's LCD keys showing whatever session icons were painted at the
+  moment of the kill, indefinitely. Root cause, already documented in the
+  v0.9.1 work above (`main._shutdown_cleanup()`'s own docstring): `schtasks
+  /End` kills the sidecar via `TerminateProcess`, which bypasses the Python
+  interpreter entirely -- no signal handler, no `finally`, so
+  `_shutdown_cleanup()` never runs. In-process cleanup can never cover this
+  path by construction; only a DIFFERENT process opening the now-free
+  device afterward can. **Fix:** each platform's `service.py` stop function
+  (`_win_stop`/`_systemd_stop`/`_launchd_stop`) now waits to CONFIRM the
+  sidecar is genuinely gone -- reusing the same unload/stopped-poll each
+  platform's `restart` already relies on (`_win_wait_for_task_stopped`,
+  `_wait_for_launchd_unload`, `service_is_active()` after systemd's own
+  blocking `stop`) -- then calls the new `_reset_deck_best_effort()`, which
+  opens the device from the CLI process itself and reuses `main._safe_close`
+  (one reset semantics, not two). Best-effort and non-fatal throughout: a
+  missing deck, a deck still claimed by something else, or a hidapi load
+  failure are reported but never turn a successful `stop` into a failure.
+  **Not Windows-only on purpose:** systemd's `TimeoutStopSec=10` +
+  `KillMode=mixed` and launchd's default `ExitTimeOut` both escalate to
+  `SIGKILL` if the sidecar doesn't exit in time, which bypasses Python
+  exactly like `TerminateProcess` does -- rarer than Windows (a sidecar that
+  notices `shutting_down` promptly exits on its own SIGTERM first), but the
+  same failure class, so the reset applies uniformly across all three
+  platforms rather than special-casing Windows. `service stop` is
+  consequently no longer silent (v0.9.3 and earlier): it now narrates
+  whether the screen was actually cleared, through the same
+  VERDICT/STATE/ACTION renderer `install`/`start`/`restart` already use.
+  **UNVERIFIED:** whether the reset actually clears a real deck's screen
+  after a genuine hard kill -- the logic is unit-tested (confirmed-stop
+  gating, reset invocation, non-fatal device errors) but needs a real
+  Stream Deck + Task Scheduler `service stop` to prove end-to-end.
