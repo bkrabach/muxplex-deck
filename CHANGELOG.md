@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.9.4 (2026-07-28)
+
+### Bug Fixes
+
+- **Stopping the service now clears the Stream Deck's screen.** Pressing Ctrl+C on a foreground run already reset the device, because the sidecar could clean up after itself. Stopping the background service could not: every platform's service manager ultimately terminates the process outright — immediately on Windows, and after a timeout on Linux and macOS — which bypasses the program's own shutdown handling entirely. The result was a deck left displaying sessions it was no longer tracking. The stop command now clears the device itself, after first confirming the sidecar has actually exited so the two never compete for it. If that confirmation times out, the screen is deliberately left alone and the command says so rather than risking a fight over the device. A failure to clear the screen never turns a successful stop into a reported failure.
+
+### Verification
+
+- 656 tests passed via pytest (baseline 642 + 14 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.9.3 (2026-07-28)
 
 ### Bug Fixes
