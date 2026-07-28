@@ -231,6 +231,149 @@ def impostor_message(paths: wsl.UsbipdPaths) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Native Windows guidance (WINDOWS_NATIVE_SPEC.md section 4) -- the win32
+# counterpart of the WSL states above. Same contract: `_windows_guidance()`
+# returns [] on a healthy box, so `doctor()`'s output stays unchanged there.
+# ---------------------------------------------------------------------------
+
+WIN_ELGATO_MESSAGE = (
+    "The official Elgato Stream Deck app is running and holds exclusive HID\n"
+    "access to the device -- muxplex-deck cannot open it while that app is\n"
+    "open. Close it (system tray -> Quit), then:\n"
+    "    muxplex-deck service restart"
+)
+
+WIN_NOHIDAPI_MESSAGE = (
+    "The bundled HIDAPI library (hidapi.dll) is missing from this install --\n"
+    "this happens on Windows arm64 (no official prebuilt for it) or a source\n"
+    "checkout without the vendored binary. Get one yourself:\n"
+    "    https://github.com/libusb/hidapi/releases\n"
+    "and either put hidapi.dll on your PATH, or drop it into the directory\n"
+    "you run muxplex-deck from (the loader also checks ./hidapi.dll)."
+)
+
+
+def win_usbip_message(device: wsl.UsbipdDevice) -> str:
+    return (
+        f"Stream Deck (BUSID {device.busid}, {device.vid_pid}) is currently handed to\n"
+        "WSL -- Windows cannot see it. No administrator rights needed:\n"
+        f"    usbipd detach --busid {device.busid}\n"
+        "Then physically unplug and replug the deck. Verified: after detach, the\n"
+        "deck keeps rendering whatever WSL last drew, and native Windows cannot\n"
+        "claim it until it is power-cycled -- this is a real step, not a quirk."
+    )
+
+
+def win_dll_shadow_message(resolved: str, vendored: str) -> str:
+    return (
+        "A different hidapi.dll is shadowing the one muxplex-deck bundles:\n"
+        f"    resolved (what streamdeck will actually load): {resolved}\n"
+        f"    bundled (what muxplex-deck vendors):            {vendored}\n"
+        "Something earlier on %PATH% is winning the load race. Remove or\n"
+        "reorder it, then run muxplex-deck doctor again to confirm."
+    )
+
+
+def _elgato_app_running() -> bool | None:
+    """Best-effort: is a process resembling the official Elgato app running?
+
+    `None` if it could not be determined (e.g. `tasklist` missing, timed
+    out, or any other failure) -- callers must not treat "could not check"
+    as "not running", the same never-guess discipline every other
+    fact-gatherer in this module follows.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["tasklist"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return "streamdeck" in result.stdout.lower()
+
+
+def _win_usbip_guidance(*, allow_usbipd_query: bool) -> Guidance | None:
+    """WIN-USBIP: the deck is currently bound to WSL, invisible to native Windows.
+
+    Reuses `wsl.find_usbipd()` / `wsl.list_devices()` as-is -- `usbipd.exe
+    list`'s output is the same text whether invoked from WSL or native
+    PowerShell. `wsl.attach()` is never called from this path; it remains
+    the one mutating function in the whole surface, WSL-only.
+    """
+    if not allow_usbipd_query:
+        return None
+    paths = wsl.find_usbipd()
+    if paths.windows is None:
+        return None
+    devices = wsl.list_devices(paths.windows, vendor_id=_ELGATO_VENDOR_ID)
+    if not devices:
+        return None
+    device = devices[0]
+    if device.state != "attached":
+        return None
+    return Guidance(status="warn", message=win_usbip_message(device), state="WIN-USBIP")
+
+
+def _windows_guidance(*, allow_usbipd_query: bool = True) -> list[Guidance]:
+    """Native-Windows environment guidance. Returns [] on a healthy box.
+
+    Checked in priority order -- each state, once true, fully explains "no
+    device" on its own, and the remaining checks would either be moot (the
+    app holds the device -- nothing else matters) or misleading (once
+    WIN-USBIP explains why Windows can't see the device at all, checking
+    hidapi resolution is a distraction):
+
+    1. WIN-ELGATO -- the #1 native-Windows failure and cheaply detectable;
+       say it specifically instead of a bare "no device found".
+    2. WIN-USBIP -- the deck is handed to WSL.
+    3. WIN-NOHIDAPI -- the vendored DLL itself is missing.
+    4. WIN-DLL-SHADOW -- the vendored DLL exists but something else on
+       %PATH% won the load race (see `hidapi_win`'s module docstring for
+       the mechanism this closes).
+
+    `allow_usbipd_query=False` skips WIN-ELGATO and WIN-USBIP (both shell
+    out) -- the same escape hatch `explain_environment()` honors for
+    contexts that must not shell out.
+    """
+    if allow_usbipd_query and _elgato_app_running():
+        return [Guidance(status="warn", message=WIN_ELGATO_MESSAGE, state="WIN-ELGATO")]
+
+    usbip_guidance = _win_usbip_guidance(allow_usbipd_query=allow_usbipd_query)
+    if usbip_guidance is not None:
+        return [usbip_guidance]
+
+    from . import hidapi_win
+
+    dll_dir = hidapi_win.ensure_hidapi()
+    if dll_dir is None:
+        return [
+            Guidance(status="warn", message=WIN_NOHIDAPI_MESSAGE, state="WIN-NOHIDAPI")
+        ]
+
+    resolved = hidapi_win.resolved_library_path()
+    vendored = str(hidapi_win.vendored_dll_path())
+    # Case-insensitive: Windows paths are case-insensitive, and a bare
+    # `os.path.normcase` comparison would only behave that way when the
+    # process actually running is Windows (it's bound to ntpath vs
+    # posixpath at interpreter start, unaffected by monkeypatching
+    # `sys.platform` in tests) -- `.lower()` keeps this deterministic
+    # everywhere the check runs, including this repo's Linux-only CI.
+    if resolved is not None and resolved.lower() != vendored.lower():
+        return [
+            Guidance(
+                status="warn",
+                message=win_dll_shadow_message(resolved, vendored),
+                state="WIN-DLL-SHADOW",
+            )
+        ]
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -251,7 +394,9 @@ def explain_environment(*, allow_usbipd_query: bool = True) -> list[Guidance]:
     info = wsl.detect()
 
     if not info.is_wsl:
-        if sys.platform not in ("darwin", "win32") and not usbnode.udev_is_live():
+        if sys.platform == "win32":
+            return _windows_guidance(allow_usbipd_query=allow_usbipd_query)
+        if sys.platform != "darwin" and not usbnode.udev_is_live():
             guidances.append(
                 Guidance(
                     status="warn", message=u_dead_container_message(), state="U-DEAD"
