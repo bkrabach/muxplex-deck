@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -44,6 +45,43 @@ SCHEMA_VERSION = 1
 
 _STATUS_DIR_NAME = "muxplex-deck"
 _STATUS_FILE_NAME = "status.json"
+
+# Windows only: os.replace() raises PermissionError when the destination is
+# open by another process -- and cli.status()/_wait_for_fresh_status() read
+# this exact file while the sidecar is writing it. The blanket `except
+# Exception` below already degrades a dropped write to a logged warning
+# (never a crash), but a dropped write during the restart-wait window could
+# manufacture exactly the false "has not published fresh status" alarm
+# v0.5.3 was released to eliminate -- see WINDOWS_NATIVE_SPEC.md section
+# 3.4. POSIX `rename()`/`replace()` has no such failure mode (an open file
+# descriptor doesn't block a rename), so this retry is Windows-only and
+# does not change behavior anywhere else.
+_WIN_REPLACE_RETRY_ATTEMPTS = 3
+_WIN_REPLACE_RETRY_DELAY_SECONDS = 0.05
+
+
+def _replace_with_windows_retry(src: str, dst: Path) -> None:
+    """`os.replace(src, dst)`, retrying on Windows if the destination is locked.
+
+    Elsewhere this is just `os.replace(src, dst)` -- no retry, no delay,
+    byte-for-byte the previous behavior. On `win32`, retries up to
+    `_WIN_REPLACE_RETRY_ATTEMPTS` times, `_WIN_REPLACE_RETRY_DELAY_SECONDS`
+    apart, before giving up; the final attempt's exception (if it still
+    fails) propagates to the caller's existing `except Exception` handler,
+    which logs and swallows it exactly as before this retry existed.
+    """
+    if sys.platform != "win32":
+        os.replace(src, dst)
+        return
+
+    for attempt in range(_WIN_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _WIN_REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_WIN_REPLACE_RETRY_DELAY_SECONDS)
 
 
 def default_status_dir() -> Path:
@@ -129,7 +167,7 @@ def write_status(status: dict[str, Any], path: Path | None = None) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(status, f, indent=2)
-            os.replace(tmp_path, target)
+            _replace_with_windows_retry(tmp_path, target)
             tmp_path = None
         finally:
             if tmp_path is not None:

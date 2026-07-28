@@ -302,3 +302,109 @@ class TestStatusReporter:
         raw = path.read_text(encoding="utf-8")
         assert "federation_key" not in raw
         assert "key_file" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Windows-only os.replace() retry (WINDOWS_NATIVE_SPEC.md section 3.4)
+#
+# os.replace() raises PermissionError on Windows when the destination is
+# open by another process -- exactly the situation `cli.status()` /
+# `_wait_for_fresh_status()` create by reading this file while the sidecar
+# writes it. A dropped write during that window could manufacture the same
+# false "has not published fresh status" alarm v0.5.3 eliminated. Every
+# test below monkeypatches `sys.platform` -- no real Windows semantics are
+# reproducible on this host, only the retry LOGIC around a fake failure.
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsReplaceRetry:
+    def test_non_windows_never_retries_on_permission_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Byte-for-byte previous behavior off Windows: exactly one attempt,
+        and a PermissionError propagates to write_status's existing
+        `except Exception` (logged + swallowed), never retried.
+        """
+        monkeypatch.setattr(statusfile.sys, "platform", "linux")
+        calls: list[str] = []
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            calls.append("replace")
+            raise PermissionError("simulated: destination open elsewhere")
+
+        monkeypatch.setattr(statusfile.os, "replace", _boom)
+
+        path = tmp_path / "status.json"
+        statusfile.write_status({"a": 1}, path)  # must not raise
+
+        assert calls == ["replace"]
+        assert statusfile.read_status(path) is None
+
+    def test_windows_retries_and_succeeds_after_transient_failures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(statusfile.sys, "platform", "win32")
+        monkeypatch.setattr(statusfile.time, "sleep", lambda _seconds: None)
+
+        attempts: list[int] = []
+        real_replace = statusfile.os.replace
+
+        def _flaky_replace(src: str, dst: Path) -> None:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise PermissionError("simulated: destination open elsewhere")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(statusfile.os, "replace", _flaky_replace)
+
+        path = tmp_path / "status.json"
+        statusfile.write_status({"a": 1}, path)
+
+        assert len(attempts) == 3
+        assert statusfile.read_status(path) == {"a": 1}
+
+    def test_windows_exhausts_retries_then_swallows_like_every_other_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(statusfile.sys, "platform", "win32")
+        monkeypatch.setattr(statusfile.time, "sleep", lambda _seconds: None)
+
+        attempts: list[int] = []
+
+        def _always_locked(*args: object, **kwargs: object) -> None:
+            attempts.append(1)
+            raise PermissionError("simulated: destination open elsewhere")
+
+        monkeypatch.setattr(statusfile.os, "replace", _always_locked)
+
+        path = tmp_path / "status.json"
+        statusfile.write_status({"a": 1}, path)  # must not raise
+
+        assert len(attempts) == statusfile._WIN_REPLACE_RETRY_ATTEMPTS
+        assert statusfile.read_status(path) is None
+        # No leftover tmp file -- the finally-block cleanup still runs.
+        assert list(path.parent.glob("*.tmp")) == []
+
+    def test_helper_retries_exact_configured_attempt_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Directly exercise `_replace_with_windows_retry` -- pins the exact
+        attempt count and delay-between-retries call pattern, independent
+        of write_status's own try/except wrapping.
+        """
+        monkeypatch.setattr(statusfile.sys, "platform", "win32")
+        sleeps: list[float] = []
+        monkeypatch.setattr(statusfile.time, "sleep", lambda s: sleeps.append(s))
+
+        def _always_locked(*args: object, **kwargs: object) -> None:
+            raise PermissionError("locked")
+
+        monkeypatch.setattr(statusfile.os, "replace", _always_locked)
+
+        src = str(tmp_path / "src.tmp")
+        dst = tmp_path / "dst.json"
+        with pytest.raises(PermissionError):
+            statusfile._replace_with_windows_retry(src, dst)
+
+        assert len(sleeps) == statusfile._WIN_REPLACE_RETRY_ATTEMPTS - 1
+        assert all(s == statusfile._WIN_REPLACE_RETRY_DELAY_SECONDS for s in sleeps)
