@@ -84,6 +84,97 @@ class TestConfigureLogging:
 
 
 # ---------------------------------------------------------------------------
+# _build_log_file_handler -- must never raise, must never take the whole
+# process down when the log file can't be opened as intended. Before this
+# fix, an unguarded RotatingFileHandler construction failure crashed run()
+# before a single line could be logged anywhere -- under pythonw.exe (no
+# console) that means the sidecar dies with ZERO diagnostic.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLogFileHandlerFallback:
+    def test_normal_case_returns_a_working_rotating_handler(
+        self, tmp_path: Path
+    ) -> None:
+        from logging.handlers import RotatingFileHandler
+
+        log_path = tmp_path / "nested" / "muxplex-deck.log"
+        handler = main_mod._build_log_file_handler(log_path)
+        try:
+            assert isinstance(handler, RotatingFileHandler)
+            assert log_path.exists()
+        finally:
+            handler.close()
+
+    def test_falls_back_to_plain_file_handler_when_rotating_construction_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging.handlers as logging_handlers
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated: locked by a concurrent writer")
+
+        monkeypatch.setattr(logging_handlers, "RotatingFileHandler", _boom)
+
+        log_path = tmp_path / "muxplex-deck.log"
+        handler = main_mod._build_log_file_handler(log_path)
+        try:
+            assert isinstance(handler, logging.FileHandler)
+            assert log_path.exists()
+        finally:
+            handler.close()
+
+    def test_falls_back_to_stderr_when_both_file_handlers_fail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging.handlers as logging_handlers
+
+        real_file_handler_cls = logging.FileHandler  # capture before patching it away
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated failure")
+
+        monkeypatch.setattr(logging_handlers, "RotatingFileHandler", _boom)
+        monkeypatch.setattr(main_mod.logging, "FileHandler", _boom)
+
+        handler = main_mod._build_log_file_handler(tmp_path / "muxplex-deck.log")
+        assert isinstance(handler, logging.StreamHandler)
+        assert not isinstance(handler, real_file_handler_cls)
+
+    def test_falls_back_to_null_handler_when_stderr_is_also_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging.handlers as logging_handlers
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated failure")
+
+        monkeypatch.setattr(logging_handlers, "RotatingFileHandler", _boom)
+        monkeypatch.setattr(main_mod.logging, "FileHandler", _boom)
+        monkeypatch.setattr(main_mod.sys, "stderr", None)
+
+        handler = main_mod._build_log_file_handler(tmp_path / "muxplex-deck.log")
+        assert isinstance(handler, logging.NullHandler)
+
+    def test_configure_logging_never_raises_when_the_log_file_cannot_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging.handlers as logging_handlers
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("simulated: disk full")
+
+        monkeypatch.setattr(logging_handlers, "RotatingFileHandler", _boom)
+        monkeypatch.setattr(main_mod.logging, "FileHandler", _boom)
+
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+        main_mod._configure_logging(tmp_path / "muxplex-deck.log")  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # _FailureEpisode -- the reusable log-once-per-episode tracker
 # ---------------------------------------------------------------------------
 

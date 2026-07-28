@@ -96,6 +96,39 @@ FULL_BRIGHTNESS_PERCENT = 100
 _MAX_VIEW_LABEL_CHARS = 20
 
 
+def _build_log_file_handler(log_file: Path) -> logging.Handler:
+    """Best-effort file handler for `log_file`. Never raises.
+
+    Tries a rotating handler first, then a plain (non-rotating) file
+    handler, then falls back to stderr (if present) or a `NullHandler`.
+    Opening the log file failing must never take the whole *process*
+    down: under `pythonw.exe` (Task Scheduler, no console -- see
+    WINDOWS_NATIVE_SPEC.md section 1.5) an uncaught exception here means
+    the sidecar dies with NO diagnostic anywhere -- no console, no log
+    file, nothing -- which is strictly worse than simply missing a log.
+    Before this fallback existed, this construction was unguarded, so
+    any failure to open the file (permission error, disk full, a
+    transient lock from a concurrent writer) crashed `run()` before a
+    single line could be logged anywhere.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        return RotatingFileHandler(
+            log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+    except OSError:
+        pass
+    try:
+        return logging.FileHandler(log_file, encoding="utf-8")
+    except OSError:
+        pass
+    if sys.stderr is not None:
+        return logging.StreamHandler(sys.stderr)
+    return logging.NullHandler()
+
+
 def _configure_logging(log_file: Path | None = None) -> None:
     """Configure logging, optionally to a rotating file instead of stderr.
 
@@ -109,12 +142,7 @@ def _configure_logging(log_file: Path | None = None) -> None:
     parameter existed.
     """
     if log_file is not None:
-        from logging.handlers import RotatingFileHandler
-
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-        )
+        handler = _build_log_file_handler(log_file)
         handler.setFormatter(
             logging.Formatter(
                 fmt="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
