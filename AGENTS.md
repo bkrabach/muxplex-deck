@@ -243,3 +243,58 @@ product. See `README.md` for setup, config, and verification checklists.
   that was guarded by "this platform can't get here anyway" needs a fresh
   look. Fixed by routing through `service.service_stop()` (one dispatch
   site) instead of a second, duplicated stop implementation in `cli.py`.
+- **`IRunningTask.EnginePID` is NOT the sidecar's own pid -- VERIFIED FALSE
+  on real hardware (2026-07), reversing WINDOWS_NATIVE_SPEC.md section
+  1.4's item 2.** A machine running exactly one healthy sidecar (its own
+  log showed it start, connect the deck, poll the server, handle key
+  presses) had `EnginePID` report a DIFFERENT pid than the one the sidecar
+  itself wrote to `status.json` -- `service status` said "running (pid
+  63268)", `status` said the published data was from "a previous run (pid
+  20300)". Read only after the hardware disproved the assumption:
+  Microsoft's own docs say `EnginePID` is "the process ID for the engine
+  (process) which is running the task"
+  (`learn.microsoft.com/windows/win32/taskschd/runningtask-enginepid`) --
+  the Task Scheduler engine HOST process, not the task's own launched
+  process, confirmed by independent reports since 2011. This holds even
+  for a direct, unwrapped `pythonw.exe` action -- the no-`cmd.exe`-wrapper
+  reasoning in section 1.2 was necessary but not sufficient. **Fix:**
+  `service_main_pid()` now always returns `None` on Windows rather than
+  fabricating an authoritative-looking wrong answer; `status()`'s existing
+  "pid undeterminable -> fall back to age-based staleness" path (already
+  built for exactly this "cannot determine" case) makes this honest
+  automatically. The v0.5.3 restart contract (never claim success before
+  the NEW process's status write is actually observed) is preserved via a
+  DIFFERENT mechanism on Windows: `_win_wait_for_fresh_status()` compares
+  the status file's recorded pid against a BASELINE captured before
+  `_win_restart()` calls `_win_stop()`, rather than against a live-queried
+  pid that Windows cannot reliably provide. Because `_win_stop()` hard-
+  kills the old process before `_win_start()` launches a new one, any pid
+  that appears afterward is necessarily a new process's write -- an
+  equally reliable signal, sourced from the sidecar's own self-report
+  (authoritative), never fabricated from `EnginePID`.
+- **`schtasks /Create /RU <user>` without `/RP` hangs on stdin,
+  interactively, EVERY time -- VERIFIED on real hardware (2026-07) and
+  confirmed by Microsoft's own docs.** `service install` hung with zero
+  output until the user pressed Enter, which then unblocked it instantly.
+  Root cause: `_win_install()`'s `schtasks /Create /XML ... /RU <user> /F`
+  passed `/RU` on the command line without `/RP` -- Microsoft's own
+  reference page states plainly: *"Schtasks always prompts for a password
+  unless you provide one, even when you schedule a task on the local
+  computer using the current user account. This is normal behavior for
+  schtasks."* This is unconditional -- it does not matter that the XML's
+  `<Principals><Principal><LogonType>InteractiveToken</LogonType>` needs
+  no password at all. `subprocess.run` inherits the parent's stdin by
+  default, so a real terminal blocked silently on that prompt; pressing
+  Enter submitted a blank password and unblocked it (task still got
+  created, since InteractiveToken never uses the stored password). **Fix:
+  drop `/RU` from the command line entirely** -- Microsoft's docs confirm
+  `/XML` can be used alone when the file already contains the user account
+  information, which ours does (the `<Principals>` block). Guessing an
+  `/RP` value instead was rejected: an empty/blank password could get
+  *stored* against the account, which is both unverifiable from here and
+  antithetical to the whole point of using `InteractiveToken`. **Also
+  added, defense-in-depth:** every Windows `subprocess.run` call in
+  `service.py` (schtasks and powershell.exe alike) now passes
+  `stdin=subprocess.DEVNULL` explicitly, so any FUTURE interactive prompt
+  from either tool fails fast and loud instead of hanging silently on
+  whatever stdin happens to be inherited.
