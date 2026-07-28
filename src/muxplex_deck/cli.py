@@ -33,37 +33,72 @@ from .config import DEFAULT_CONFIG, ConfigError
 # ---------------------------------------------------------------------------
 
 
-def _add_run_flags(parser: argparse.ArgumentParser) -> None:
-    """Add --config, --emulator, --emulator-port to a parser.
+def _add_run_flags(
+    parser: argparse.ArgumentParser, *, is_subparser: bool = False
+) -> None:
+    """Add --config, --emulator, --emulator-port, --log-file to a parser.
 
-    Applied to BOTH the root parser and the `run` subcommand so bare
-    `muxplex-deck` and `muxplex-deck run` behave identically. `--config`
-    defaults to None so `run()` can distinguish "not passed" from "passed
-    the default path" (3-tier resolution -- CLI flag > config.json >
+    Applied to BOTH the root parser (`is_subparser=False`) and the `run`
+    subcommand (`is_subparser=True`) so bare `muxplex-deck` and `muxplex-deck
+    run` behave identically, AND so a flag placed either before or after
+    `run` on the command line works (`muxplex-deck --log-file X run` and
+    `muxplex-deck run --log-file X` must both set `log_file`).
+
+    `--config` defaults to None so `run()` can distinguish "not passed" from
+    "passed the default path" (3-tier resolution -- CLI flag > config.json >
     hardcoded default -- lives inside `config.load_config`, keyed off this
     same None-vs-explicit distinction).
+
+    `is_subparser` controls what these actions default to when NOT given in
+    argv: the root parser's copies use concrete defaults (None/False/8484)
+    since bare `muxplex-deck` (no `run` token at all) never touches the
+    subparser and must still have every attribute set. The `run` subparser's
+    copies default to `argparse.SUPPRESS` instead -- this is what makes
+    "flag before the subcommand" survive. argparse's own subparsers action
+    (`_SubParsersAction.__call__`) parses the tokens after `run` into a
+    *fresh* namespace and then unconditionally overwrites the parent
+    namespace with every key that fresh namespace has -- including its own
+    defaults for flags the user never typed after `run`. With a concrete
+    default (e.g. `None`) on BOTH parsers, that unconditional overwrite
+    clobbers whatever the root parser already parsed from before `run` back
+    to `None`. `SUPPRESS` means "only put this key in the fresh namespace if
+    it was actually seen in these specific tokens", so the overwrite loop
+    simply has nothing to clobber with when the flag wasn't repeated after
+    `run`, and the root-parsed value survives. When the flag IS repeated
+    after `run`, the subparser's own explicit value is real (not a default)
+    and correctly wins, same as before. Verified directly against argparse's
+    behavior (see `tests/test_cli_dispatch.py`'s
+    `TestSharedFlagOrderIndependence`) -- this is a well-known, if
+    under-documented, subparser-default gotcha, not something specific to
+    this codebase.
     """
+    suppress = argparse.SUPPRESS
+
+    def _default(value: object) -> object:
+        return suppress if is_subparser else value
+
     parser.add_argument(
         "--config",
-        default=None,
+        default=_default(None),
         help="Path to config JSON file (overrides MUXPLEX_DECK_CONFIG and the "
         "default ~/.config/muxplex-deck/config.json)",
     )
     parser.add_argument(
         "--emulator",
         action="store_true",
+        default=_default(False),
         help="Run against the in-process Stream Deck+ emulator (localhost web UI) "
         "instead of real hardware -- no device, no hidapi required.",
     )
     parser.add_argument(
         "--emulator-port",
         type=int,
-        default=8484,
+        default=_default(8484),
         help="Port for the emulator's web UI (default: 8484). Ignored without --emulator.",
     )
     parser.add_argument(
         "--log-file",
-        default=None,
+        default=_default(None),
         help="Write logs to this file instead of stderr (default: stderr, unchanged "
         "behavior). All platforms -- required in practice under Windows Task "
         "Scheduler, since pythonw.exe has no console for stderr to go to "
@@ -1772,7 +1807,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     run_parser = sub.add_parser("run", help="Run the sidecar (default)")
-    _add_run_flags(run_parser)
+    _add_run_flags(run_parser, is_subparser=True)
 
     sub.add_parser("version", help="Show the muxplex-deck version")
 
@@ -1955,11 +1990,22 @@ def main() -> None:
             )
     else:
         # No subcommand (or "run"): the default action.
+        #
+        # `args.log_file` was previously dropped here -- this is the actual
+        # root cause of the missing-log-file bug (WINDOWS_NATIVE_SPEC.md
+        # section 1.5 follow-up): argparse itself correctly parsed
+        # `--log-file` (see `_add_run_flags`'s docstring) in every case
+        # this branch handles, but nothing ever read `args.log_file` back
+        # out and forwarded it to `run()`, so it was silently thrown away
+        # regardless of where on the command line it appeared or whether
+        # parsing succeeded. `--config`/`--emulator`/`--emulator-port` were
+        # never affected -- only `--log-file` was missing from this call.
         sys.exit(
             run(
                 args.config,
                 emulator=args.emulator,
                 emulator_port=args.emulator_port,
+                log_file=args.log_file,
             )
         )
 

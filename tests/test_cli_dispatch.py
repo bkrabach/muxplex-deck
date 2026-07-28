@@ -149,3 +149,151 @@ class TestOtherSubcommandsDoNotFallThroughToRun:
         cli.main()
         assert recorded_run == {}
         assert "muxplex-deck" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# --log-file: root-cause regression tests (WINDOWS_NATIVE_SPEC.md 1.5
+# follow-up). Two independent bugs, both fixed here:
+#
+# 1. `cli.main()`'s final dispatch `else` branch never read `args.log_file`
+#    back out and passed it to `run()` -- so no matter what argparse parsed,
+#    the value was thrown away. This is what a real user hit: they ran the
+#    EXACT Task Scheduler command by hand (`-m muxplex_deck run --log-file
+#    <path>`) and no log file appeared, while `muxplex-deck run` (no
+#    --log-file) logged to the console fine.
+# 2. `--log-file` (and every other `_add_run_flags` flag) placed BEFORE the
+#    `run` token was silently reset to the subparser's own default -- a
+#    well-known argparse gotcha where the subparsers action parses tokens
+#    after `run` into a fresh namespace and unconditionally overwrites the
+#    parent namespace with it, including its own defaults for flags never
+#    repeated after `run`. Fixed via `argparse.SUPPRESS` defaults on the
+#    `run` subparser's copies (see `_add_run_flags`'s docstring).
+# ---------------------------------------------------------------------------
+
+
+class TestLogFileReachesRun:
+    """`args.log_file` must reach `cli.run()` regardless of position."""
+
+    def test_log_file_after_run_subcommand(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["muxplex-deck", "run", "--log-file", "/tmp/after.log"]
+        )
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["log_file"] == "/tmp/after.log"
+
+    def test_log_file_before_run_subcommand(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        """The exact ordering the Windows Task Scheduler action originally
+
+        produced when this bug was live -- see `service.py`'s
+        `_win_task_arguments`.
+        """
+        monkeypatch.setattr(
+            "sys.argv", ["muxplex-deck", "--log-file", "/tmp/before.log", "run"]
+        )
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["log_file"] == "/tmp/before.log"
+
+    def test_log_file_with_no_subcommand_at_all(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["muxplex-deck", "--log-file", "/tmp/bare.log"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["log_file"] == "/tmp/bare.log"
+
+    def test_no_log_file_still_defaults_to_none_in_both_positions(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        monkeypatch.setattr("sys.argv", ["muxplex-deck", "run"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["log_file"] is None
+
+
+class TestSharedFlagOrderIndependence:
+    """Every `_add_run_flags` flag -- not just --log-file -- must survive
+
+    being placed before `run` (the argparse subparser-default clobber
+    gotcha this class tests against is generic to shared dest names, not
+    specific to any one flag).
+    """
+
+    def test_config_before_run_subcommand_is_not_clobbered(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["muxplex-deck", "--config", "/tmp/c.json", "run"]
+        )
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["config_path"] == "/tmp/c.json"
+
+    def test_emulator_before_run_subcommand_is_not_clobbered(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            ["muxplex-deck", "--emulator", "--emulator-port", "9999", "run"],
+        )
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["emulator"] is True
+        assert recorded_run["emulator_port"] == 9999
+
+    def test_run_subparser_still_wins_when_flag_repeated_after_run(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict
+    ) -> None:
+        """Last-specified-wins: a flag given both before AND after `run`
+
+        takes the value given after `run` (the subparser's own explicit
+        parse, not a default) -- this is the case the SUPPRESS fix must
+        NOT break.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "muxplex-deck",
+                "--log-file",
+                "/tmp/before.log",
+                "run",
+                "--log-file",
+                "/tmp/after.log",
+            ],
+        )
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert recorded_run["log_file"] == "/tmp/after.log"
+
+
+class TestUnknownArgumentsStillErrorLoudly:
+    """`cli.main()` uses `parser.parse_args()` (not a bare
+
+    `parse_known_args()`), so unrecognized arguments are NOT silently
+    discarded -- argparse's own leftover-argv check inside `parse_args()`
+    still fires and routes through `_ReportingArgumentParser.error()` (see
+    `test_cli_argument_errors.py`'s
+    `test_unrecognized_argument_still_routes_through_report_and_exits_two`
+    for the full regression test). `_ReportingArgumentParser` overrides
+    `parse_known_args()` only to record argv for near-miss suggestions; it
+    never overrides `parse_args()`, so that check is untouched. This test
+    locks in the same guarantee specifically for the `run` subcommand,
+    where the missing-log-file bug lived.
+    """
+
+    def test_unknown_flag_on_run_subcommand_errors_instead_of_silently_dropping(
+        self, monkeypatch: pytest.MonkeyPatch, recorded_run: dict, capsys
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["muxplex-deck", "run", "--totally-bogus-flag", "x"]
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        assert excinfo.value.code == 2
+        assert recorded_run == {}
+        assert "unrecognized arguments" in capsys.readouterr().err
