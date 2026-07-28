@@ -15,6 +15,7 @@ from typing import cast
 
 import pytest
 from muxplex_client import MuxplexClient, Settings, View
+from test_runtime_modes import FakeClient, FakeDeck, _make_sessions
 
 from muxplex_deck.device import DeckDevice
 from muxplex_deck.interaction import ViewCycler
@@ -23,7 +24,6 @@ from muxplex_deck.main import (
     FULL_BRIGHTNESS_PERCENT,
     _ActiveRuntime,
 )
-from test_runtime_modes import FakeClient, FakeDeck, _make_sessions
 
 _TEST_DEBOUNCE_SECONDS = 0.05
 _WAIT_SECONDS = 5.0

@@ -27,6 +27,17 @@ A flag added to `_build_parser()` in the future with no matching read in
 `main()`'s dispatch will fail this test immediately -- no one needs to
 remember to write a bespoke regression test for it, the way `--log-file`
 needed one after the fact.
+
+`TestEverySubcommandChoiceIsDispatchable` below is the mirror-image net,
+closing the sibling incident: `controls show` was documented (CHANGELOG,
+a build report) and its dispatch branch already existed, but `"show"` was
+never passed to `controls_sub.add_parser(...)`, so argparse rejected the
+command before dispatch ever ran. Same walk-the-parser-generically shape,
+opposite direction: instead of checking every *flag* is read, it checks
+every *subcommand choice* the parser actually registers is named somewhere
+in dispatch -- so a choice added to a subparsers group with no matching
+branch (silently swallowed by the wrong default, or by
+`_render_missing_subcommand`) is caught the same way.
 """
 
 from __future__ import annotations
@@ -127,3 +138,83 @@ class TestDetectorCorrectness:
         """`args.log_file_extra` must not satisfy a check for `log_file`."""
         fake_dispatch = "x = args.log_file_extra"
         assert not _dest_is_referenced("log_file", fake_dispatch)
+
+
+def _choice_is_referenced(choice: str, source: str) -> bool:
+    """Does `source` mention this subcommand choice as a quoted string literal?
+
+    Matches `"show"` or `'show'` -- either quote style, exact content, not a
+    substring of a longer identifier or literal (`"show_all"` does not
+    satisfy a check for `"show"`, since the closing quote must immediately
+    follow).
+    """
+    pattern = rf"""(['"]){re.escape(choice)}\1"""
+    return re.search(pattern, source) is not None
+
+
+class TestEverySubcommandChoiceIsDispatchable:
+    """The mirror-image net: every subcommand *choice* the parser registers
+
+    must be named somewhere in `cli.main()`'s dispatch source, or it can be
+    silently swallowed into the wrong branch -- exactly the reverse of the
+    `controls show` incident (see this module's docstring): there, dispatch
+    logic existed but the choice was never registered; here, the risk this
+    guards is a choice that IS registered but whose dispatch branch is
+    missing, so it falls into `_render_missing_subcommand` (reported as
+    "not a valid command" despite argparse having just accepted it) or into
+    an unrelated default action.
+
+    Like the flag-coverage test above, this does not hardcode any group or
+    command name -- it walks `cli._build_parser()`'s own subparsers actions
+    to get the ground-truth set of registered choices, whatever they are
+    today or become in the future.
+    """
+
+    def test_every_registered_subcommand_choice_is_named_in_dispatch(self) -> None:
+        parser = cli._build_parser()
+        dispatch_source = inspect.getsource(cli.main)
+
+        missing = sorted(
+            f"{action.dest}={choice!r}"
+            for action in _iter_actions(parser)
+            if isinstance(action, argparse._SubParsersAction)
+            for choice in action.choices
+            if not _choice_is_referenced(choice, dispatch_source)
+        )
+
+        assert not missing, (
+            "These argparse subcommand choices are registered but never "
+            f"named in cli.main()'s dispatch source: {missing}. A choice "
+            "argparse happily accepts must still be referenced by dispatch, "
+            "or it silently falls into the wrong branch -- an unrelated "
+            "default action, or an 'unrecognized command' error via "
+            "_render_missing_subcommand -- despite being a valid command."
+        )
+
+
+class TestChoiceDetectorCorrectness:
+    """Unit-tests `_choice_is_referenced()` itself, mirroring
+
+    `TestDetectorCorrectness` above for the flag-side detector.
+    """
+
+    def test_flags_a_choice_that_is_never_quoted_in_source(self) -> None:
+        fake_dispatch = 'if cmd == "actions":\n    pass\n'
+        assert not _choice_is_referenced("totally-new-choice", fake_dispatch)
+
+    def test_accepts_a_choice_referenced_via_equality(self) -> None:
+        fake_dispatch = 'if cmd == "show":\n    pass\n'
+        assert _choice_is_referenced("show", fake_dispatch)
+
+    def test_accepts_a_choice_referenced_inside_a_tuple(self) -> None:
+        fake_dispatch = 'if cmd in (None, "list"):\n    pass\n'
+        assert _choice_is_referenced("list", fake_dispatch)
+
+    def test_accepts_single_quotes_too(self) -> None:
+        fake_dispatch = "if cmd == 'reset':\n    pass\n"
+        assert _choice_is_referenced("reset", fake_dispatch)
+
+    def test_does_not_false_positive_on_a_longer_identifier(self) -> None:
+        """`"show_all"` must not satisfy a check for `"show"`."""
+        fake_dispatch = 'getattr(args, "show_all", False)'
+        assert not _choice_is_referenced("show", fake_dispatch)

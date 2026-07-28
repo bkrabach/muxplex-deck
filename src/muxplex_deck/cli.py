@@ -2179,6 +2179,9 @@ def _build_parser() -> _ReportingArgumentParser:
     )
     controls_sub = controls_parser.add_subparsers(dest="controls_command")
     controls_sub.add_parser(
+        "show", help="Show the resolved binding table (same as bare `controls`)"
+    )
+    controls_sub.add_parser(
         "actions", help="List every available control action (the catalog)"
     )
     controls_set_parser = controls_sub.add_parser(
@@ -2276,7 +2279,12 @@ def main() -> None:
         )
     elif args.command == "controls":
         cmd = getattr(args, "controls_command", None)
-        if cmd == "actions":
+        # "show" is registered explicitly (both spellings must work), but
+        # bare `muxplex-deck controls` (cmd is None) is the same action --
+        # see test_cli_controls.py's parity tests.
+        if cmd in (None, "show"):
+            sys.exit(controls_show(getattr(args, "config", None)))
+        elif cmd == "actions":
             sys.exit(controls_actions())
         elif cmd == "set":
             sys.exit(
@@ -2286,8 +2294,6 @@ def main() -> None:
             sys.exit(controls_unset(args.address, getattr(args, "config", None)))
         elif cmd == "reset":
             sys.exit(controls_reset(getattr(args, "config", None)))
-        else:
-            sys.exit(controls_show(getattr(args, "config", None)))
     elif args.command == "wsl":
         cmd = getattr(args, "wsl_command", None)
         if cmd == "attach":
@@ -2297,14 +2303,16 @@ def main() -> None:
     elif args.command == "config":
         config_path = getattr(args, "config", None)
         cmd = getattr(args, "config_command", None)
-        if cmd == "get":
+        # Bare `muxplex-deck config` (cmd is None) and the explicit `list`
+        # subcommand are the same action -- both registered spellings must work.
+        if cmd in (None, "list"):
+            config_list(config_path)
+        elif cmd == "get":
             config_get(args.key, config_path)
         elif cmd == "set":
             config_set(args.key, args.value, config_path)
         elif cmd == "reset":
             config_reset(getattr(args, "key", None), config_path)
-        else:
-            config_list(config_path)
     elif args.command == "service":
         from .service import (
             service_install,
@@ -2344,8 +2352,9 @@ def main() -> None:
                     "logs",
                 ],
             )
-    else:
-        # No subcommand (or "run"): the default action.
+    elif args.command in (None, "run"):
+        # No subcommand (bare invocation) or the explicit "run" subcommand:
+        # the default action -- both must behave identically.
         #
         # `args.log_file` was previously dropped here -- this is the actual
         # root cause of the missing-log-file bug (WINDOWS_NATIVE_SPEC.md
@@ -2364,6 +2373,11 @@ def main() -> None:
                 log_file=args.log_file,
             )
         )
+    else:
+        # Unreachable: argparse's subparsers dest can only be None or one
+        # of the registered choices, and every registered top-level choice
+        # is handled by a branch above.
+        raise AssertionError(f"unhandled command: {args.command!r}")
 
 
 if __name__ == "__main__":
