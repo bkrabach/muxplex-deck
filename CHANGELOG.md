@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.7.0 (2026-07-27)
+
+### Features
+
+- **Support for six-key, three-column Stream Decks.** On a deck this small, spending a corner key on the view selector and the opposite corners on paging leaves the controls scattered around the session keys. The bottom row is now reserved as a control row — previous page, view selector, next page, in that order — leaving the top row entirely for sessions. Layout selection continues to depend only on what the hardware reports about itself (key count, grid shape, dials, touchscreen) and never on a model name, so any three-column deck gets this arrangement.
+
+- **`doctor` and `status` were redesigned around a verdict, a state list, and a single next action.** Previously every line carried the same weight, whether it reported a Python version that is never actionable or the one command the reader needed to run, and a healthy result was formatted identically to one with eight warnings. Output now opens with a one-line verdict that counts **actions rather than problems**, follows with the state, and ends — closest to the prompt — with the single thing to do. Items that cannot be evaluated until something upstream is resolved are shown as blocked rather than failed, so a missing configuration file reads as one action with several consequences instead of four independent problems. When there is nothing to do, the status markers disappear entirely: an empty margin means no work is needed, readable before any word is. A `--all` view expands every group into its members while keeping the same verdict and the same recommended action, so the shorter form hides evidence, never answers.
+
+### Changes
+
+- **Status readouts and health checks are now formatted differently.** Values like the active session and current view were being marked with a success indicator despite having no failure mode to indicate. They are now presented as readings rather than checks.
+
+- **Multi-step remediation moved out of the state list.** Guidance that spans several lines — such as the Windows steps for sharing a device with WSL — now appears in the action section, so the state list stays one line per item regardless of how involved the fix is.
+
+### Verification
+
+- 504 tests passed via pytest (baseline 449 + 55 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.6.1 (2026-07-27)
 
 ### Bug Fixes
