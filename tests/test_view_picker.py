@@ -16,7 +16,14 @@ from muxplex_deck.interaction import (
     clamp_window_start,
     handle_picker_key,
 )
-from muxplex_deck.layout import KEY_NEXT, KEY_PREV, KEY_SESSION, KEY_VIEW
+
+# `interaction.handle_picker_key`'s `kind` parameter is now the pressed
+# key's resolved catalog action name (see `layout.classify_key`), not the
+# old KEY_VIEW/KEY_PREV/KEY_NEXT/KEY_SESSION constants.
+KEY_VIEW = "view_picker"
+KEY_PREV = "page_prev"
+KEY_NEXT = "page_next"
+KEY_SESSION = "session"
 
 # 16 options across a 12-per-page window -> pages start at 0 and 12.
 OPTIONS = ["all"] + [f"view-{i:02d}" for i in range(15)]

@@ -37,8 +37,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from .layout import KEY_NEXT, KEY_PREV, KEY_VIEW
-
 DEFAULT_DEBOUNCE_SECONDS = 0.4
 
 
@@ -378,11 +376,24 @@ def handle_picker_key(
 ) -> PickerKeyResult:
     """Pure dispatch: map a classified key press to a picker action.
 
+    Picker mode is *derived*, not separately configured (see
+    docs/CONTROL_MAPPING_DESIGN.md §7): a key's normal-mode action
+    determines its meaning while a picker is open, via a fixed,
+    default-deny table --
+
+        view_picker / page_picker  -> BACK   (ACTION_CANCEL)
+        page_prev / page_next      -> page   (ACTION_PAGE)
+        session                    -> option slot (ACTION_SELECT)
+        anything else              -> ignored (ACTION_IGNORE)
+
+    New catalog actions (`view_all`, `focus_app`, `brightness_*`, etc.)
+    need no new rule here -- they simply fall through to ACTION_IGNORE,
+    exactly like `none` always has.
+
     Args:
-        kind: the key's role from `layout.classify_key` (KEY_VIEW is the
-            BACK key while the picker is open; KEY_PREV/KEY_NEXT page).
+        kind: the pressed key's resolved action from `layout.classify_key`.
         slot: the session-slot position from `classify_key` (option index
-            within the current window), or None for a reserved/unknown key.
+            within the current window), or None when `kind != "session"`.
         options: the full option list (view names, in the same order the
             rest of the app uses -- `ViewCycler.names()`).
         window_start: the picker's current scroll-window start.
@@ -395,20 +406,20 @@ def handle_picker_key(
     total = len(options)
     window_start = clamp_window_start(window_start, total=total, page_size=page_size)
 
-    if kind == KEY_VIEW:
+    if kind in ("view_picker", "page_picker"):
         return PickerKeyResult(ACTION_CANCEL, window_start=window_start)
-    if kind == KEY_PREV:
+    if kind == "page_prev":
         new_start = clamp_window_start(
             window_start - page_size, total=total, page_size=page_size
         )
         return PickerKeyResult(ACTION_PAGE, window_start=new_start)
-    if kind == KEY_NEXT:
+    if kind == "page_next":
         new_start = clamp_window_start(
             window_start + page_size, total=total, page_size=page_size
         )
         return PickerKeyResult(ACTION_PAGE, window_start=new_start)
 
-    if slot is None:
+    if kind != "session" or slot is None:
         return PickerKeyResult(ACTION_IGNORE, window_start=window_start)
     index = window_start + slot
     if index >= total:

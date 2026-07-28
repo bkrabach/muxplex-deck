@@ -17,30 +17,7 @@ Two layout modes:
   With no dials or strip to lean on, three keys are reserved *by grid
   position* (computed from `key_layout` rows x cols, never hardcoded)
   for the roles the dials/strip played. Which three positions depends on
-  grid shape alone (see `_reserved_control_keys`), never on model name:
-
-    * Exactly 3 columns, 2+ rows (e.g. the Stream Deck Mini, 3 cols x 2
-      rows): 3 columns is exactly enough to dedicate the *entire bottom
-      row* to controls, reading left to right as PREV, VIEW, NEXT --
-      every row above it is entirely session tiles. This was chosen over
-      reusing the corner layout below because on a 3-wide grid the
-      corner scheme leaves session tiles awkwardly split around a lone
-      reserved key in the bottom row (e.g. keys 1, 2, 4 on a 3x2 grid --
-      a gap where key 3 (PREV) sits), whereas a full control row leaves
-      every session tile contiguous on the row(s) above.
-    * Everything else (any other column count): reserve the three
-      corners -- VIEW top-left (index 0), PREV bottom-left
-      (index (rows-1)*cols), NEXT bottom-right (index rows*cols-1) --
-      the original REDUCED geometry, ported from dial-0/dial-1's roles
-      on the Stream Deck+. Unchanged for the 15-key Original (3x5) and
-      XL (4x8).
-
-  In both cases VIEW shows the current view name + server label (what
-  the strip showed); a tap opens a paged view picker on the session-slot
-  keys (dial-0's picker role) -- VIEW becomes BACK, PREV/NEXT page the
-  list, tapping a view selects it. Every remaining key is a session tile
-  in reading order, so sessions_per_page = key_count - 3 (12 on a 15-key
-  deck, 3 on a 6-key Mini).
+  grid shape alone (see `_reserved_control_keys`), never on model name.
 
 Edge cases (degrade gracefully, never crash):
 
@@ -56,6 +33,22 @@ Edge cases (degrade gracefully, never crash):
 
 Everything here is pure (no device I/O, no threads), so both layout modes
 are unit-testable with fake capability dicts.
+
+--- User-configurable control mappings (docs/CONTROL_MAPPING_DESIGN.md) ---
+
+`plan_layout(caps, overrides)` resolves every control (key, dial turn,
+dial push) to a named *action* (see `.controls.ACTIONS`) via:
+
+    resolved = default_bindings(caps) | overrides_applicable_to(caps)
+
+Defaults are **computed, never stored** -- a user who configures nothing
+sees behavior byte-identical to the pre-config-mapping implementation.
+`overrides` is Gate 1 (`config.py`) already-validated address->action
+pairs; this module performs Gate 2 (capability-aware applicability):
+an override whose address index is out of range for *this* deck is
+reported via `LayoutPlan.unapplied`, never fails the whole plan -- the
+deck is hot-pluggable, and refusing to start would make the sidecar
+unstartable whenever it's unplugged (see AGENTS.md's hotplug section).
 """
 
 from __future__ import annotations
@@ -64,13 +57,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from . import controls as controls_mod
 from .device import DeckDevice
-
-# classify_key result kinds
-KEY_VIEW = "view"
-KEY_PREV = "prev"
-KEY_NEXT = "next"
-KEY_SESSION = "session"
 
 MODE_FULL = "full"
 MODE_REDUCED = "reduced"
@@ -98,24 +86,62 @@ def read_capabilities(deck: DeckDevice) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class Unapplied:
+    """One Gate-2 diagnostic: a configured binding that cannot apply to this deck."""
+
+    address: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class LayoutPlan:
     """The one decision object: which keys/controls this deck uses for what.
 
-    `session_slots` maps *slot position* (index into the current page's
-    session list, reading order) -> *physical key index*. In FULL mode it
-    is simply `range(key_count)`; in REDUCED mode it skips the reserved
-    control keys.
+    `bindings` is the fully resolved (address -> action) map -- every
+    control address this deck's capabilities describe, defaults merged
+    with applicable overrides. `session_slots`/`sessions_per_page`/
+    `use_dials` are derived from it (kept as separate fields since they're
+    read on every repaint and are cheap to precompute once here).
     """
 
     mode: str  # MODE_FULL | MODE_REDUCED
     key_count: int
-    view_key: int | None  # reserved control keys (REDUCED mode only)
-    prev_key: int | None
-    next_key: int | None
-    session_slots: tuple[int, ...]
+    bindings: Mapping[str, str]  # resolved address -> action, every control
+    session_slots: tuple[int, ...]  # keys whose action == "session", ascending
     sessions_per_page: int
-    use_dials: bool  # attach dial callbacks (view/page cycling)?
-    use_strip: bool  # paint the touch strip (status headline)?
+    use_dials: bool  # any dial.* address resolves to non-"none"?
+    use_strip: bool  # paint the touch strip (status headline)? -- is_touch alone
+    unapplied: tuple[Unapplied, ...]  # Gate-2 diagnostics (§6)
+    advisories: tuple[str, ...]  # Gate-2 advisory warnings -- legal but self-defeating
+
+    def _first_key_for_action(self, action: str) -> int | None:
+        """First (ascending) key index bound to `action`, or None.
+
+        Binding two keys to the same control action is legal -- both work
+        at runtime -- but only the first gets special-cased painting
+        treatment (e.g. the reduced-layout picker's BACK/PREV/NEXT chrome).
+        """
+        matches = sorted(
+            int(address.split(".")[1])
+            for address, bound_action in self.bindings.items()
+            if address.startswith("key.") and bound_action == action
+        )
+        return matches[0] if matches else None
+
+    @property
+    def view_key(self) -> int | None:
+        """First key bound to `view_picker`, or None if none is."""
+        return self._first_key_for_action("view_picker")
+
+    @property
+    def prev_key(self) -> int | None:
+        """First key bound to `page_prev`, or None if none is."""
+        return self._first_key_for_action("page_prev")
+
+    @property
+    def next_key(self) -> int | None:
+        """First key bound to `page_next`, or None if none is."""
+        return self._first_key_for_action("page_next")
 
 
 def _reserved_control_keys(rows: int, cols: int) -> tuple[int, int, int]:
@@ -139,15 +165,13 @@ def _reserved_control_keys(rows: int, cols: int) -> tuple[int, int, int]:
     return 0, (rows - 1) * cols, rows * cols - 1
 
 
-def plan_layout(caps: Mapping[str, Any]) -> LayoutPlan:
-    """Choose the layout mode and key assignments for a deck's capabilities.
+def default_bindings(caps: Mapping[str, Any]) -> dict[str, str]:
+    """The capability-derived default (address -> action) table for `caps`.
 
-    Args:
-        caps: capability dict with `key_count`, `key_rows`, `key_cols`,
-            `dial_count`, `is_touch` (see `read_capabilities`).
-
-    Returns:
-        A `LayoutPlan`; never raises for a weird-but-real deck shape.
+    This is the pre-config-mapping behavior, expressed in the action
+    catalog's vocabulary -- never written to disk (§4.2). Merging a user's
+    (empty, by default) overrides on top of this must reproduce today's
+    behavior exactly.
     """
     key_count = int(caps["key_count"])
     rows = int(caps["key_rows"])
@@ -155,18 +179,21 @@ def plan_layout(caps: Mapping[str, Any]) -> LayoutPlan:
     dial_count = int(caps["dial_count"])
     is_touch = bool(caps["is_touch"])
 
+    bindings: dict[str, str] = {}
+
     if dial_count >= _FULL_MODE_MIN_DIALS and is_touch:
-        return LayoutPlan(
-            mode=MODE_FULL,
-            key_count=key_count,
-            view_key=None,
-            prev_key=None,
-            next_key=None,
-            session_slots=tuple(range(key_count)),
-            sessions_per_page=key_count,
-            use_dials=True,
-            use_strip=True,
-        )
+        for key in range(key_count):
+            bindings[f"key.{key}"] = controls_mod.SESSION_ACTION
+        if dial_count >= 1:
+            bindings["dial.0.turn"] = "view_cycle"
+            bindings["dial.0.push"] = "view_picker"
+        if dial_count >= 2:
+            bindings["dial.1.turn"] = "page_cycle"
+            bindings["dial.1.push"] = "page_picker"
+        for dial in range(2, dial_count):
+            bindings[f"dial.{dial}.turn"] = controls_mod.NONE_ACTION
+            bindings[f"dial.{dial}.push"] = controls_mod.NONE_ACTION
+        return bindings
 
     view_key, prev_key, next_key = _reserved_control_keys(rows, cols)
     reserved = (view_key, prev_key, next_key)
@@ -178,53 +205,185 @@ def plan_layout(caps: Mapping[str, Any]) -> LayoutPlan:
     if degenerate:
         # Too few keys (or a grid where the corners collide) to spend three
         # on controls: every key is a session tile, no view/page controls.
-        return LayoutPlan(
-            mode=MODE_REDUCED,
-            key_count=key_count,
-            view_key=None,
-            prev_key=None,
-            next_key=None,
-            session_slots=tuple(range(key_count)),
-            sessions_per_page=max(1, key_count),
-            use_dials=False,
-            use_strip=is_touch,
-        )
+        for key in range(key_count):
+            bindings[f"key.{key}"] = controls_mod.SESSION_ACTION
+    else:
+        bindings[f"key.{view_key}"] = "view_picker"
+        bindings[f"key.{prev_key}"] = "page_prev"
+        bindings[f"key.{next_key}"] = "page_next"
+        for key in range(key_count):
+            if key not in reserved:
+                bindings[f"key.{key}"] = controls_mod.SESSION_ACTION
 
-    session_slots = tuple(i for i in range(key_count) if i not in reserved)
+    # REDUCED mode never uses dials by default (matches today's
+    # use_dials=False), but a deck that HAS dials still gets them listed as
+    # explicit "none" bindings -- reclaimable via an override (§4.4).
+    for dial in range(dial_count):
+        bindings[f"dial.{dial}.turn"] = controls_mod.NONE_ACTION
+        bindings[f"dial.{dial}.push"] = controls_mod.NONE_ACTION
+    return bindings
+
+
+def _split_overrides(
+    overrides: Mapping[str, str], *, key_count: int, dial_count: int
+) -> tuple[dict[str, str], tuple[Unapplied, ...]]:
+    """Partition Gate-1-validated overrides into (applicable, unapplied) for this deck.
+
+    Gate 2 (§6): an override is inapplicable when its address index is out
+    of range for the deck's actual key/dial count. Never raises -- an
+    inapplicable override is reported, not refused (see module docstring).
+    """
+    applicable: dict[str, str] = {}
+    unapplied: list[Unapplied] = []
+    for address_text, action in overrides.items():
+        try:
+            address = controls_mod.parse_address(address_text)
+        except controls_mod.AddressError:
+            # Gate 1 (config.py) already rejects malformed addresses before
+            # this ever runs; this is just defense-in-depth against a
+            # caller that skipped Gate 1 (e.g. a future direct API user).
+            unapplied.append(Unapplied(address_text, "not a valid control address"))
+            continue
+
+        if address.control == "key":
+            if address.index >= key_count:
+                reason = (
+                    f"this deck has {key_count} key"
+                    + ("" if key_count == 1 else "s")
+                    + (
+                        f" (key.0 - key.{key_count - 1})"
+                        if key_count > 1
+                        else " (key.0)"
+                    )
+                )
+                unapplied.append(Unapplied(address_text, reason))
+                continue
+        else:  # dial
+            if dial_count == 0:
+                unapplied.append(Unapplied(address_text, "this deck has no dials"))
+                continue
+            if address.index >= dial_count:
+                reason = (
+                    f"this deck has {dial_count} dial"
+                    + ("" if dial_count == 1 else "s")
+                    + (
+                        f" (dial.0 - dial.{dial_count - 1})"
+                        if dial_count > 1
+                        else " (dial.0)"
+                    )
+                )
+                unapplied.append(Unapplied(address_text, reason))
+                continue
+
+        applicable[address.text] = action
+    return applicable, tuple(unapplied)
+
+
+def _advisories(bindings: Mapping[str, str]) -> tuple[str, ...]:
+    """Gate-2 advisory warnings (§6): legal but self-defeating configurations.
+
+    Never blocks anything -- a user who only ever uses the `all` view is
+    entitled to unbind `view_picker`, for example.
+    """
+    actions = set(bindings.values())
+    warnings: list[str] = []
+    if controls_mod.SESSION_ACTION not in actions:
+        warnings.append(
+            "no control is bound to 'session' -- this deck cannot connect any session"
+        )
+    if "view_picker" in actions and not (
+        {"page_prev", "page_next", "page_cycle"} & actions
+    ):
+        warnings.append(
+            "the view picker is bound but nothing pages it -- views past the "
+            "first page will be unreachable"
+        )
+    if not ({"view_picker", "view_cycle", "view_all"} & actions):
+        warnings.append(
+            "no control changes the view -- the deck will stay on whatever "
+            "view the server has"
+        )
+    return tuple(warnings)
+
+
+def plan_layout(
+    caps: Mapping[str, Any], overrides: Mapping[str, str] | None = None
+) -> LayoutPlan:
+    """Choose the layout mode and resolve every control's action for this deck.
+
+    Args:
+        caps: capability dict with `key_count`, `key_rows`, `key_cols`,
+            `dial_count`, `is_touch` (see `read_capabilities`).
+        overrides: Gate-1-validated (address -> action) pairs from config
+            (`Config.controls`). Defaults to empty -- a fresh install's
+            plan is purely capability-derived.
+
+    Returns:
+        A `LayoutPlan`; never raises for a weird-but-real deck shape or an
+        override that doesn't apply to it (see `Unapplied`).
+    """
+    overrides = overrides or {}
+    key_count = int(caps["key_count"])
+    dial_count = int(caps["dial_count"])
+    is_touch = bool(caps["is_touch"])
+
+    mode = (
+        MODE_FULL if dial_count >= _FULL_MODE_MIN_DIALS and is_touch else MODE_REDUCED
+    )
+
+    defaults = default_bindings(caps)
+    applicable, unapplied = _split_overrides(
+        overrides, key_count=key_count, dial_count=dial_count
+    )
+    bindings: dict[str, str] = {**defaults, **applicable}
+
+    session_slots = tuple(
+        sorted(
+            int(address.split(".")[1])
+            for address, action in bindings.items()
+            if address.startswith("key.") and action == controls_mod.SESSION_ACTION
+        )
+    )
+    use_dials = any(
+        action != controls_mod.NONE_ACTION
+        for address, action in bindings.items()
+        if address.startswith("dial.")
+    )
+
     return LayoutPlan(
-        mode=MODE_REDUCED,
+        mode=mode,
         key_count=key_count,
-        view_key=view_key,
-        prev_key=prev_key,
-        next_key=next_key,
+        bindings=bindings,
         session_slots=session_slots,
-        sessions_per_page=len(session_slots),
-        use_dials=False,
+        sessions_per_page=max(1, len(session_slots)),
+        use_dials=use_dials,
         use_strip=is_touch,
+        unapplied=unapplied,
+        advisories=_advisories(bindings),
     )
 
 
 def classify_key(plan: LayoutPlan, key: int) -> tuple[str, int | None]:
-    """Map a physical key press to its role under `plan`.
+    """Map a physical key press to its resolved action under `plan`.
 
     Returns:
-        `(KEY_VIEW | KEY_PREV | KEY_NEXT, None)` for a reserved control
-        key, or `(KEY_SESSION, slot_position)` where `slot_position`
-        indexes into the current page's session list. A key outside the
-        plan entirely (shouldn't happen on real hardware) classifies as
-        `(KEY_SESSION, None)` -- callers treat a `None` slot as an empty
+        `(action, slot)` where `action` is the catalog name bound to this
+        key (see `.controls.ACTIONS`) and `slot` is the session-slot
+        position (index into the current page's session list) when
+        `action == "session"`, else None. A key outside the plan entirely
+        (shouldn't happen on real hardware) classifies as
+        `("session", None)` -- callers treat a `None` slot as an empty
         press and ignore it.
     """
-    if key == plan.view_key:
-        return (KEY_VIEW, None)
-    if key == plan.prev_key:
-        return (KEY_PREV, None)
-    if key == plan.next_key:
-        return (KEY_NEXT, None)
-    try:
-        return (KEY_SESSION, plan.session_slots.index(key))
-    except ValueError:
-        return (KEY_SESSION, None)
+    action = plan.bindings.get(f"key.{key}")
+    if action is None:
+        return (controls_mod.SESSION_ACTION, None)
+    if action == controls_mod.SESSION_ACTION:
+        try:
+            return (controls_mod.SESSION_ACTION, plan.session_slots.index(key))
+        except ValueError:
+            return (controls_mod.SESSION_ACTION, None)
+    return (action, None)
 
 
 def describe_plan(plan: LayoutPlan) -> str:
@@ -236,11 +395,16 @@ def describe_plan(plan: LayoutPlan) -> str:
         )
     if plan.view_key is None:
         return (
-            f"reduced layout (degenerate grid): all {plan.key_count} keys are "
-            "session tiles, no view/page controls"
+            f"reduced layout: all {plan.key_count} keys are session tiles, "
+            "no view/page controls bound"
         )
     return (
         f"reduced layout: {plan.sessions_per_page} session keys/page, "
-        f"key[{plan.view_key}]=VIEW (tap opens picker), key[{plan.prev_key}]=PREV, "
-        f"key[{plan.next_key}]=NEXT" + ("" if not plan.use_strip else ", strip=status")
+        f"key[{plan.view_key}]=VIEW (tap opens picker), "
+        + (
+            f"key[{plan.prev_key}]=PREV, key[{plan.next_key}]=NEXT"
+            if plan.prev_key is not None and plan.next_key is not None
+            else "no PREV/NEXT bound"
+        )
+        + ("" if not plan.use_strip else ", strip=status")
     )
