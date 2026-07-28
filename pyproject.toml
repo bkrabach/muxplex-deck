@@ -37,6 +37,11 @@ build-backend = "uv_build"
 module-name = ["deck_probe", "muxplex_deck"]
 module-root = "src"
 
+[tool.ruff]
+# Exclude markdown files from format checks (line-length violations in
+# documentation are acceptable; focus format checks on Python code only).
+exclude = ["*.md"]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

@@ -204,7 +204,7 @@ product. See `README.md` for setup, config, and verification checklists.
   onto git. Both entry points must agree on every known source, and
   neither may recommend an action that undoes the user's install choice.
 - **Windows background service = Task Scheduler, at-logon, current user --
-  never a Windows Service.** See WINDOWS_NATIVE_SPEC.md section 1 for the
+  never a Windows Service.** See docs/WINDOWS_NATIVE_SPEC.md section 1 for the
   full reasoning; the short version: creating/deleting a real Windows
   Service needs admin, and it runs as LocalSystem (wrong `%USERPROFILE%`)
   or a named account whose password would have to live in the SCM --
@@ -244,7 +244,7 @@ product. See `README.md` for setup, config, and verification checklists.
   look. Fixed by routing through `service.service_stop()` (one dispatch
   site) instead of a second, duplicated stop implementation in `cli.py`.
 - **`IRunningTask.EnginePID` is NOT the sidecar's own pid -- VERIFIED FALSE
-  on real hardware (2026-07), reversing WINDOWS_NATIVE_SPEC.md section
+  on real hardware (2026-07), reversing docs/WINDOWS_NATIVE_SPEC.md section
   1.4's item 2.** A machine running exactly one healthy sidecar (its own
   log showed it start, connect the deck, poll the server, handle key
   presses) had `EnginePID` report a DIFFERENT pid than the one the sidecar
@@ -313,7 +313,7 @@ product. See `README.md` for setup, config, and verification checklists.
   running -- `MultipleInstancesPolicy=IgnoreNew` (chosen deliberately, see
   section 1.2) then silently discarded the new run request. Net effect:
   old process dies, new one never starts. **This was already the
-  documented plan** -- WINDOWS_NATIVE_SPEC.md section 1.6's `restart` row
+  documented plan** -- docs/WINDOWS_NATIVE_SPEC.md section 1.6's `restart` row
   says "stop -> poll `state != RUNNING` (bounded, reusing
   `_wait_for_launchd_unload`'s shape) -> start" -- but the original
   implementation never actually added that poll. **Fix:**
