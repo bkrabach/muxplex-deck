@@ -19,6 +19,7 @@ from StreamDeck.DeviceManager import ProbeError as _LibProbeError
 from StreamDeck.Devices.StreamDeck import StreamDeck as _LibStreamDeck
 from StreamDeck.Transport.Transport import TransportError
 
+from . import hidapi_win
 from .device import (
     DeckDevice,
     DeviceProbeError,
@@ -34,8 +35,13 @@ _MISSING_HIDAPI_MESSAGE = (
     "Install it for your platform, then try again:\n"
     "  macOS:          brew install hidapi\n"
     "  Debian/Ubuntu:  sudo apt install libhidapi-libusb0\n"
-    "  Windows:        bundled with the 'streamdeck' wheel; if missing, install\n"
-    "                  hidapi via your package manager of choice.\n"
+    "  Windows:        muxplex-deck bundles hidapi.dll -- if you're seeing this,\n"
+    "                  either the vendored copy is missing from this install\n"
+    "                  (arm64 Windows, or a source checkout without the binary),\n"
+    "                  or a different hidapi.dll earlier on %PATH% shadowed it.\n"
+    "                  Run 'muxplex-deck doctor' for which DLL actually resolved,\n"
+    "                  or get one yourself: https://github.com/libusb/hidapi/releases\n"
+    "                  (the loader also honors ./hidapi.dll in the current directory).\n"
 )
 
 
@@ -147,6 +153,11 @@ class RealDeviceManager:
     """
 
     def __init__(self) -> None:
+        # No-op on non-Windows; on Windows this must run BEFORE
+        # _LibDeviceManager() ever imports/loads the native library -- see
+        # hidapi_win's module docstring for why both of its mechanisms are
+        # required to make the vendored DLL win the load-path race.
+        hidapi_win.ensure_hidapi()
         try:
             self._manager = _LibDeviceManager()
         except _LibProbeError as exc:

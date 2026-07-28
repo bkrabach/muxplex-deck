@@ -34,6 +34,8 @@ from StreamDeck.DeviceManager import DeviceManager, ProbeError
 from StreamDeck.Devices.StreamDeck import StreamDeck
 from StreamDeck.Transport.Transport import TransportError
 
+from muxplex_deck import hidapi_win
+
 from . import capabilities, events
 
 logger = logging.getLogger("deck_probe")
@@ -146,6 +148,10 @@ def _install_signal_handler() -> threading.Event:
 def run() -> int:
     _configure_logging()
 
+    # No-op on non-Windows; on Windows this must run BEFORE DeviceManager()
+    # ever imports/loads the native library -- see hidapi_win's module
+    # docstring for why both of its mechanisms are required.
+    hidapi_win.ensure_hidapi()
     try:
         manager = DeviceManager()
     except ProbeError:

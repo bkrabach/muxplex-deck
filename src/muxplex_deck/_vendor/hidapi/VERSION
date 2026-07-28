@@ -1,0 +1,31 @@
+Upstream: libusb/hidapi
+Tag:      hidapi-0.15.0
+Release:  https://github.com/libusb/hidapi/releases/tag/hidapi-0.15.0
+Asset:    hidapi-win.zip
+Asset URL: https://github.com/libusb/hidapi/releases/download/hidapi-0.15.0/hidapi-win.zip
+
+sha256 (hidapi-win.zip):     d18c43ec9506a2f6d7faa9c7e0a342c4b64fbae521b71b5d4ac0777fd24dda93
+sha256 (x64/hidapi.dll):     d4c05ba2138cb5259a7f796464b5eaa63b9f8f67bb5cb003f96989244ee01583
+
+Extracted: x64/hidapi.dll only (166912 bytes). The x86 build, headers, and
+.pdb/.lib files from the release asset are not vendored -- this project only
+supports 64-bit Python on Windows (see WINDOWS_NATIVE_SPEC.md section 2.4).
+
+License: BSD 3-clause (see LICENSE-bsd.txt in this directory), one of
+HIDAPI's three available license options. Chosen because its one
+redistribution obligation (reproduce the copyright notice) is trivially
+satisfied and it does not affect muxplex-deck's own license, unlike the
+GPLv3 option.
+
+To bump this vendored DLL to a newer hidapi release:
+1. Download the new release's `hidapi-win.zip` asset from
+   https://github.com/libusb/hidapi/releases
+2. Verify its SHA-256 against the value published in that release's notes
+   (or compute it yourself and record it here -- never vendor an unverified
+   download).
+3. Extract `x64/hidapi.dll` and overwrite the file next to this one.
+4. Update the tag, asset URL, and both SHA-256 values above.
+5. Re-run the full test suite; nothing in this repo depends on the DLL's
+   internal behavior beyond "streamdeck's ctypes probe can load it", which
+   only real Windows hardware can confirm (see AGENTS.md / the sign-off
+   checklist in WINDOWS_NATIVE_SPEC.md section 9).
