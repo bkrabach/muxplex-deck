@@ -405,6 +405,72 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   Sort order" above for the full behavior.
 - `focus_app` (optional, default off) -- macOS app name of the locally
   installed muxplex PWA; see "Bringing the PWA to the foreground" below.
+- `controls` (optional, default `{}`) -- per-control action overrides; see
+  "Control mappings" below. Not settable via `config set` -- use
+  `muxplex-deck controls set` instead.
+
+### Control mappings
+
+Every physical control (key, dial turn, dial push) resolves to a named
+*action*. A fresh install configures nothing and behaves exactly as
+before -- defaults are computed from the connected deck's capabilities,
+never stored in `config.json`.
+
+```
+muxplex-deck controls actions          # the full catalog: what's available
+muxplex-deck controls                  # the resolved table for this deck
+muxplex-deck controls set key.4 view_picker
+muxplex-deck controls unset key.4      # back to the default for this address
+muxplex-deck controls reset            # delete every override
+```
+
+Addresses are capability-space coordinates, never model names: `key.N`,
+`dial.N.turn`, `dial.N.push`. An action is either **momentary** (fires on
+a press -- valid on `key.N`/`dial.N.push`) or **relative** (consumes dial
+tick counts -- valid on `dial.N.turn` only); `none` (unassign) is valid on
+any address. The 19-action catalog:
+
+| Action | Kind | Does |
+|---|---|---|
+| `session` | momentary | Connect the session shown in this slot (the default) |
+| `view_picker` | momentary | Open/close the paged view picker |
+| `page_picker` | momentary | Open/close the page picker |
+| `page_prev` / `page_next` | momentary | Page -1 / +1 (clamped) |
+| `none` | momentary | Unassigned -- blank, ignored |
+| `view_cycle` | relative | Debounced active-view change by dial ticks |
+| `page_cycle` | relative | Local paging by dial ticks |
+| `view_all` | momentary | Jump straight to the `all` view |
+| `page_first` / `page_last` | momentary | Jump to the first/last page |
+| `view_prev` / `view_next` | momentary | Step the view back/forward one |
+| `focus_app` | momentary | Bring the muxplex PWA to the foreground |
+| `refresh_now` | momentary | Poll the server immediately |
+| `toggle_last` | momentary | Connect the previously-active session |
+| `brightness_up` / `brightness_down` | momentary | Brightness +-10% (floor 10%, cap 100%) |
+| `brightness_cycle` | relative | Brightness by dial ticks (floor 10%, cap 100%) |
+
+Example -- reclaim the Stream Deck+'s otherwise-dead dials 2/3:
+
+```json
+{
+  "controls": {
+    "dial.2.turn": "page_cycle",
+    "dial.2.push": "page_first",
+    "dial.3.push": "view_all"
+  }
+}
+```
+
+A binding that doesn't apply to the *currently connected* deck (e.g. a
+Deck+ config loaded against an Original) is never fatal -- it's reported
+by `muxplex-deck controls`, `muxplex-deck doctor`, and `muxplex-deck
+status`, and the sidecar starts normally with the rest of the plan intact
+(the deck is hot-pluggable; a stricter config-time check would make the
+sidecar unstartable whenever the "wrong" deck -- or none -- is plugged in).
+
+Brightness set via `brightness_up`/`brightness_down`/`brightness_cycle` is
+**session-local, never persisted**: the sidecar always asserts full
+brightness on every bring-up (real hardware powers on dim), so a dimmed
+value is never written to `config.json`.
 
 ### Bringing the PWA to the foreground (macOS)
 

@@ -184,7 +184,12 @@ class TestConfigSetRoundTrip:
             "sort",
             "focus_app",
         }
-        assert set(DEFAULT_CONFIG.keys()) == covered
+        # "controls" is deliberately excluded from the scalar round-trip
+        # above -- it's a dict, refused by `config set` entirely (see
+        # TestConfigSetControlsRefusal below) and has its own dedicated
+        # `controls set`/`unset`/`reset` interface (test_cli_controls.py).
+        assert set(DEFAULT_CONFIG.keys()) - {"controls"} == covered
+        assert "controls" in DEFAULT_CONFIG
 
     def test_structured_default_type_is_rejected_loudly_not_stored_as_a_string(
         self,

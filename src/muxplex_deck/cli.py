@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from . import config as config_mod
+from . import controls as controls_mod
 from .config import DEFAULT_CONFIG, ConfigError
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,15 @@ def config_list(config_path: str | None = None) -> None:
         default = DEFAULT_CONFIG[key]
         is_default = value == default
         marker = "" if is_default else " (modified)"
+        if key == "controls":
+            # A raw dict dump would make `config list` unscannable -- show
+            # a count instead (docs/CONTROL_MAPPING_DESIGN.md §8.1). Use
+            # `muxplex-deck controls` for the resolved table, `config get
+            # controls` for the raw JSON.
+            count = len(value) if isinstance(value, dict) else 0
+            display = f"{count} binding{'' if count == 1 else 's'}"
+            print(f"  {key}: {display}{marker}")
+            continue
         if isinstance(value, str):
             display = f'"{value}"' if value else '""'
         elif value is None:
@@ -198,7 +208,9 @@ def config_get(key: str, config_path: str | None = None) -> None:
 
     settings = config_mod.load_raw_config(config_path)
     value = settings.get(key)
-    if isinstance(value, bool):
+    if key == "controls":
+        print(json.dumps(value, indent=2, sort_keys=True))
+    elif isinstance(value, bool):
         print("true" if value else "false")
     elif value is None:
         print("null")
@@ -227,6 +239,22 @@ def config_set(key: str, raw_value: str, config_path: str | None = None) -> None
     accepted. Structured keys need a dedicated interface (their own
     subcommand, or direct file editing), not CLI-string coercion.
     """
+    if key == "controls":
+        # `controls` is a dict -- every isinstance branch below would miss
+        # it and fall through to storing the raw CLI string where a dict
+        # belongs (exactly the silently-corrupted-config class this repo
+        # hit five times on 2026-07-28). A dedicated subcommand group
+        # exists instead: docs/CONTROL_MAPPING_DESIGN.md §8.1.
+        print(
+            "Cannot set 'controls' via 'config set' -- it's a structured "
+            "mapping, not a scalar value. Use:\n"
+            "  muxplex-deck controls set <address> <action>\n"
+            "e.g. muxplex-deck controls set key.0 view_picker\n"
+            "See: muxplex-deck controls actions",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if key not in DEFAULT_CONFIG:
         print(f"Unknown setting: {key}", file=sys.stderr)
         print(
@@ -281,6 +309,229 @@ def config_reset(key: str | None = None, config_path: str | None = None) -> None
         config_mod.save_raw_config(copy.deepcopy(DEFAULT_CONFIG), config_path)
         resolved_path = config_mod._resolve_config_path(config_path)
         print(f"  All settings reset to defaults ({resolved_path})")
+
+
+# ---------------------------------------------------------------------------
+# controls -- user-configurable action bindings per control
+# (docs/CONTROL_MAPPING_DESIGN.md). `config set controls` is refused above
+# (§8.1); this group is the dedicated interface instead.
+# ---------------------------------------------------------------------------
+
+
+def _layout_caps_from_probe(caps: dict) -> dict:
+    """Adapt `deck_probe.capabilities.describe_capabilities`'s dict shape to
+
+    the narrower one `layout.plan_layout`/`layout.read_capabilities`
+    expect (`is_touch` vs that module's `has_touchscreen`).
+    """
+    return {
+        "key_count": caps["key_count"],
+        "key_rows": caps["key_rows"],
+        "key_cols": caps["key_cols"],
+        "dial_count": caps["dial_count"],
+        "is_touch": caps["has_touchscreen"],
+    }
+
+
+def _current_deck_caps() -> dict | None:
+    """Best-effort: capabilities of the currently-connected+openable deck, or None."""
+    try:
+        from .device import DeviceProbeError
+        from .device_real import RealDeviceManager
+    except ImportError:
+        return None
+    try:
+        manager = RealDeviceManager()
+    except DeviceProbeError:
+        return None
+    status = probe_deck_status(manager)
+    if status["caps"] is None:
+        return None
+    return _layout_caps_from_probe(status["caps"])
+
+
+def _last_seen_deck_caps() -> dict | None:
+    """Best-effort: capabilities from the sidecar's last published status.json."""
+    from .statusfile import read_status
+
+    data = read_status()
+    if not data:
+        return None
+    device_caps = data.get("device", {}).get("capabilities")
+    if not device_caps:
+        return None
+    try:
+        return _layout_caps_from_probe(device_caps)
+    except KeyError:
+        return None
+
+
+def controls_actions() -> int:
+    """`muxplex-deck controls actions` -- the catalog: the user's "list of
+
+    available options to choose from" (§8.2).
+    """
+    print("\nAvailable control actions:\n")
+    for line in controls_mod.catalog_help_lines():
+        print(line)
+    print(
+        "\nAddresses: key.N (e.g. key.0), dial.N.turn, dial.N.push (e.g. dial.1.push)\n"
+    )
+    return 0
+
+
+def _address_sort_key(address: str) -> tuple[int, int, str]:
+    """Sort key.N numerically, then dial.N.turn/push, for a stable display order."""
+    if address.startswith("key."):
+        return (0, int(address.split(".")[1]), "")
+    _, index_text, sub = address.split(".")
+    return (1, int(index_text), sub)
+
+
+def controls_show(config_path: str | None = None) -> int:
+    """`muxplex-deck controls` -- the resolved binding table (§8.2).
+
+    Computed against the currently-connected deck's real capabilities when
+    one is open; otherwise falls back to the sidecar's last-published
+    `status.json` capabilities, clearly labeled as such -- never presented
+    as current (§8.2). With no deck ever seen, there is nothing to resolve
+    against and the command says so plainly.
+    """
+    from . import layout as layout_mod
+
+    raw = config_mod.load_raw_config(config_path)
+    try:
+        validated = config_mod._validate_controls(raw.get("controls", {}))
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    caps = _current_deck_caps()
+    stale_source = False
+    if caps is None:
+        caps = _last_seen_deck_caps()
+        stale_source = caps is not None
+
+    if caps is None:
+        print(
+            "\nNo deck currently connected, and no previous status recorded.\n"
+            "Plug in a Stream Deck (or start the sidecar at least once) to "
+            "see the resolved table.\n"
+        )
+        return 0
+
+    plan = layout_mod.plan_layout(caps, validated)
+    print()
+    if stale_source:
+        print("(showing the last-seen deck's capabilities -- not necessarily current)")
+    if plan.unapplied:
+        print(
+            f"Controls: {len(validated)} configured, {len(plan.unapplied)} "
+            "cannot apply to this deck\n"
+        )
+    else:
+        print(f"Controls: {len(validated)} configured, all apply\n")
+
+    for address in sorted(plan.bindings, key=_address_sort_key):
+        action = plan.bindings[address]
+        origin = "(configured)" if address in validated else "(default)"
+        print(f"     {address:<14}{action:<18}{origin}")
+
+    if plan.unapplied:
+        print()
+        for u in plan.unapplied:
+            print(f"  !  {u.address:<14}{u.reason}")
+        print()
+        print("Do this:")
+        for u in plan.unapplied:
+            print(f"    muxplex-deck controls unset {u.address}")
+
+    if plan.advisories:
+        print()
+        for note in plan.advisories:
+            print(f"  !  {note}")
+    print()
+    return 0
+
+
+def controls_set(address: str, action: str, config_path: str | None = None) -> int:
+    """`muxplex-deck controls set <address> <action>` -- write one binding.
+
+    Validated identically to Gate 1 (`config._validate_controls`) before
+    being written -- a binding this command accepts must be exactly what
+    `load_config` will accept back.
+    """
+    try:
+        parsed = controls_mod.validate_binding(address, action)
+    except (controls_mod.AddressError, ValueError) as exc:
+        print(f"Cannot set control binding: {exc}", file=sys.stderr)
+        return 1
+
+    raw = config_mod.load_raw_config(config_path)
+    current = (
+        dict(raw.get("controls", {})) if isinstance(raw.get("controls"), dict) else {}
+    )
+    current[parsed.text] = action
+    config_mod.patch_raw_config({"controls": current}, config_path)
+    print(f"  {parsed.text}: {action}")
+    return 0
+
+
+def controls_unset(address: str, config_path: str | None = None) -> int:
+    """`muxplex-deck controls unset <address>` -- remove one binding (-> default)."""
+    try:
+        parsed = controls_mod.parse_address(address)
+    except controls_mod.AddressError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    raw = config_mod.load_raw_config(config_path)
+    current = (
+        dict(raw.get("controls", {})) if isinstance(raw.get("controls"), dict) else {}
+    )
+    if parsed.text not in current:
+        print(f"  {parsed.text}: no override set (already default)")
+        return 0
+    del current[parsed.text]
+    config_mod.patch_raw_config({"controls": current}, config_path)
+    print(f"  {parsed.text}: reset to default")
+    return 0
+
+
+def controls_reset(config_path: str | None = None) -> int:
+    """`muxplex-deck controls reset` -- delete the whole `controls` key."""
+    config_mod.patch_raw_config({"controls": {}}, config_path)
+    print("  All control bindings reset to defaults")
+    return 0
+
+
+def check_controls(config_path: str | None = None) -> tuple[str, str]:
+    """`doctor` check (§8.3): are the configured overrides valid, and do they apply?"""
+    from . import layout as layout_mod
+
+    raw = config_mod.load_raw_config(config_path)
+    try:
+        validated = config_mod._validate_controls(raw.get("controls", {}))
+    except ConfigError as exc:
+        return "fail", f"controls: invalid config -- {exc}"
+    if not validated:
+        return "ok", "controls: using capability-derived defaults"
+
+    caps = _current_deck_caps()
+    if caps is None:
+        return "ok", (
+            f"controls: {len(validated)} binding(s) configured (no deck "
+            "connected to verify against -- run: muxplex-deck controls)"
+        )
+
+    plan = layout_mod.plan_layout(caps, validated)
+    if plan.unapplied:
+        names = ", ".join(u.address for u in plan.unapplied)
+        return "warn", (
+            f"controls: {len(plan.unapplied)} of {len(validated)} binding(s) "
+            f"do not apply to this deck ({names}) -- run: muxplex-deck controls"
+        )
+    return "ok", f"controls: {len(validated)} binding(s), all apply"
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1271,12 @@ def doctor(config_path: str | None = None, *, show_all: bool = False) -> int:
     )
     config_created = cfg_status == "ok"
 
-    items: list[Any] = [environment_group, config_group]
+    ctrl_status, ctrl_message = check_controls(config_path)
+    items: list[Any] = [
+        environment_group,
+        config_group,
+        report.Check("controls", _status_glyph(ctrl_status), ctrl_message),
+    ]
 
     # Environment guidance (WSL/usbipd/udev-liveness) BEFORE the device
     # checks -- it explains why the next line is about to warn. Returns []
@@ -1918,6 +2174,30 @@ def _build_parser() -> _ReportingArgumentParser:
         "key", nargs="?", help="Config key (omit to reset all)"
     )
 
+    controls_parser = sub.add_parser(
+        "controls", help="Show and manage per-control action bindings"
+    )
+    controls_sub = controls_parser.add_subparsers(dest="controls_command")
+    controls_sub.add_parser(
+        "actions", help="List every available control action (the catalog)"
+    )
+    controls_set_parser = controls_sub.add_parser(
+        "set", help="Bind an action to a control address"
+    )
+    controls_set_parser.add_argument(
+        "address", help="Control address, e.g. key.0, dial.1.turn, dial.1.push"
+    )
+    controls_set_parser.add_argument(
+        "action", help="Action name, e.g. view_picker (see: controls actions)"
+    )
+    controls_unset_parser = controls_sub.add_parser(
+        "unset", help="Remove one binding (back to the capability-derived default)"
+    )
+    controls_unset_parser.add_argument("address", help="Control address to unbind")
+    controls_sub.add_parser(
+        "reset", help="Delete every control binding (back to all defaults)"
+    )
+
     wsl_parser = sub.add_parser("wsl", help="WSL2 USB/IP helpers")
     wsl_sub = wsl_parser.add_subparsers(dest="wsl_command")
     wsl_sub.add_parser(
@@ -1994,6 +2274,20 @@ def main() -> None:
                 non_interactive=getattr(args, "non_interactive", False),
             )
         )
+    elif args.command == "controls":
+        cmd = getattr(args, "controls_command", None)
+        if cmd == "actions":
+            sys.exit(controls_actions())
+        elif cmd == "set":
+            sys.exit(
+                controls_set(args.address, args.action, getattr(args, "config", None))
+            )
+        elif cmd == "unset":
+            sys.exit(controls_unset(args.address, getattr(args, "config", None)))
+        elif cmd == "reset":
+            sys.exit(controls_reset(getattr(args, "config", None)))
+        else:
+            sys.exit(controls_show(getattr(args, "config", None)))
     elif args.command == "wsl":
         cmd = getattr(args, "wsl_command", None)
         if cmd == "attach":
