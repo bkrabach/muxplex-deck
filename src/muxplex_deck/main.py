@@ -516,7 +516,7 @@ class _ActiveRuntime:
             self.last_seen_active_view = server_state.active_view
 
             self.ordered = ordered
-            self.active_session = server_state.active_session
+            self._note_active_session_locked(server_state.active_session)
             self.active_view = server_state.active_view
             self.pager.set_item_count(len(ordered))
 

@@ -170,6 +170,11 @@ class FakeClient:
 
     def connect(self, name: str) -> None:
         self.connected_names.append(name)
+        # Matches real muxplex server behavior: a successful connect updates
+        # server-side active_session, so the NEXT poll/refresh reports it --
+        # needed for tests that call `ctx.refresh()` after a local connect
+        # (e.g. toggle_last's dead-session guard).
+        self.active_session = name
         self.connect_event.set()
 
     def set_active_view(self, view: str) -> None:
