@@ -585,6 +585,247 @@ class TestIdempotentReRun:
 
 
 # ---------------------------------------------------------------------------
+# 5c. Federation key "skip" -- a real, named exit. Round of fixes closed:
+# the old prompt mixed a secret-paste and a local-file-path route through
+# one hidden getpass call and printed a bare `<your-server>` placeholder
+# with no indication of which machine the command ran on.
+# ---------------------------------------------------------------------------
+
+
+class TestFederationKeySkip:
+    def test_skip_finishes_config_without_key_and_suppresses_service_offer(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(404),
+            },
+        )
+        # No "n" scripted for the service-install offer -- it must never be
+        # asked at all when the key was skipped. If the wizard asks it
+        # anyway, _make_input raises on the empty iterator.
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input([]),
+            getpass_func=lambda _p: "skip",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "skipped" in out.lower()
+        assert "muxplex-deck init" in out
+        assert "incomplete without a federation key" in out.lower()
+        assert "you're set up" not in out.lower()
+
+        key_path = deck_home / ".config" / "muxplex-deck" / "federation_key"
+        assert not key_path.exists()
+
+    def test_blank_response_also_skips(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(404),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input([]),
+            getpass_func=lambda _p: "",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "skipped" in out.lower()
+
+    def test_prompt_shows_real_host_via_ssh_never_a_placeholder(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The prompt must say which machine (ssh <host> ...) with the
+        actual server hostname substituted -- never a bare remote path
+        and never a `<your-server>` placeholder the wizard could have
+        resolved itself.
+        """
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(404),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input([]),
+            getpass_func=lambda _p: "skip",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "ssh spark-1.test cat ~/.config/muxplex/federation_key" in out
+        assert "<your-server>" not in out
+        assert "scp <your-server>" not in out
+
+
+# ---------------------------------------------------------------------------
+# 5d. TLS-failure line -- interpretation first, raw exception only under
+# MUXPLEX_DECK_VERBOSE. Same defect class as the federation-key "success
+# marker for a step that didn't run": don't alarm with a raw `_ssl.c`
+# detail and then retract it a line later as expected.
+# ---------------------------------------------------------------------------
+
+
+class TestTlsFailureLineIsInterpretedNotRaw:
+    def test_default_hides_raw_exception_detail(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.delenv("MUXPLEX_DECK_VERBOSE", raising=False)
+        tls_exc = httpx.ConnectError(
+            "certificate verify failed: unable to get local issuer certificate "
+            "(_ssl.c:1081)"
+        )
+        cert_bytes = (
+            b"-----BEGIN CERTIFICATE-----\nFAKECERT\n-----END CERTIFICATE-----\n"
+        )
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": tls_exc,
+                "/api/ca": _FakeCaResponse(200, content=cert_bytes),
+                "/api/sessions": _FakeCaResponse(200),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input(["n"]),
+            getpass_func=lambda _p: "test-federation-key",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Scope the assertion to the server-validation step this fix
+        # touches (`_validate_server`) -- `check_server_reachable`'s own
+        # TLS message (used later, at the post-write verification step)
+        # is a separate, unfixed code path with different phrasing and is
+        # out of scope for this fix.
+        validation_step = out.split("\nConfig saved:")[0]
+        assert "own certificate authority" in validation_step.lower()
+        assert "_ssl.c" not in validation_step
+
+    def test_verbose_env_var_shows_raw_exception_detail(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("MUXPLEX_DECK_VERBOSE", "1")
+        tls_exc = httpx.ConnectError(
+            "certificate verify failed: unable to get local issuer certificate "
+            "(_ssl.c:1081)"
+        )
+        cert_bytes = (
+            b"-----BEGIN CERTIFICATE-----\nFAKECERT\n-----END CERTIFICATE-----\n"
+        )
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": tls_exc,
+                "/api/ca": _FakeCaResponse(200, content=cert_bytes),
+                "/api/sessions": _FakeCaResponse(200),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input(["n"]),
+            getpass_func=lambda _p: "test-federation-key",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "_ssl.c" in out
+
+
+# ---------------------------------------------------------------------------
+# 5e. CA fingerprint block -- must say which machine (real hostname, not
+# a bare POSIX path unrunnable on the client), and must fit 80 columns.
+# ---------------------------------------------------------------------------
+
+
+class TestCaFingerprintBlockNamesTheHost:
+    def test_verify_command_is_ssh_wrapped_with_real_host(
+        self,
+        deck_home: Path,
+        config_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        cert_bytes = (
+            b"-----BEGIN CERTIFICATE-----\nFAKECERT\n-----END CERTIFICATE-----\n"
+        )
+        _patch_httpx(
+            monkeypatch,
+            {
+                "/api/instance-info": _FakeJsonResponse(
+                    {"name": "spark-1", "version": "0.13.0", "federation_enabled": True}
+                ),
+                "/api/ca": _FakeCaResponse(200, content=cert_bytes),
+                "/api/sessions": _FakeCaResponse(200),
+            },
+        )
+        rc = init_wizard.run_init(
+            config_path,
+            "https://spark-1.test:8088",
+            non_interactive=False,
+            input_func=_make_input(["n"]),
+            getpass_func=lambda _p: "test-federation-key",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "ssh spark-1.test openssl x509" in out
+        # The verify-command lines specifically must fit a standard
+        # 80-column terminal (unlike the CA-path line above them, which
+        # necessarily contains a long filesystem path and isn't part of
+        # this fix -- note the tmp_path used to isolate this test happens
+        # to contain the substring "ssh" itself, from the test's own
+        # name, so match on the stripped line PREFIX, not "contains").
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("ssh ", "-in ")):
+                assert len(line) <= 80, f"line exceeds 80 columns: {line!r}"
+
+
+# ---------------------------------------------------------------------------
 # 8. --non-interactive with missing required input
 # ---------------------------------------------------------------------------
 
