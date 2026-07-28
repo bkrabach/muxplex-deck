@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.6.0 (2026-07-27)
+
+### Features
+
+- **Native Windows support — the sidecar now drives a Stream Deck on Windows itself, without WSL.** Until now a Windows user had to bridge the device into WSL over USB/IP: sharing it from an administrator PowerShell, re-attaching after every unplug and every reboot, and granting access to a device node whose number changed each time. On native Windows the deck is simply a local device and none of that applies. Everything about talking to a muxplex server — the server URL, a private CA, the federation key — is unchanged and carries over as-is, so an existing configuration works on either side. **This release covers running the sidecar (`muxplex-deck run`); installing it as a background service on Windows is not yet supported and remains available on macOS and Linux only.**
+
+- **HIDAPI is now included for Windows.** The Stream Deck library loads HIDAPI by name at runtime and Windows ships no such library, so a fresh install previously failed to find any HID backend at all. The official library is now included with the package, and both mechanisms Windows uses to locate it are set, so an unrelated copy already present on the system cannot silently take precedence. `doctor` reports which one actually resolved, and names both paths when something else is shadowing the included copy.
+
+- **`doctor` now explains Windows-specific situations** — the Elgato Stream Deck application holding the device open, a device still attached to WSL, a missing HIDAPI, or a shadowed one. The device-attached-to-WSL guidance notes that after detaching, the Stream Deck keeps displaying whatever WSL last drew on it until it is physically unplugged and reconnected; Windows cannot claim it before that.
+
+### Bug Fixes
+
+- **The federation-key check no longer prints a `chmod` command on Windows**, where file permissions are governed by NTFS access control rather than POSIX mode bits and the command cannot do anything.
+
+- **Writing the status file no longer fails on Windows when something is reading it at that moment.** The atomic replace used to publish status is rejected on Windows while another process holds the file open, which would have produced exactly the kind of stale-status false alarm removed in v0.5.3. The write now retries briefly before giving up.
+
+### Verification
+
+- 433 tests passed via pytest (baseline 404 + 29 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.5.3 (2026-07-27)
 
 ### Bug Fixes
