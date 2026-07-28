@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.8.0 (2026-07-27)
+
+### Features
+
+- **muxplex-deck can now run as a background service on Windows.** The sidecar previously had to be left running in a terminal; it can now be installed to start automatically. It registers as a scheduled task running as you, in your own session, which means no administrator rights are required and no password is stored anywhere — deliberately chosen over a conventional Windows service, which would have had to run either as the system account (whose home directory is the wrong place for your configuration and federation key) or as a named account whose password the service manager would need to keep. Two honest differences from the Linux and macOS services, stated by `service install` itself rather than left to be discovered: it starts when you log in rather than at boot, and after an unexpected exit it can take up to a minute to come back rather than a few seconds.
+
+- **`service install`, `uninstall`, `start`, and `restart` now use the same verdict-and-next-action format as `doctor` and `status`.** These commands previously narrated progress line by line as they worked, in a different shape from the rest of the tool. They now report one verdict, the state, and — only when something needs doing — a single next action. Successful runs are quiet.
+
+### Bug Fixes
+
+- **`update` no longer fails on Windows when the service is running.** The update path stopped the running service by calling the Linux or macOS service manager directly, neither of which exists on Windows. This could not be reached before, because Windows had no service to detect; enabling background services on Windows would have made it fail on every update. Stopping the service now goes through the same platform dispatch as every other service command.
+
+### Verification
+
+- 572 tests passed via pytest (baseline 504 + 68 new).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.7.0 (2026-07-27)
 
 ### Features
