@@ -627,6 +627,77 @@ class TestWinStop:
         assert out == ""
 
 
+class TestWinWaitForTaskStopped:
+    """`_win_wait_for_task_stopped()` -- the fix for the real-hardware bug
+
+    where `service restart` left the task registered but NOT running
+    (state 3): `_win_restart()` used to issue `schtasks /Run` immediately
+    after `/End`, racing Task Scheduler's own internal "is this task
+    running" bookkeeping and losing the new run request to
+    `MultipleInstancesPolicy=IgnoreNew`. This function closes that race by
+    polling `_win_task_query()` directly (never `service_is_active()` --
+    see the function's own docstring for why) until the state is no longer
+    `_WIN_TASK_STATE_RUNNING`.
+    """
+
+    def test_returns_true_immediately_when_already_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            service_mod,
+            "_win_task_query",
+            lambda: service_mod.WinTaskInfo(exists=True, state=3, pid=None),
+        )
+        assert service_mod._win_wait_for_task_stopped() is True
+
+    def test_polls_until_state_transitions_from_running_to_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_INTERVAL_SECONDS", 0.001)
+        calls = {"n": 0}
+
+        def _fake_query() -> service_mod.WinTaskInfo:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return service_mod.WinTaskInfo(
+                    exists=True, state=service_mod._WIN_TASK_STATE_RUNNING, pid=111
+                )
+            return service_mod.WinTaskInfo(exists=True, state=3, pid=None)
+
+        monkeypatch.setattr(service_mod, "_win_task_query", _fake_query)
+
+        assert service_mod._win_wait_for_task_stopped() is True
+        assert calls["n"] == 3
+
+    def test_returns_false_after_timeout_when_always_reported_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_INTERVAL_SECONDS", 0.005)
+        monkeypatch.setattr(
+            service_mod,
+            "_win_task_query",
+            lambda: service_mod.WinTaskInfo(
+                exists=True, state=service_mod._WIN_TASK_STATE_RUNNING, pid=111
+            ),
+        )
+        assert service_mod._win_wait_for_task_stopped() is False
+
+    def test_unqueryable_task_reads_as_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Conservative default: cannot determine -> not running, matching
+
+        `_parse_win_task_query()`'s own convention elsewhere in this module.
+        """
+        monkeypatch.setattr(
+            service_mod,
+            "_win_task_query",
+            lambda: service_mod.WinTaskInfo(exists=False, state=None, pid=None),
+        )
+        assert service_mod._win_wait_for_task_stopped() is True
+
+
 class TestWinRestart:
     def test_restart_waits_for_fresh_status_before_reporting_success(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
@@ -767,6 +838,102 @@ class TestWinRestart:
 
         out = capsys.readouterr().out
         assert "Restarted the task" in out
+
+    def test_restart_does_not_issue_run_until_task_query_reports_stopped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Regression guard for the real-hardware race (state 3 after
+
+        restart): `/Run` must not be issued until `_win_task_query()`
+        (polled via `_win_wait_for_task_stopped()`) actually observes the
+        task has stopped -- a bare "/Run right after /End" is exactly what
+        let `IgnoreNew` silently drop the new run request.
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_INTERVAL_SECONDS", 0.001)
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.001)
+
+        # Baseline read (before `_win_stop()`) sees the OLD pid; every read
+        # after that sees the NEW process's pid, so
+        # `_win_wait_for_fresh_status()` can observe a genuine change once
+        # `/Run` succeeds -- same pattern the other restart tests use.
+        status_calls = {"n": 0}
+
+        def _fake_read_status(path: Any = None) -> dict[str, Any]:
+            status_calls["n"] += 1
+            return {"pid": 111} if status_calls["n"] == 1 else {"pid": 999}
+
+        monkeypatch.setattr(statusfile_mod, "read_status", _fake_read_status)
+
+        call_order: list[str] = []
+        query_calls = {"n": 0}
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            if argv[:2] == ["schtasks", "/End"]:
+                call_order.append("end")
+                return _FakeCompletedProcess(0)
+            if argv[:2] == ["schtasks", "/Run"]:
+                call_order.append("run")
+                return _FakeCompletedProcess(0)
+            if argv and argv[0] == "powershell.exe":
+                query_calls["n"] += 1
+                call_order.append("query")
+                # RUNNING for the first two queries, stopped from then on.
+                state = (
+                    service_mod._WIN_TASK_STATE_RUNNING if query_calls["n"] < 3 else 3
+                )
+                return _FakeCompletedProcess(0, stdout=f"OK {state} 0\n")
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        service_mod._win_restart()
+
+        assert query_calls["n"] >= 3
+        run_index = call_order.index("run")
+        assert call_order[:run_index].count("query") >= 3
+        assert "end" in call_order[:run_index]
+
+        out = capsys.readouterr().out
+        assert "Task did not report stopped" not in out
+        assert "Restarted the task" in out
+
+    def test_restart_still_attempts_run_when_task_never_reports_stopped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Never silently give up: an honest ACT check is added, but the
+
+        restart is still attempted -- matching `_launchd_restart()`'s own
+        behavior when `_wait_for_launchd_unload()` times out.
+        """
+        from muxplex_deck import statusfile as statusfile_mod
+
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(service_mod, "_WIN_STOP_POLL_INTERVAL_SECONDS", 0.005)
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(service_mod, "_RESTART_STATUS_POLL_INTERVAL_SECONDS", 0.005)
+        monkeypatch.setattr(
+            statusfile_mod, "read_status", lambda path=None: {"pid": 999}
+        )
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            calls.append(list(argv))
+            if argv and argv[0] == "powershell.exe":
+                return _FakeCompletedProcess(
+                    0, stdout=f"OK {service_mod._WIN_TASK_STATE_RUNNING} 999\n"
+                )
+            return _FakeCompletedProcess(0)
+
+        monkeypatch.setattr(service_mod.subprocess, "run", _fake_run)
+
+        service_mod._win_restart()  # must not raise / must not exit nonzero
+
+        out = capsys.readouterr().out
+        assert "Task did not report stopped" in out
+        assert any(c[:2] == ["schtasks", "/Run"] for c in calls)
 
 
 class TestWinStatus:

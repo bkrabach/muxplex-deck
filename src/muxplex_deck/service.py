@@ -192,6 +192,15 @@ _WIN_TASK_STATE_RUNNING = 4
 
 _WIN_QUERY_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 
+# How long `_win_restart()` waits for the OLD task instance to actually stop
+# reporting TASK_STATE_RUNNING before issuing `/Run` for the new one -- see
+# `_win_wait_for_task_stopped()`'s docstring for the real-hardware incident
+# this closes. Same interval/timeout shape as launchd's own unload wait
+# (`_LAUNCHD_BOOTOUT_*`); Windows gets its own constants rather than reusing
+# those so each platform's timing can be tuned independently.
+_WIN_STOP_POLL_INTERVAL_SECONDS = 0.2
+_WIN_STOP_POLL_TIMEOUT_SECONDS = 5.0
+
 # One PowerShell/COM query answers `is_installed`/`is_active`/`main_pid` at
 # once -- see WINDOWS_NATIVE_SPEC.md section 1.4 for why this must be COM
 # (`Schedule.Service`) and never `schtasks /Query` text: `schtasks`' console
@@ -1426,8 +1435,63 @@ def _win_stop() -> None:
     )
 
 
+def _win_wait_for_task_stopped(timeout: float | None = None) -> bool:
+    """Poll until Task Scheduler no longer reports the task as running.
+
+    **The actual cause of the "restart leaves the task not running" bug,
+    VERIFIED on real hardware (2026-07-28):** `schtasks /End` (invoked by
+    `_win_stop()`) requests termination but does not synchronously wait for
+    Task Scheduler's own internal "is this task currently running"
+    bookkeeping to catch up with the killed process. The previous
+    `_win_restart()` issued `/Run` immediately after `/End` on the (wrong)
+    assumption that "Task Scheduler's /End has no separate unload race to
+    wait out" -- a real machine proved that assumption false: `/Run`
+    immediately after `/End` left the task in state 3 (`TASK_STATE_READY`,
+    not running) instead of actually restarting it, because
+    `MultipleInstancesPolicy=IgnoreNew` (WINDOWS_NATIVE_SPEC.md section 1.2,
+    chosen deliberately) saw the OLD instance as still "running" at the
+    exact instant `/Run` was issued and silently discarded the new run
+    request -- net effect: the old process dies, the new one never starts,
+    and the user has to `service start` manually.
+
+    This is the exact class of race `_wait_for_launchd_unload()` exists to
+    close for launchd's `bootout` (which "returns before the job has
+    necessarily finished tearing down"), and WINDOWS_NATIVE_SPEC.md section
+    1.6 already specified it for `restart` ("poll `state != RUNNING`
+    (bounded, reusing `_wait_for_launchd_unload`'s shape)") -- but the
+    original Windows implementation never actually did this. Fixed here.
+
+    Deliberately queries `_win_task_query()` directly rather than going
+    through the cross-platform `service_is_active()` dispatcher: this
+    function is already Windows-specific (like `_win_wait_for_fresh_status`
+    below), and calling the dispatcher would route through `_is_windows()`
+    /`_is_darwin()`/`_have_systemctl()` platform probes that have nothing to
+    do with what this function checks -- an unnecessary indirection for a
+    function that only ever runs from `_win_restart()`.
+
+    Returns True once the task's state is no longer
+    `_WIN_TASK_STATE_RUNNING` (or the task cannot be queried at all, which
+    reads as "not running" -- the same conservative default
+    `_parse_win_task_query()` uses elsewhere); False if `timeout` elapses
+    first. The caller (`_win_restart()`) decides how to proceed on a
+    timeout -- attempt the restart anyway and report the situation
+    honestly, matching `_wait_for_launchd_unload()`'s own contract of never
+    raising and never fabricating success.
+    """
+    if timeout is None:
+        timeout = _WIN_STOP_POLL_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        info = _win_task_query()
+        if info.state != _WIN_TASK_STATE_RUNNING:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_WIN_STOP_POLL_INTERVAL_SECONDS)
+
+
 def _win_restart() -> None:
-    from . import statusfile
+    from . import report, statusfile
 
     items: list[Any] = []
 
@@ -1440,8 +1504,23 @@ def _win_restart() -> None:
     baseline_pid = baseline_data.get("pid") if baseline_data is not None else None
 
     _win_stop()
-    # Unlike launchd's bootout, Task Scheduler's /End has no separate
-    # unload race to wait out -- /Run can follow immediately.
+    # MUST wait for the task to actually stop reporting RUNNING before
+    # issuing /Run -- see `_win_wait_for_task_stopped()`'s docstring for the
+    # real-hardware incident this closes (a bare "/Run right after /End"
+    # silently lost the restart to IgnoreNew). Never fails the restart over
+    # this alone -- honestly reported and the restart is attempted anyway,
+    # exactly as `_launchd_restart()` does when `_wait_for_launchd_unload()`
+    # times out.
+    if not _win_wait_for_task_stopped():
+        items.append(
+            report.Check(
+                "stop",
+                report.ACT,
+                f"Task did not report stopped within {_WIN_STOP_POLL_TIMEOUT_SECONDS:.0f}s "
+                "-- attempting restart anyway",
+            )
+        )
+
     result = subprocess.run(
         ["schtasks", "/Run", "/TN", _WIN_TASK_NAME],
         capture_output=True,
