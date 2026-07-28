@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import difflib
 import json
 import os
 import platform
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from . import config as config_mod
 from .config import DEFAULT_CONFIG, ConfigError
@@ -1617,13 +1618,152 @@ def wsl_attach(*, vendor_id: str = "0fd9") -> int:
 
 
 # ---------------------------------------------------------------------------
+# Argument-error reporting -- keep argparse failures inside the v0.7/v0.8
+# VERDICT/STATE/ACTION renderer instead of falling back to argparse's raw
+# two-line "usage: ...\n<prog>: error: ..." dump.
+#
+# `doctor`/`status` (v0.7.0) and the `service` verbs (v0.8.0) moved onto
+# report.py's renderer; a mistyped command was the one remaining door back
+# into the pre-report.py experience -- real user feedback named this gap
+# directly ("what happened to the ... feedback/errors? My feedback had been
+# more on the instructions being provided during failures"), with two
+# concrete near-miss examples:
+#
+#     $ muxplex-deck server status      (meant: service status)
+#     $ muxplex-deck service log        (meant: service logs)
+#
+# `_ReportingArgumentParser` overrides two hook points argparse itself
+# documents for exactly this kind of customization:
+#
+# - `_check_value()` -- called for every argparse value that has a
+#   `choices` list, INCLUDING the subparsers action itself (`nargs=PARSER`;
+#   see `ArgumentParser._get_values`, which calls `_check_value` on the
+#   first token). On a miss, computes a "did you mean" via stdlib
+#   `difflib` (no new dependency) against the recorded argv, so the
+#   suggested fix is a full runnable command, not just the corrected word.
+# - `error()` -- argparse's own documented override point ("If you
+#   override this in a subclass, it should not return -- it should either
+#   exit or raise"). Renders via report.py instead of `print_usage()` +
+#   a raw one-liner, then exits with the SAME code (2) argparse's default
+#   `error()` uses -- only the text changes, never the exit code.
+#
+# `add_subparsers()` defaults `parser_class` to `type(self)` (verified
+# against argparse's own source, not assumed) -- so constructing only the
+# ROOT parser as `_ReportingArgumentParser` is sufficient for every
+# subparser (`config`, `wsl`, `service`, and their own sub-subparsers) to
+# inherit this behavior automatically; no per-parser wiring needed.
+# ---------------------------------------------------------------------------
+
+
+class _ReportingArgumentParser(argparse.ArgumentParser):
+    """argparse parser whose `error()` renders through report.py.
+
+    See the module section comment above this class for the full
+    rationale and the argparse hook points relied on.
+    """
+
+    _last_argv: list[str]
+    _last_suggested_command: str | None
+
+    def parse_known_args(  # type: ignore[override]
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        # Recorded BEFORE delegating so `_check_value` (called from deep
+        # inside `_parse_known_args`) can reconstruct a corrected full
+        # command line, not just the one wrong token.
+        self._last_argv = list(args) if args is not None else list(sys.argv[1:])
+        self._last_suggested_command = None
+        # argparse's own overloads distinguish "namespace omitted" (returns
+        # Namespace) from "namespace: _N supplied" (returns tuple[_N, ...]);
+        # we always pass `namespace` through unchanged, so the runtime
+        # result is exactly what the caller expects -- pyright just can't
+        # see that across our single non-overloaded signature.
+        return super().parse_known_args(args, namespace)  # type: ignore[return-value]
+
+    def _check_value(self, action: argparse.Action, value: object) -> None:
+        if action.choices is None or value in action.choices:
+            return
+        choices = [str(c) for c in action.choices]
+        argv = getattr(self, "_last_argv", [])
+        match = difflib.get_close_matches(str(value), choices, n=1, cutoff=0.5)
+        if match:
+            corrected = [match[0] if token == str(value) else token for token in argv]
+            self._last_suggested_command = f"{self.prog} {' '.join(corrected)}".strip()
+        else:
+            self._last_suggested_command = None
+        choices_str = ", ".join(repr(c) for c in choices)
+        raise argparse.ArgumentError(
+            action, f"invalid choice: {value!r} (choose from {choices_str})"
+        )
+
+    def error(self, message: str) -> NoReturn:
+        """Render an argparse failure through report.py. Exit code unchanged (2).
+
+        Subject is always the fixed word "command" (matching
+        `_render_missing_subcommand`'s STATE line below) rather than the
+        raw argparse dest name -- some dests (`service_command`) are long
+        enough to break the column ladder's subject/value gutter, and the
+        raw dest name adds nothing a reader can't already see in the full
+        argparse message itself, which becomes the value.
+        """
+        from . import report
+
+        suggestion = getattr(self, "_last_suggested_command", None)
+
+        utf8 = report.utf8_capable()
+        state_lines = [
+            report.format_check_line(report.ACT, "command", message, utf8=utf8)
+        ]
+        if suggestion:
+            decision = report.Decision(commands=[suggestion])
+        else:
+            decision = report.Decision(
+                commands=[], prose=f"Run '{self.prog} --help' to see valid commands."
+            )
+        verdict = report.verdict_readiness(1)
+        action_lines = report.render_action(report.Action(decision=decision))
+        sys.stderr.write(report.render(verdict, state_lines, action_lines))
+        self.exit(2)
+
+
+def _render_missing_subcommand(
+    parser: argparse.ArgumentParser, choices: list[str]
+) -> None:
+    """VERDICT/STATE/ACTION output for a bare group command (`service`, `wsl`)
+
+    given with no subcommand -- replaces the raw argparse `print_help()`
+    fallback so this path stays inside the same renderer as every other
+    doctor/status/service surface, per the same user feedback that drove
+    `_ReportingArgumentParser` above. Exit code unchanged (0): like the
+    `print_help()` it replaces, an omitted subcommand is not an error.
+    """
+    from . import report
+
+    utf8 = report.utf8_capable()
+    state_lines = [
+        report.format_check_line(
+            report.ACT,
+            "command",
+            f"no subcommand given (choose from {', '.join(choices)})",
+            utf8=utf8,
+        )
+    ]
+    decision = report.Decision(commands=[f"{parser.prog} {choices[0]}"])
+    verdict = report.verdict_readiness(1)
+    action_lines = report.render_action(report.Action(decision=decision))
+    print(report.render(verdict, state_lines, action_lines), end="")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(
+    parser = _ReportingArgumentParser(
         prog="muxplex-deck",
         description="Drive an Elgato Stream Deck against a muxplex server.",
     )
@@ -1762,7 +1902,7 @@ def main() -> None:
         if cmd == "attach":
             sys.exit(wsl_attach())
         else:
-            wsl_parser.print_help()
+            _render_missing_subcommand(wsl_parser, ["attach"])
     elif args.command == "config":
         config_path = getattr(args, "config", None)
         cmd = getattr(args, "config_command", None)
@@ -1801,7 +1941,18 @@ def main() -> None:
         elif cmd == "logs":
             service_logs()
         else:
-            service_parser.print_help()
+            _render_missing_subcommand(
+                service_parser,
+                [
+                    "install",
+                    "uninstall",
+                    "start",
+                    "stop",
+                    "restart",
+                    "status",
+                    "logs",
+                ],
+            )
     else:
         # No subcommand (or "run"): the default action.
         sys.exit(
