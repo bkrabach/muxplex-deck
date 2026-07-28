@@ -389,6 +389,21 @@ def check_ca_file(ca_file: Path | None) -> tuple[str, str]:
             check=False,
         )
     except FileNotFoundError:
+        if sys.platform == "win32":
+            # Windows doesn't ship openssl by default -- unlike Linux/macOS,
+            # where its absence is unusual and worth a "warn", here it's the
+            # norm. Flagging this as something the user needs to fix would
+            # violate the repo's own rule (never print guidance that treats
+            # an environment gap as the user's problem when it isn't one).
+            # `ok`, with an actionable-if-they-want-it alternative -- never
+            # invent an X.509 parser dependency for this one check.
+            return "ok", (
+                "ca_file: could not verify via openssl (not bundled with "
+                "Windows) -- compare the SHA-256 fingerprint printed "
+                "during `init` against the server's, or install openssl "
+                "(winget install ShiningLight.OpenSSL.Light, or use Git "
+                "for Windows' bundled openssl.exe) to enable this check"
+            )
         return "warn", "openssl not found -- cannot verify ca_file is a CA"
     except Exception as exc:  # noqa: BLE001 -- doctor check must degrade to warn, never raise
         return "warn", f"Could not inspect ca_file {ca_file}: {exc}"
@@ -685,11 +700,27 @@ def check_federation_key_auth(
                            callers must not print a false success, but also
                            must not treat an unrelated network hiccup as a
                            rejected key.
+
+    **Must send `Accept: application/json`.** This is the root cause of a
+    real regression: without it, muxplex's auth middleware treats the
+    request as a browser navigation and answers an unauthenticated
+    request with a 307 redirect to `/login` instead of a 401 -- which this
+    client (deliberately, like `muxplex_client.MuxplexClient`, see its
+    docstring) does not follow, so the redirect surfaced as an
+    "unexpected response HTTP 307" that read as "can't verify" and let a
+    bad key through unvalidated. `follow_redirects` is NOT the fix --
+    following the redirect would land on the login page and return a
+    misleading 200. Sending the header the server's auth layer actually
+    branches on is what makes this request exercise the credential at
+    all, exactly like the sidecar's own `MuxplexClient` already does.
     """
     import httpx
 
     url = f"{server_url.rstrip('/')}/api/sessions"
-    headers = {"Authorization": f"Bearer {federation_key}"}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {federation_key}",
+    }
     try:
         with httpx.Client(verify=verify, timeout=5.0) as client:
             resp = client.get(url, headers=headers)
@@ -726,6 +757,16 @@ def check_service_status() -> tuple[str, str]:
 
     if sys.platform == "darwin":
         manager, tool = "launchd", "launchctl"
+    elif sys.platform == "win32":
+        # Accurate-but-misleading is still misleading: "systemctl not
+        # found" frames this as a missing Linux tool, when the real story
+        # is that background-service support (Task Scheduler) is a
+        # not-yet-built increment on this platform -- not something the
+        # user is missing or can install their way out of.
+        return "warn", (
+            "Service: background-service install isn't supported on "
+            "Windows yet -- run: muxplex-deck"
+        )
     else:
         manager, tool = "systemd", "systemctl"
 

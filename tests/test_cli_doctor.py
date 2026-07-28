@@ -170,6 +170,29 @@ class TestCheckCaFile:
         assert status == "warn"
         assert "openssl not found" in message
 
+    def test_openssl_missing_on_windows_is_ok_not_warn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows doesn't ship openssl by default -- unlike POSIX, where
+        its absence is a warn-worthy anomaly, here it's expected. Flagging
+        it as a "warn" implies the user broke something they need to fix;
+        it's not their problem, so this must not use `warn`.
+        """
+        ca_file = tmp_path / "ca.crt"
+        ca_file.write_text("x", encoding="utf-8")
+
+        def _raise(*a: Any, **k: Any) -> Any:
+            raise FileNotFoundError("no openssl")
+
+        monkeypatch.setattr(cli.subprocess, "run", _raise)
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        status, message = cli.check_ca_file(ca_file)
+        assert status == "ok"
+        assert "windows" in message.lower()
+        # Still actionable for anyone who wants deeper verification, just
+        # not framed as something broken.
+        assert "fingerprint" in message.lower()
+
 
 # ---------------------------------------------------------------------------
 # check_hidapi_dll -- WINDOWS_NATIVE_SPEC.md section 2.6's diagnosability
@@ -579,6 +602,153 @@ class TestCheckServerReachable:
 
 
 # ---------------------------------------------------------------------------
+# check_federation_key_auth -- the actual root cause of a real regression:
+# without `Accept: application/json`, muxplex's auth middleware answers an
+# authenticated request with a 307 redirect to /login instead of 401/200.
+# This client deliberately does not follow redirects (same reasoning as
+# `muxplex_client.MuxplexClient`'s docstring -- following it would land on
+# the login page and misreport a 200), so the redirect used to surface as
+# "unexpected response HTTP 307" and read as "can't verify", letting a
+# wrong key through unvalidated. The fix is the header, NOT
+# `follow_redirects=True`.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAuthResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _FakeAuthMiddlewareClient:
+    """Simulates the real server behavior that caused the regression: a
+    request without `Accept: application/json` gets 307-redirected to
+    /login instead of answered with 401/200.
+    """
+
+    def __init__(self, accepted_key: str, **_kwargs: Any) -> None:
+        self._accepted_key = accepted_key
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def get(self, url: str, headers: dict[str, str] | None = None) -> _FakeAuthResponse:
+        headers = headers or {}
+        if headers.get("Accept") != "application/json":
+            return _FakeAuthResponse(307)
+        token = headers.get("Authorization", "")
+        if token == f"Bearer {self._accepted_key}":
+            return _FakeAuthResponse(200)
+        return _FakeAuthResponse(401)
+
+
+class TestCheckFederationKeyAuth:
+    def test_correct_key_is_verified_not_unverifiable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression pin: this used to come back HTTP 307 and read as
+        'could not verify' -- with the Accept header sent, the real
+        auth middleware now answers definitively.
+        """
+        import httpx
+
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda **k: _FakeAuthMiddlewareClient("right-key", **k),
+        )
+        status, message = cli.check_federation_key_auth(
+            "https://spark-1:8088", "right-key"
+        )
+        assert status == "ok"
+        assert "accepted" in message.lower()
+
+    def test_wrong_key_is_rejected_not_unverifiable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda **k: _FakeAuthMiddlewareClient("right-key", **k),
+        )
+        status, message = cli.check_federation_key_auth(
+            "https://spark-1:8088", "wrong-key"
+        )
+        assert status == "fail"
+        assert "rejected" in message.lower()
+
+    def test_request_actually_sends_accept_json_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the mechanism, not just the outcome: assert the real
+        request this function builds includes the header the server's
+        auth layer branches on, so this regression cannot silently
+        return via some future refactor that drops it.
+        """
+        import httpx
+
+        captured: dict[str, str] = {}
+
+        class _CapturingClient:
+            def __init__(self, **_k: Any) -> None:
+                pass
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+            def get(
+                self, url: str, headers: dict[str, str] | None = None
+            ) -> _FakeAuthResponse:
+                captured.update(headers or {})
+                return _FakeAuthResponse(200)
+
+        monkeypatch.setattr(httpx, "Client", lambda **k: _CapturingClient(**k))
+        cli.check_federation_key_auth("https://spark-1:8088", "some-key")
+        assert captured.get("Accept") == "application/json"
+        assert captured.get("Authorization") == "Bearer some-key"
+
+    def test_unexpected_status_still_warns_without_fabricating_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuinely unexpected status code (not a redirect this fix
+        eliminates, but e.g. a 500) must still degrade to warn -- this
+        function must never claim a definitive answer it doesn't have.
+        """
+        import httpx
+
+        monkeypatch.setattr(
+            httpx, "Client", lambda **k: _FakeHttpxClient(_FakeResponse({}))
+        )
+
+        class _FiveHundredClient:
+            def __init__(self, **_k: Any) -> None:
+                pass
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+            def get(self, url: str, headers: dict[str, str] | None = None) -> Any:
+                return _FakeAuthResponse(500)
+
+        monkeypatch.setattr(httpx, "Client", lambda **k: _FiveHundredClient(**k))
+        status, message = cli.check_federation_key_auth(
+            "https://spark-1:8088", "some-key"
+        )
+        assert status == "warn"
+        assert "500" in message
+
+
+# ---------------------------------------------------------------------------
 # _check_for_update -- pypi source
 #
 # muxplex-deck 0.4.0+ is published to PyPI; this is the known-source path
@@ -750,6 +920,28 @@ class TestCheckServiceStatus:
         assert status == "ok"
         assert "launchd" in message
         assert "running" in message
+
+    def test_windows_reports_not_yet_supported_not_missing_systemctl(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On native Windows, `systemctl` will never be found -- that's not
+        a missing tool the user needs to install, it's a not-yet-built
+        platform increment (Task Scheduler support). The message must say
+        that, not frame it as a missing Linux binary.
+        """
+        monkeypatch.setattr(cli.sys, "platform", "win32")
+        # Even if something named "systemctl" happened to resolve on
+        # PATH, win32 must short-circuit before ever consulting `which`.
+        monkeypatch.setattr(
+            cli.shutil, "which", lambda name: (_ for _ in ()).throw(AssertionError)
+        )
+
+        status, message = cli.check_service_status()
+
+        assert status == "warn"
+        assert "isn't supported on windows yet" in message.lower()
+        assert "systemctl" not in message.lower()
+        assert "muxplex-deck" in message
 
 
 # ---------------------------------------------------------------------------
