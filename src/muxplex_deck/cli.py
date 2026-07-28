@@ -1825,8 +1825,20 @@ def _render_missing_subcommand(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """CLI entry point."""
+def _build_parser() -> _ReportingArgumentParser:
+    """Construct the full argument parser -- every command, every flag.
+
+    Split out from `main()` so tests can enumerate every flag this CLI
+    defines (across every subcommand) without duplicating the definitions
+    or invoking `main()` itself (which parses real `sys.argv` and may
+    `sys.exit`). This is what makes the generic "every flag must be read
+    somewhere in dispatch" regression test in
+    `tests/test_cli_flag_dispatch_coverage.py` possible: it walks this
+    parser's own actions rather than a hand-maintained list of flag names,
+    so a flag added here in the future is automatically covered -- see
+    that test module's docstring for the full rationale (the missing
+    `--log-file` read-back bug this guards against).
+    """
     parser = _ReportingArgumentParser(
         prog="muxplex-deck",
         description="Drive an Elgato Stream Deck against a muxplex server.",
@@ -1931,6 +1943,27 @@ def main() -> None:
         help="Show the muxplex-deck version and exit",
     )
 
+    return parser
+
+
+def _subparser(parser: argparse.ArgumentParser, name: str) -> argparse.ArgumentParser:
+    """Look up a registered subparser (e.g. "wsl", "service") by name.
+
+    `_build_parser()` no longer returns its intermediate `wsl_parser`/
+    `service_parser` locals (only the top-level parser), so
+    `_render_missing_subcommand()`'s two call sites resolve them here via
+    argparse's own subparsers action rather than needing those locals
+    threaded back out.
+    """
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices[name]
+    raise AssertionError(f"parser has no subparsers action (looking for {name!r})")
+
+
+def main() -> None:
+    """CLI entry point."""
+    parser = _build_parser()
     args = parser.parse_args()
 
     if getattr(args, "version", False) and args.command is None:
@@ -1966,7 +1999,7 @@ def main() -> None:
         if cmd == "attach":
             sys.exit(wsl_attach())
         else:
-            _render_missing_subcommand(wsl_parser, ["attach"])
+            _render_missing_subcommand(_subparser(parser, "wsl"), ["attach"])
     elif args.command == "config":
         config_path = getattr(args, "config", None)
         cmd = getattr(args, "config_command", None)
@@ -2006,7 +2039,7 @@ def main() -> None:
             service_logs()
         else:
             _render_missing_subcommand(
-                service_parser,
+                _subparser(parser, "service"),
                 [
                     "install",
                     "uninstall",
