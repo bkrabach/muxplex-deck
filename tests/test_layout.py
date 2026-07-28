@@ -1,10 +1,16 @@
 """Pure layout-planning tests -- no hardware, no server, no I/O.
 
-Fake capability dicts for the hardware-verified 15-key Original (3x5, no
-dials, no touch) and the Stream Deck+ (2x4, 4 dials, touch strip), plus the
-other real no-dial grids (XL 4x8, Mini 2x3) and the documented edge cases,
-exercise `plan_layout` / `classify_key` and the paging math (`Pager`) the
-plan feeds.
+Fake capability dicts for the hardware-verified 15-key Original (3 rows x 5
+cols, no dials, no touch) and the Stream Deck+ (2 rows x 4 cols, 4 dials,
+touch strip), plus the other real no-dial grids (XL 4x8, Mini 2 rows x 3
+cols) and the documented edge cases, exercise `plan_layout` / `classify_key`
+and the paging math (`Pager`) the plan feeds.
+
+All `key_rows`/`key_cols` values here follow the `key_layout()` tuple order
+verified in `layout.read_capabilities`: `rows, cols = deck.key_layout()` --
+NOT `(cols, rows)`. The 15-key Original's own capability dict below
+(`key_rows=3, key_cols=5`) is the cross-check: it's a 3-row, 5-column grid,
+matching every existing REDUCED-mode assertion in this file.
 """
 
 from __future__ import annotations
@@ -85,15 +91,13 @@ class TestReducedMode:
         assert classify_key(plan, 11) == (KEY_SESSION, 9)
         assert classify_key(plan, 13) == (KEY_SESSION, 11)
 
-    def test_other_no_dial_grids_use_same_corner_math(self) -> None:
+    def test_other_no_dial_grid_uses_same_corner_math(self) -> None:
+        # XL (4x8) has more than 3 columns, so it keeps the original corner
+        # reservation -- only the exactly-3-columns Mini shape (below) gets
+        # the bottom-row treatment.
         xl = plan_layout(CAPS_XL)
         assert (xl.view_key, xl.prev_key, xl.next_key) == (0, 24, 31)
         assert xl.sessions_per_page == 29
-
-        mini = plan_layout(CAPS_MINI)
-        assert (mini.view_key, mini.prev_key, mini.next_key) == (0, 3, 5)
-        assert mini.session_slots == (1, 2, 4)
-        assert mini.sessions_per_page == 3
 
 
 class TestFullMode:
@@ -117,6 +121,94 @@ class TestFullMode:
         plan = plan_layout(CAPS_PLUS)
         for key in range(8):
             assert classify_key(plan, key) == (KEY_SESSION, key)
+
+
+class TestCompactThreeColumnMode:
+    """Stream Deck Mini shape (2 rows x 3 cols): bottom row is PREV/VIEW/NEXT.
+
+    3 columns is exactly enough to dedicate a whole row to the 3 controls,
+    so this grid shape gets bottom-row reservation instead of the corner
+    scheme -- see `layout._reserved_control_keys`. Selected purely by
+    `key_rows`/`key_cols`, never by `deck_type()`/model name.
+    """
+
+    def test_mode_and_reserved_indices(self) -> None:
+        plan = plan_layout(CAPS_MINI)
+        assert plan.mode == MODE_REDUCED
+        assert plan.prev_key == 3  # bottom row, left
+        assert plan.view_key == 4  # bottom row, middle
+        assert plan.next_key == 5  # bottom row, right
+
+    def test_session_slots_are_the_entire_top_row(self) -> None:
+        plan = plan_layout(CAPS_MINI)
+        assert plan.session_slots == (0, 1, 2)
+        assert plan.sessions_per_page == 3
+
+    def test_no_dials_no_strip(self) -> None:
+        plan = plan_layout(CAPS_MINI)
+        assert plan.use_dials is False
+        assert plan.use_strip is False
+
+    def test_classify_reserved_keys(self) -> None:
+        plan = plan_layout(CAPS_MINI)
+        assert classify_key(plan, 3) == (KEY_PREV, None)
+        assert classify_key(plan, 4) == (KEY_VIEW, None)
+        assert classify_key(plan, 5) == (KEY_NEXT, None)
+
+    def test_classify_session_keys_map_to_slot_positions(self) -> None:
+        plan = plan_layout(CAPS_MINI)
+        assert classify_key(plan, 0) == (KEY_SESSION, 0)
+        assert classify_key(plan, 1) == (KEY_SESSION, 1)
+        assert classify_key(plan, 2) == (KEY_SESSION, 2)
+
+    def test_three_columns_with_extra_rows_still_reserves_bottom_row_only(
+        self,
+    ) -> None:
+        # A hypothetical 3x3-cols deck (9 keys): still exactly 3 columns, so
+        # the whole bottom row (not just its corners) is reserved -- the
+        # two rows above it are entirely session tiles.
+        caps = {
+            "key_count": 9,
+            "key_rows": 3,
+            "key_cols": 3,
+            "dial_count": 0,
+            "is_touch": False,
+        }
+        plan = plan_layout(caps)
+        assert (plan.prev_key, plan.view_key, plan.next_key) == (6, 7, 8)
+        assert plan.session_slots == (0, 1, 2, 3, 4, 5)
+        assert plan.sessions_per_page == 6
+
+    def test_full_mode_wins_even_if_a_three_column_deck_reports_dials_and_touch(
+        self,
+    ) -> None:
+        # Capability-driven priority: FULL mode's dial+touch check runs
+        # before any REDUCED-mode geometry decision, so a (hypothetical)
+        # 3-column deck with 2+ dials and a touchscreen is never routed
+        # into the bottom-row special case.
+        caps = {**CAPS_MINI, "dial_count": 2, "is_touch": True}
+        plan = plan_layout(caps)
+        assert plan.mode == MODE_FULL
+        assert plan.view_key is None
+        assert plan.prev_key is None
+        assert plan.next_key is None
+        assert plan.session_slots == tuple(range(6))
+        assert plan.sessions_per_page == 6
+
+    def test_dials_but_no_touch_still_uses_bottom_row_geometry(self) -> None:
+        caps = {**CAPS_MINI, "dial_count": 4}
+        plan = plan_layout(caps)
+        assert plan.mode == MODE_REDUCED
+        assert plan.use_dials is False
+        assert plan.use_strip is False
+        assert (plan.prev_key, plan.view_key, plan.next_key) == (3, 4, 5)
+
+    def test_touch_but_one_dial_keeps_strip_with_bottom_row_geometry(self) -> None:
+        caps = {**CAPS_MINI, "dial_count": 1, "is_touch": True}
+        plan = plan_layout(caps)
+        assert plan.mode == MODE_REDUCED
+        assert plan.use_strip is True
+        assert (plan.prev_key, plan.view_key, plan.next_key) == (3, 4, 5)
 
 
 class TestEdgeCases:

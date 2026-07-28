@@ -13,18 +13,34 @@ Two layout modes:
   Deck+). Every LCD key is a session tile; dial 0 cycles views, dial 1
   pages, and the touch strip carries the server/view/status headline.
   This is the pre-existing Stream Deck+ behavior, unchanged.
-- REDUCED -- everything else (Original/MK2 3x5, XL 4x8, Mini 2x3, ...).
+- REDUCED -- everything else (Original/MK2 3x5, XL 4x8, Mini 3x2, ...).
   With no dials or strip to lean on, three keys are reserved *by grid
   position* (computed from `key_layout` rows x cols, never hardcoded)
-  for the roles the dials/strip played:
-    * VIEW  = top-left     (index 0): shows the current view name +
-      server label (what the strip showed); a tap opens a paged view
-      picker on the session-slot keys (dial-0's picker role) -- VIEW
-      becomes BACK, PREV/NEXT page the list, tapping a view selects it.
-    * PREV  = bottom-left  (index (rows-1)*cols): previous page.
-    * NEXT  = bottom-right (index rows*cols-1): next page (dial-1's role).
-  Every remaining key is a session tile in reading order, so
-  sessions_per_page = key_count - 3 (12 on a 15-key deck).
+  for the roles the dials/strip played. Which three positions depends on
+  grid shape alone (see `_reserved_control_keys`), never on model name:
+
+    * Exactly 3 columns, 2+ rows (e.g. the Stream Deck Mini, 3 cols x 2
+      rows): 3 columns is exactly enough to dedicate the *entire bottom
+      row* to controls, reading left to right as PREV, VIEW, NEXT --
+      every row above it is entirely session tiles. This was chosen over
+      reusing the corner layout below because on a 3-wide grid the
+      corner scheme leaves session tiles awkwardly split around a lone
+      reserved key in the bottom row (e.g. keys 1, 2, 4 on a 3x2 grid --
+      a gap where key 3 (PREV) sits), whereas a full control row leaves
+      every session tile contiguous on the row(s) above.
+    * Everything else (any other column count): reserve the three
+      corners -- VIEW top-left (index 0), PREV bottom-left
+      (index (rows-1)*cols), NEXT bottom-right (index rows*cols-1) --
+      the original REDUCED geometry, ported from dial-0/dial-1's roles
+      on the Stream Deck+. Unchanged for the 15-key Original (3x5) and
+      XL (4x8).
+
+  In both cases VIEW shows the current view name + server label (what
+  the strip showed); a tap opens a paged view picker on the session-slot
+  keys (dial-0's picker role) -- VIEW becomes BACK, PREV/NEXT page the
+  list, tapping a view selects it. Every remaining key is a session tile
+  in reading order, so sessions_per_page = key_count - 3 (12 on a 15-key
+  deck, 3 on a 6-key Mini).
 
 Edge cases (degrade gracefully, never crash):
 
@@ -33,10 +49,10 @@ Edge cases (degrade gracefully, never crash):
 - Touchscreen but fewer than two dials: REDUCED for the keys, but the
   strip is still used for the status headline (`use_strip` stays True) --
   free extra signal, no behavior depends on it.
-- Fewer than 4 keys, or a grid so degenerate the three reserved corners
-  collide (e.g. a single row, where top-left == bottom-left): every key
-  becomes a session tile with no view/page controls -- a plain session
-  switcher beats three controls with no sessions.
+- Fewer than 4 keys, or a grid so degenerate the three reserved control
+  keys collide (e.g. a single row, where top-left == bottom-left): every
+  key becomes a session tile with no view/page controls -- a plain
+  session switcher beats three controls with no sessions.
 
 Everything here is pure (no device I/O, no threads), so both layout modes
 are unit-testable with fake capability dicts.
@@ -102,6 +118,27 @@ class LayoutPlan:
     use_strip: bool  # paint the touch strip (status headline)?
 
 
+def _reserved_control_keys(rows: int, cols: int) -> tuple[int, int, int]:
+    """Compute `(view_key, prev_key, next_key)` physical key indices.
+
+    Chosen by grid shape alone (`key_rows` x `key_cols`) -- never by model
+    name. Two geometries:
+
+    - Exactly 3 columns, 2+ rows: the bottom row exactly fits all three
+      controls, reading left to right as PREV, VIEW, NEXT. Every row above
+      it is entirely session tiles. A 3-wide grid is the one shape where a
+      full control row is both possible (no leftover) and better than the
+      corner scheme below, which would otherwise strand session tiles
+      around a lone reserved key mid-row.
+    - Everything else: reserve the three corners -- VIEW top-left, PREV
+      bottom-left, NEXT bottom-right -- the original REDUCED geometry.
+    """
+    if cols == 3 and rows >= 2:
+        bottom_row_start = (rows - 1) * cols
+        return bottom_row_start + 1, bottom_row_start, bottom_row_start + 2
+    return 0, (rows - 1) * cols, rows * cols - 1
+
+
 def plan_layout(caps: Mapping[str, Any]) -> LayoutPlan:
     """Choose the layout mode and key assignments for a deck's capabilities.
 
@@ -131,9 +168,7 @@ def plan_layout(caps: Mapping[str, Any]) -> LayoutPlan:
             use_strip=True,
         )
 
-    view_key = 0
-    prev_key = (rows - 1) * cols
-    next_key = rows * cols - 1
+    view_key, prev_key, next_key = _reserved_control_keys(rows, cols)
     reserved = (view_key, prev_key, next_key)
     degenerate = (
         key_count < _REDUCED_MIN_KEYS
