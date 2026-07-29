@@ -347,3 +347,145 @@ def patch_raw_config(patch: dict, config_path: str | None = None) -> dict:
             current[key] = patch[key]
     save_raw_config(current, config_path)
     return current
+
+
+# ---------------------------------------------------------------------------
+# Hot reload -- pick up `controls set`/`config set` edits without a restart.
+# ---------------------------------------------------------------------------
+#
+# The running sidecar and the CLI process that edits config.json are always
+# different processes. Rather than a new IPC channel (socket, HTTP endpoint),
+# this follows the repo's existing file-based-IPC precedent (`statusfile.py`,
+# `singleton.py`): the sidecar's already-running poll loop cheaply `stat()`s
+# config.json on its existing tick (`main._run_active`'s while loop, same
+# cadence as the server poll) and, only when the mtime actually changed,
+# re-runs it through the exact same Gate 1 validation `load_config` performs
+# at startup (`ConfigError` -> keep the last-known-good `Config`, never a
+# partially-applied one -- see `ConfigWatcher.poll`'s docstring).
+#
+# Not every key is safe to apply live. `server_url`, `key_file` (whose
+# resolved value is `Config.federation_key`), and `ca_file` are baked into a
+# `MuxplexClient` constructed once per connection (`main._run`); swapping
+# them out from under a live `httpx.Client`/TLS context is not attempted --
+# changing any of them is reported (`ReloadOutcome.restart_required`) but
+# never applied, and a sidecar restart is still required. Everything else in
+# `DEFAULT_CONFIG` is read fresh on every tick already (`controls`/`sort`/
+# `focus_app` are plain values threaded through `_ActiveRuntime`;
+# `poll_interval` is a local variable in `_run_active`'s wait call) --
+# verified by inspection, not assumed: none of them are captured into a
+# closure, a constructed client, or any other object that would go stale.
+RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "focus_app", "poll_interval")
+
+# (report name as it appears in config.json / `config list`, Config attribute
+# to compare) -- reported when different, but NEVER applied to the running
+# session; a restart is required. `key_file` compares on `federation_key`
+# (the resolved secret), not the raw path, since a path change is only
+# meaningful insofar as it changes which key is live.
+_RESTART_REQUIRED_FIELDS: tuple[tuple[str, str], ...] = (
+    ("server_url", "server_url"),
+    ("key_file", "federation_key"),
+    ("ca_file", "ca_file"),
+)
+
+
+@dataclass(frozen=True)
+class ReloadOutcome:
+    """Result of one `ConfigWatcher.poll()` check.
+
+    `checked` is False when config.json's mtime hasn't changed since the
+    last check -- the common case, and deliberately cheap: just one
+    `Path.stat()` call, no re-read, no re-validation (see module docstring
+    on poll cost). Callers should treat `checked=False` as "nothing to do
+    at all", not merely "nothing changed".
+
+    When `checked` is True:
+    - `error` is set (and `config` is `None`) if the file changed but
+      failed Gate 1 validation -- the caller's previously-held `Config`
+      must be kept exactly as-is, as if this poll had not run. This is
+      the fail-safe behavior for a bad hand-edit at runtime: unlike
+      startup (which fails closed with a non-zero exit), a sidecar
+      already driving hardware keeps its last-good bindings and only
+      reports the problem.
+    - Otherwise `config` is the freshly loaded, fully Gate-1-validated
+      `Config` (whether or not anything reloadable actually differs).
+      `applied` lists which of `RELOADABLE_KEYS` differ from the
+      previous known-good config -- empty if the file changed but only a
+      restart-required (or no) field did. `restart_required` lists
+      non-reloadable keys that differ -- informational only, never
+      applied; the field the running session is still using is
+      unaffected.
+    """
+
+    checked: bool
+    config: Config | None = None
+    applied: tuple[str, ...] = ()
+    restart_required: tuple[str, ...] = ()
+    error: str | None = None
+
+
+class ConfigWatcher:
+    """Detects and Gate-1-validates config.json changes for a running sidecar.
+
+    Constructed once per `main._run()` invocation with whatever `Config` was
+    loaded at startup; `poll()` is called from the existing poll-loop tick
+    in `main._run_active`. See `RELOADABLE_KEYS`/`ReloadOutcome` for the
+    contract. `current` always holds the last-known-good `Config` -- never
+    a config that failed validation, and never one with a bad-edit's
+    unsafe fields silently substituted in.
+    """
+
+    def __init__(self, config_path: str | None, initial: Config) -> None:
+        self._config_path = config_path
+        self._resolved_path = _resolve_config_path(config_path)
+        self._last_good = initial
+        self._mtime = self._stat_mtime()
+
+    def _stat_mtime(self) -> float | None:
+        try:
+            return self._resolved_path.stat().st_mtime
+        except OSError:
+            return None
+
+    @property
+    def current(self) -> Config:
+        """The last-known-good `Config` -- what the sidecar should be using right now."""
+        return self._last_good
+
+    def poll(self) -> ReloadOutcome:
+        """Cheap check: has config.json changed since the last check?
+
+        Only re-reads/re-validates the file when its mtime differs from
+        what was last observed -- the common per-tick case is a single
+        `stat()` call and nothing else.
+        """
+        mtime = self._stat_mtime()
+        if mtime == self._mtime:
+            return ReloadOutcome(checked=False)
+        # Record the new mtime regardless of outcome: a broken edit must be
+        # reported once, not re-validated (and re-logged) on every future
+        # tick until it's fixed -- the file genuinely changed, so there is
+        # nothing more to learn from re-parsing the same bytes again.
+        self._mtime = mtime
+
+        try:
+            new_config = load_config(self._config_path)
+        except ConfigError as exc:
+            return ReloadOutcome(checked=True, error=str(exc))
+
+        applied = tuple(
+            key
+            for key in RELOADABLE_KEYS
+            if getattr(new_config, key) != getattr(self._last_good, key)
+        )
+        restart_required = tuple(
+            report_name
+            for report_name, attr in _RESTART_REQUIRED_FIELDS
+            if getattr(new_config, attr) != getattr(self._last_good, attr)
+        )
+        self._last_good = new_config
+        return ReloadOutcome(
+            checked=True,
+            config=new_config,
+            applied=applied,
+            restart_required=restart_required,
+        )
