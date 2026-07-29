@@ -109,6 +109,7 @@ def build_status(
     page: int | None,
     hint: str | None = None,
     unapplied: list[dict[str, str]] | None = None,
+    config_reload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the status dict written to disk. Pure -- no I/O, easy to test.
 
@@ -131,6 +132,15 @@ def build_status(
     docs/CONTROL_MAPPING_DESIGN.md §6 requires so a binding that can't
     apply to the connected deck is never silently discarded. Published so
     `muxplex-deck status`/`controls` can show it with no deck attached.
+
+    `config_reload` (optional, additive) is the last *processed*
+    `config.ConfigWatcher.poll()` outcome (`main._config_reload_status`'s
+    shape: `config_mtime`/`checked_at`/`applied`/`restart_required`/
+    `error`) -- published only when a poll actually detected a config.json
+    change, so it answers "did my edit get picked up, and when": `cli.py`'s
+    `controls set`/`unset`/`reset` compare their own write's mtime against
+    `config_mtime` to report whether a running sidecar applied it (see
+    `cli._wait_for_config_pickup`).
     """
     device: dict[str, Any] = {"connected": device_connected}
     if device_connected and device_caps is not None:
@@ -140,7 +150,7 @@ def build_status(
     if unapplied:
         device["unapplied"] = unapplied
 
-    return {
+    status: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "pid": pid,
         "updated_at": time.time(),
@@ -157,6 +167,9 @@ def build_status(
             "page": page,
         },
     }
+    if config_reload is not None:
+        status["config_reload"] = config_reload
+    return status
 
 
 def write_status(status: dict[str, Any], path: Path | None = None) -> None:
@@ -223,6 +236,7 @@ class StatusReporter:
             "page": None,
             "hint": None,
             "unapplied": None,
+            "config_reload": None,
         }
 
     def update(self, **fields: Any) -> None:

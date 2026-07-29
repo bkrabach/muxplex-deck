@@ -55,6 +55,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from muxplex_client import (
@@ -68,6 +69,7 @@ from muxplex_client import (
 )
 
 from . import attention, focus, interaction, layout, rendering, views
+from . import config as config_mod
 from . import controls as controls_mod
 from .config import Config
 from .device import (
@@ -409,6 +411,7 @@ class _ActiveRuntime:
         sort_mode: str,
         focus_app_name: str = "",
         controls: Mapping[str, str] | None = None,
+        poll_interval: float = 2.0,
     ) -> None:
         self.deck = deck
         self.client = client
@@ -417,6 +420,10 @@ class _ActiveRuntime:
         # macOS app name of the local muxplex PWA to bring forward on a
         # key-press session switch; "" disables (see `.focus`).
         self.focus_app_name = focus_app_name
+        # Read fresh on every wait in `_run_active`'s loop -- a plain
+        # attribute (not captured into a closure), so `apply_reload` can
+        # change it and the very next wait honors the new value.
+        self.poll_interval = poll_interval
 
         # Guards every actual HTTP call -- poll-loop GETs, a dial-0 commit's
         # PATCH+refresh, and key-press connects can each originate from a
@@ -470,6 +477,38 @@ class _ActiveRuntime:
         with self.paint_lock:
             self.last_key_state = [None] * self.deck.key_count()
             self.last_strip = None
+
+    def apply_reload(self, config: Config) -> None:
+        """Apply a hot-reloaded config's safe fields to this live session.
+
+        Called only when `config_mod.ConfigWatcher.poll()` reports that at
+        least one of `config_mod.RELOADABLE_KEYS` actually changed --
+        `server_url`/`key_file`/`ca_file` are never read from here (see
+        that module's docstring on why: they're bound into the
+        already-constructed `MuxplexClient`, not this object).
+
+        Recomputes the Gate-2 plan against THIS deck's real capabilities --
+        the same call bring-up (`_run_active`) makes -- so a control-mapping
+        edit takes effect exactly like a fresh connection would compute it,
+        with no reconnect needed. `sessions_per_page` may change if the
+        edit moved which keys are reserved for view/page controls, so the
+        pager's page size and page count are kept in lockstep; the paint
+        cache is invalidated so the next `repaint()` redraws every key
+        under the new bindings instead of trusting a diff cache computed
+        under the old ones.
+        """
+        with self.paint_lock:
+            self.plan = layout.plan_layout(
+                layout.read_capabilities(self.deck), config.controls
+            )
+            self.sort_mode = config.sort
+            self.focus_app_name = config.focus_app
+            self.poll_interval = config.poll_interval
+            self.pager.page_size = max(1, self.plan.sessions_per_page)
+            self.pager.set_item_count(len(self.ordered))
+            self.last_key_state = [None] * self.deck.key_count()
+            self.last_strip = None
+        _log_plan_diagnostics(self.plan)
 
     # --- fetch + process ---------------------------------------------------
 
@@ -1237,16 +1276,57 @@ def _unapplied_for_status(plan: layout.LayoutPlan) -> list[dict[str, str]] | Non
     return [{"address": u.address, "reason": u.reason} for u in plan.unapplied]
 
 
+def _log_plan_diagnostics(plan: layout.LayoutPlan) -> None:
+    """Gate 2 diagnostics (§6): reported, never fatal -- a binding that
+
+    doesn't apply to THIS deck may be perfectly valid for a different one
+    the user swaps in later (hotplug), or may have just been introduced by
+    a hot-reloaded edit. Surfaced at WARNING here (surface 1 of 4: bring-up
+    log / reload log), in `status.json` (surface 2, via
+    `_unapplied_for_status`), and via `doctor`/`muxplex-deck controls`
+    (surfaces 3-4, in cli.py). Shared by bring-up (`_run_active`) and
+    hot-reload (`_ActiveRuntime.apply_reload`) so both paths report
+    identically.
+    """
+    for unapplied in plan.unapplied:
+        logger.warning(
+            "control binding %s does not apply to this deck: %s",
+            unapplied.address,
+            unapplied.reason,
+        )
+    for advisory in plan.advisories:
+        logger.warning("control binding advisory: %s", advisory)
+
+
+def _config_reload_status(
+    mtime: float | None, outcome: config_mod.ReloadOutcome
+) -> dict[str, Any]:
+    """JSON-serializable `status.json` field for one *processed* reload check.
+
+    Only called when `outcome.checked` is True -- `main._run_active`'s loop
+    omits the `config_reload` key entirely on an unchanged-file tick, and
+    `StatusReporter.update`'s merge-not-replace semantics mean the last
+    processed outcome simply persists until the next one. `mtime` is
+    config.json's mtime as of THIS check -- `cli.py`'s `controls set`/
+    `unset`/`reset` compare against it to tell whether a specific edit has
+    been picked up yet (see `cli._wait_for_config_pickup`).
+    """
+    return {
+        "config_mtime": mtime,
+        "checked_at": time.time(),
+        "applied": list(outcome.applied),
+        "restart_required": list(outcome.restart_required),
+        "error": outcome.error,
+    }
+
+
 def _run_active(
     deck: DeckDevice,
     client: MuxplexClient,
     shutting_down: threading.Event,
-    poll_interval: float,
     hostname: str,
-    sort_mode: str,
-    focus_app_name: str,
     reporter: StatusReporter,
-    controls: Mapping[str, str] | None = None,
+    watcher: config_mod.ConfigWatcher,
 ) -> None:
     """Run one connected-device session against the muxplex server.
 
@@ -1254,7 +1334,16 @@ def _run_active(
     errors (unreachable/auth) are handled *inside* this loop -- they never
     propagate up to trigger the outer hotplug recovery path, since they are
     expected, recoverable conditions, not device errors.
+
+    `watcher` is polled once here (before anything else) so a *fresh*
+    connection -- including a reconnect after the deck was unplugged for a
+    while -- always starts from whatever config.json currently says, not a
+    snapshot from an earlier bring-up; it's polled again every tick inside
+    the loop below for genuine hot-reload while the connection stays up.
     """
+    watcher.poll()
+    config = watcher.current
+
     _log_device_info(deck)
     try:
         deck.set_brightness(FULL_BRIGHTNESS_PERCENT)
@@ -1264,21 +1353,17 @@ def _run_active(
         # but a device that just went away mid-open shouldn't be fatal here,
         # the outer loop's is_open()/connected() checks handle that.
         logger.exception("failed to set brightness to %d%%", FULL_BRIGHTNESS_PERCENT)
-    ctx = _ActiveRuntime(deck, client, hostname, sort_mode, focus_app_name, controls)
+    ctx = _ActiveRuntime(
+        deck,
+        client,
+        hostname,
+        config.sort,
+        config.focus_app,
+        config.controls,
+        config.poll_interval,
+    )
     logger.info("%s", layout.describe_plan(ctx.plan))
-    # Gate 2 diagnostics (§6): reported, never fatal -- a binding that
-    # doesn't apply to THIS deck may be perfectly valid for a different one
-    # the user swaps in later (hotplug). Surfaced at WARNING here (surface
-    # 1 of 4: bring-up log), in `status.json` below (surface 2), and via
-    # `doctor`/`muxplex-deck controls` (surfaces 3-4, in cli.py).
-    for unapplied in ctx.plan.unapplied:
-        logger.warning(
-            "control binding %s does not apply to this deck: %s",
-            unapplied.address,
-            unapplied.reason,
-        )
-    for advisory in ctx.plan.advisories:
-        logger.warning("control binding advisory: %s", advisory)
+    _log_plan_diagnostics(ctx.plan)
     _paint_status_only(deck, "connecting to muxplex...", ctx.plan)
 
     reporter.update(
@@ -1300,8 +1385,8 @@ def _run_active(
     logger.info(
         "Stream Deck active -- polling %s every %.1fs (sort=%s)",
         hostname,
-        poll_interval,
-        sort_mode,
+        ctx.poll_interval,
+        ctx.sort_mode,
     )
 
     backoff = INITIAL_BACKOFF_SECONDS
@@ -1366,7 +1451,37 @@ def _run_active(
                 active_view=ctx.active_view,
                 page=ctx.pager.page,
             )
-            if _interruptible_wait(deck, shutting_down, poll_interval):
+
+            # Hot reload (§ config.py "Hot reload"): cheap on this existing
+            # tick -- one `stat()` when nothing changed. Only a *processed*
+            # check (`checked=True`) publishes `config_reload`; an
+            # unchanged-file tick omits the key entirely and the reporter's
+            # merge-not-replace semantics leave the last one in place.
+            outcome = watcher.poll()
+            if outcome.checked:
+                mtime = watcher._stat_mtime()
+                if outcome.error:
+                    logger.error(
+                        "config reload failed -- keeping last-known-good bindings: %s",
+                        outcome.error,
+                    )
+                else:
+                    assert outcome.config is not None
+                    if outcome.applied:
+                        ctx.apply_reload(outcome.config)
+                        reporter.update(unapplied=_unapplied_for_status(ctx.plan))
+                        logger.info(
+                            "config reload applied: %s", ", ".join(outcome.applied)
+                        )
+                    if outcome.restart_required:
+                        logger.warning(
+                            "config change to %s requires a sidecar restart "
+                            "to take effect",
+                            ", ".join(outcome.restart_required),
+                        )
+                reporter.update(config_reload=_config_reload_status(mtime, outcome))
+
+            if _interruptible_wait(deck, shutting_down, ctx.poll_interval):
                 return
     finally:
         reporter.update(
@@ -1448,6 +1563,7 @@ def run(
     *,
     log_file: Path | None = None,
     lock_path: Path | None = None,
+    config_path: str | None = None,
 ) -> int:
     _configure_logging(log_file)
 
@@ -1476,17 +1592,23 @@ def run(
         return 1
 
     try:
-        return _run(config, manager)
+        return _run(config, manager, config_path)
     finally:
         lock.release()
 
 
-def _run(config: Config, manager: DeviceManager) -> int:
+def _run(config: Config, manager: DeviceManager, config_path: str | None = None) -> int:
     """The hotplug + server-connectivity loop, guarded by `run()`'s lock."""
     shutting_down = _install_signal_handler()
     hostname = urlparse(config.server_url).hostname or config.server_url
     logged_waiting = False
     last_heartbeat = 0.0
+
+    # Hot reload (see config.py's "Hot reload" section): one watcher for
+    # the whole process lifetime, seeded with whatever `config` this
+    # process started with. `_run_active` polls it on its existing
+    # per-tick cadence -- see that function's docstring.
+    watcher = config_mod.ConfigWatcher(config_path, config)
 
     # The most recently found device (or None, if absent/never found yet).
     # Tracked here -- not just inside `_run_active` -- so the `finally`
@@ -1590,12 +1712,9 @@ def _run(config: Config, manager: DeviceManager) -> int:
                         deck,
                         client,
                         shutting_down,
-                        config.poll_interval,
                         hostname,
-                        config.sort,
-                        config.focus_app,
                         reporter,
-                        config.controls,
+                        watcher,
                     )
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")
