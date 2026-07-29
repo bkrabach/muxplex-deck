@@ -390,9 +390,9 @@ class TestReducedViewPicker:
         assert ctx.last_key_state[3] == ("picker", "hidden", False)
         assert ctx.last_key_state[4] is None  # empty option slot
         # reserved keys repurposed: BACK on the VIEW key, pagers inert (1 page)
-        assert ctx.last_key_state[0] == ("control", "VIEW", "< BACK", "")
-        assert ctx.last_key_state[10] == ("control", "", "< PREV", "")
-        assert ctx.last_key_state[14] == ("control", "", "NEXT >", "")
+        assert ctx.last_key_state[0] == ("control", "< BACK", "VIEW", "")
+        assert ctx.last_key_state[10] == ("control", "< PREV", "PAGE", "")
+        assert ctx.last_key_state[14] == ("control", "NEXT >", "PAGE", "")
 
     def test_hidden_pseudo_view_selectable_like_all(self, reduced) -> None:
         """Regression: "hidden" is a reserved pseudo-view exactly like "all" --
@@ -472,7 +472,7 @@ class TestReducedViewPickerPaging:
         # slot 4 -- options[16] == "hidden", the trailing pseudo-view
         assert ctx.last_key_state[5] == ("picker", "hidden", False)
         # pagers show the picker's own page footer on page 2 of 2
-        assert ctx.last_key_state[14] == ("control", "", "NEXT >", "p2/2")
+        assert ctx.last_key_state[14] == ("control", "NEXT >", "PAGE", "2/2")
         # slot tap on page 2 selects the right (windowed) view
         ctx.handle_key(2)  # slot 1 -> options[13] == "view-12"
         assert client.view_patches == ["view-12"]
@@ -611,9 +611,9 @@ class TestMiniViewPicker:
         assert ctx.last_key_state[2] == ("picker", "view-01", False)
         # reserved keys repurposed: BACK on VIEW, PREV/NEXT show the
         # picker's own page footer -- never repainted as session tiles.
-        assert ctx.last_key_state[4] == ("control", "VIEW", "< BACK", "")
-        assert ctx.last_key_state[3] == ("control", "", "< PREV", "p1/2")
-        assert ctx.last_key_state[5] == ("control", "", "NEXT >", "p1/2")
+        assert ctx.last_key_state[4] == ("control", "< BACK", "VIEW", "")
+        assert ctx.last_key_state[3] == ("control", "< PREV", "PAGE", "1/2")
+        assert ctx.last_key_state[5] == ("control", "NEXT >", "PAGE", "1/2")
 
     def test_next_pages_and_second_page_maps_correct_names(
         self, mini_many_views
@@ -626,7 +626,7 @@ class TestMiniViewPicker:
         assert ctx.last_key_state[0] == ("picker", "view-02", False)
         assert ctx.last_key_state[1] == ("picker", "view-03", False)
         assert ctx.last_key_state[2] == ("picker", "hidden", False)
-        assert ctx.last_key_state[5] == ("control", "", "NEXT >", "p2/2")
+        assert ctx.last_key_state[5] == ("control", "NEXT >", "PAGE", "2/2")
         ctx.handle_key(1)  # slot 1 on this window -> "view-03"
         assert client.view_patches == ["view-03"]
         assert ctx.picker.mode == PickerMode.NONE

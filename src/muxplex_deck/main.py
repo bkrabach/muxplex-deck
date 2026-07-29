@@ -108,48 +108,83 @@ BRIGHTNESS_FLOOR_PERCENT = 10
 
 _MAX_VIEW_LABEL_CHARS = 20
 
-# Static (title, body) display for control-key actions whose label never
-# changes at runtime -- everything else (view_picker, page_picker,
-# page_prev, page_next) carries live state and is special-cased in
-# `_control_key_display`. Relative-only actions (view_cycle, page_cycle,
-# brightness_cycle) never appear here: Gate 1 (config.py) rejects them on
-# any address but `dial.N.turn`, so they can never be the resolved action
-# for a `key.N` or `dial.N.push` control needing a key-paint spec.
-_STATIC_CONTROL_LABELS: dict[str, tuple[str, str]] = {
-    "view_all": ("VIEW", "ALL"),
-    "page_first": ("PAGE", "FIRST"),
-    "page_last": ("PAGE", "LAST"),
-    "view_prev": ("VIEW", "< PREV"),
-    "view_next": ("VIEW", "NEXT >"),
-    "focus_app": ("", "FOCUS"),
-    "refresh_now": ("", "REFRESH"),
-    "toggle_last": ("", "TOGGLE"),
-    "brightness_up": ("BRIGHT", "+"),
-    "brightness_down": ("BRIGHT", "-"),
-}
+
+def _view_position_text(names: list[str], view_label: str) -> str:
+    """The "n/N" position of `view_label` in the view-cycle list, or "" if absent.
+
+    Feeds the STATE band of `view_picker`/`view_prev`/`view_next` (see
+    docs/KEY_DESIGN_SYSTEM.md §6.2) -- the same "which of N options is
+    this" read the page controls already give via `page_text`, just for
+    views instead of pages.
+    """
+    if not names:
+        return ""
+    try:
+        index = names.index(view_label) + 1
+    except ValueError:
+        return ""
+    return f"{index}/{len(names)}"
 
 
 def _control_key_display(
-    action: str, *, view_label: str, turning: bool, hostname: str, page_text: str
+    action: str,
+    *,
+    view_label: str,
+    turning: bool,
+    view_position: str,
+    page_text: str,
+    brightness_text: str,
+    previous_session: str,
 ) -> tuple[str, str, str]:
-    """(title, body, footer) for a non-"session"/"none" control key's paint.
+    """(name, body, state) for a non-"session"/"none" control key's paint.
 
-    `view_picker`/`page_picker`/`page_prev`/`page_next` carry live state
-    (the current view name, or the page footer) and are special-cased;
-    everything else in the catalog has a fixed label from
-    `_STATIC_CONTROL_LABELS`.
+    Implements the per-action table in docs/KEY_DESIGN_SYSTEM.md §6.2:
+    NAME is the qualifier (what this key controls, or which direction),
+    BODY is the discriminator (the single most important word on the
+    face), STATE is live ambient context that changes without a press.
+
+    This is the "discriminator swap" from pre-v3: the old code put the
+    direction (`"< PREV"`) in the large, prominent slot and the noun
+    (`"VIEW"`/`"PAGE"`) in the small dim one, so `view_prev` and
+    `page_prev` -- two keys that can sit right next to each other -- were
+    indistinguishable at a glance. Swapping which text goes in which band
+    (not just resizing) is the actual fix; see the design doc's "critical
+    inversion" note.
     """
     if action == "view_picker":
         body = f"> {view_label}" if turning else view_label
-        return "VIEW", body, hostname
+        return "VIEW", body, view_position
+    if action == "view_prev":
+        return "< PREV", "VIEW", view_position
+    if action == "view_next":
+        return "NEXT >", "VIEW", view_position
+    if action == "view_all":
+        return "GO TO", "ALL", ""
     if action == "page_picker":
-        return "PAGE", "PAGE", page_text
+        return "PAGE", page_text, ""
     if action == "page_prev":
-        return "", "< PREV", page_text
+        return "< PREV", "PAGE", page_text
     if action == "page_next":
-        return "", "NEXT >", page_text
-    title, body = _STATIC_CONTROL_LABELS.get(action, ("", action))
-    return title, body, ""
+        return "NEXT >", "PAGE", page_text
+    if action == "page_first":
+        return "FIRST", "PAGE", page_text
+    if action == "page_last":
+        return "LAST", "PAGE", page_text
+    if action == "brightness_up":
+        return "BRIGHT", "+", brightness_text
+    if action == "brightness_down":
+        return "BRIGHT", "-", brightness_text
+    if action == "toggle_last":
+        return "SWAP TO", "LAST", previous_session
+    if action == "refresh_now":
+        return "DECK", "SYNC", ""
+    if action == "focus_app":
+        return "HOST", "FOCUS", ""
+    # Unreached today: "none" is short-circuited by the caller before this
+    # runs, and every other catalog entry is handled above -- kept as an
+    # honest fallback rather than raising, for a future action nobody has
+    # taught this table about yet.
+    return "", action, ""
 
 
 def _build_log_file_handler(log_file: Path) -> logging.Handler:
@@ -648,7 +683,12 @@ class _ActiveRuntime:
             with self.deck:
                 if reduced:
                     self._paint_reduced_picker(
-                        window, current, start=start, total=total, page_size=page_size
+                        window,
+                        current,
+                        kind=kind,
+                        start=start,
+                        total=total,
+                        page_size=page_size,
                     )
                 else:
                     self._paint_picker_keys(window, current)
@@ -683,6 +723,7 @@ class _ActiveRuntime:
         window: list[str],
         current: str,
         *,
+        kind: str,
         start: int,
         total: int,
         page_size: int,
@@ -690,12 +731,12 @@ class _ActiveRuntime:
         """Paint the reduced-layout picker: options on session slots, controls reserved.
 
         The session-slot keys show the current window of options (one view
-        name per key, the active one marked with the same cyan border the
+        name per key, the active one marked with the same cyan ring the
         active session tile uses); the reserved keys are repurposed as
-        BACK (the VIEW key) and PREV/NEXT (the picker's own paging, with a
-        pN/M footer only when there is more than one page -- the same
-        convention the session grid's controls use). Same per-key diffing
-        as every other paint path.
+        BACK (the VIEW key) and PREV/NEXT (the picker's own paging).
+        `kind` (`"VIEW"` or `"PAGE"`, whichever picker is open) is BACK's
+        BODY -- see docs/KEY_DESIGN_SYSTEM.md §6.4's picker-chrome table.
+        Same per-key diffing as every other paint path.
         """
         for slot, key_index in enumerate(self.plan.session_slots):
             label = window[slot] if slot < len(window) else None
@@ -716,23 +757,23 @@ class _ActiveRuntime:
 
         page = start // page_size + 1
         page_count = max(1, (total + page_size - 1) // page_size)
-        page_text = f"p{page}/{page_count}" if page_count > 1 else ""
+        page_text = f"{page}/{page_count}" if page_count > 1 else ""
         specs: list[tuple[int | None, str, str, str]] = [
-            (self.plan.view_key, "VIEW", "< BACK", ""),
-            (self.plan.prev_key, "", "< PREV", page_text),
-            (self.plan.next_key, "", "NEXT >", page_text),
+            (self.plan.view_key, "< BACK", kind, ""),
+            (self.plan.prev_key, "< PREV", "PAGE", page_text),
+            (self.plan.next_key, "NEXT >", "PAGE", page_text),
         ]
         handled = {key_index for key_index, *_ in specs if key_index is not None}
-        for key_index, title, body, footer in specs:
+        for key_index, name, body, state in specs:
             if key_index is None:
                 continue
-            control_identity: object = ("control", title, body, footer)
+            control_identity: object = ("control", name, body, state)
             if self.last_key_state[key_index] == control_identity:
                 continue
             self.deck.set_key_image(
                 key_index,
                 rendering.render_control_key(
-                    self.deck, title=title, body=body, footer=footer
+                    self.deck, name=name, body=body, state=state
                 ),
             )
             self.last_key_state[key_index] = control_identity
@@ -808,7 +849,10 @@ class _ActiveRuntime:
         """
         page = self.pager.page
         page_count = self.pager.page_count
-        page_text = f"p{page}/{page_count}" if page_count > 1 else ""
+        page_text = f"{page}/{page_count}" if page_count > 1 else ""
+        view_position = _view_position_text(self.view_cycler.names(), view_label)
+        brightness_text = f"{self.brightness}%"
+        previous_session = self.previous_session or ""
 
         session_slot_set = set(self.plan.session_slots)
         for key_index in range(self.deck.key_count()):
@@ -824,20 +868,22 @@ class _ActiveRuntime:
                 )
                 self.last_key_state[key_index] = identity
                 continue
-            title, body, footer = _control_key_display(
+            name, body, state = _control_key_display(
                 action,
                 view_label=view_label,
                 turning=turning,
-                hostname=self.hostname,
+                view_position=view_position,
                 page_text=page_text,
+                brightness_text=brightness_text,
+                previous_session=previous_session,
             )
-            identity = ("control", title, body, footer)
+            identity = ("control", name, body, state)
             if self.last_key_state[key_index] == identity:
                 continue
             self.deck.set_key_image(
                 key_index,
                 rendering.render_control_key(
-                    self.deck, title=title, body=body, footer=footer
+                    self.deck, name=name, body=body, state=state
                 ),
             )
             self.last_key_state[key_index] = identity
