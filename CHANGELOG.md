@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.0 (2026-07-29)
+
+### Features
+
+- **Every key face now follows one consistent layout.** Each key is divided into the same three bands — what the key is, what distinguishes it, and any live status — reserved whether or not they hold anything. Previously the name sat at the top on some keys, the middle on others, and status at the bottom on a third group, which made adjacent keys hard to tell apart at a glance. All measurements derive from the key's pixel size, so the same rules apply to every deck.
+
+- **Direction and category swapped places on paging keys.** The category — view or page — is now the large word, and the direction is small above it. With the previous arrangement, a view key and a page key sitting side by side both showed the same large word and could not be distinguished quickly.
+
+- **Three type sizes replace six.** One is used per key for the thing you actually read; the others carry supporting and background text.
+
+- **Selection and attention no longer compete for the same pixels.** The active session is marked by a ring drawn in the margin, costing no space that text could use; a session wanting attention fills its name band instead, with the text inverted for contrast. Both can apply at once. Neither is signalled by colour alone.
+
+### Bug Fixes
+
+- **Session titles no longer collide with the selection outline.** The outline was drawn at the very edge of the key while text was permitted to extend into the same pixels. Text is now measured against the space inside the outline, and the outline is thinner, leaving a clear gap. The number of preview lines shown is unchanged.
+
+- **Several keys were showing the wrong thing.** One paging key had no label at all and was indistinguishable from its counterpart; another repeated its own name where its position should have been; a third left two bands empty; a fourth displayed the machine's hostname — a value that never changes — in a slot meant for live status.
+
+### Rendered Samples
+
+Rendered sample key faces are available under [docs/samples/](docs/samples/) for both 72px and 120px sizes, covering session tiles in all states (idle, active, attention, both, long name) and all 14 control actions.
+
+### Verification
+
+- 906 tests passed via pytest (baseline 858 + 48 new across zone geometry, band layout, and face rendering tests).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.11.0 (2026-07-28)
 
 ### Features
