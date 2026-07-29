@@ -138,7 +138,7 @@ def run(
         return 1
 
     log_path = Path(log_file).expanduser() if log_file else None
-    return main_mod.run(cfg, manager, log_file=log_path)
+    return main_mod.run(cfg, manager, log_file=log_path, config_path=config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +474,7 @@ def controls_set(address: str, action: str, config_path: str | None = None) -> i
     current[parsed.text] = action
     config_mod.patch_raw_config({"controls": current}, config_path)
     print(f"  {parsed.text}: {action}")
+    _report_reload_effect(config_path, raw)
     return 0
 
 
@@ -495,14 +496,117 @@ def controls_unset(address: str, config_path: str | None = None) -> int:
     del current[parsed.text]
     config_mod.patch_raw_config({"controls": current}, config_path)
     print(f"  {parsed.text}: reset to default")
+    _report_reload_effect(config_path, raw)
     return 0
 
 
 def controls_reset(config_path: str | None = None) -> int:
     """`muxplex-deck controls reset` -- delete the whole `controls` key."""
+    raw = config_mod.load_raw_config(config_path)
     config_mod.patch_raw_config({"controls": {}}, config_path)
     print("  All control bindings reset to defaults")
+    _report_reload_effect(config_path, raw)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Reload-effect reporting -- "config written but not applied" is exactly the
+# stale-state class this repo's AGENTS.md documents shipping five times in
+# one day; `controls set`/`unset`/`reset` must say whether a running sidecar
+# actually picked the edit up, not just that the file was written.
+# ---------------------------------------------------------------------------
+
+_RELOAD_CONFIRM_POLL_SECONDS = 0.1
+_RELOAD_CONFIRM_MIN_TIMEOUT_SECONDS = 1.0
+_RELOAD_CONFIRM_MAX_TIMEOUT_SECONDS = 10.0
+_RELOAD_CONFIRM_TIMEOUT_MARGIN = 1.5  # multiplier over one poll_interval
+
+
+def _reload_confirm_timeout(raw_config: dict) -> float:
+    """Bounded wait budget: comfortably longer than one sidecar poll tick.
+
+    Derived from the config's own `poll_interval` (already loaded by the
+    caller) rather than a fixed constant, so a deliberately slow-polling
+    sidecar isn't reported as unresponsive just because the CLI didn't
+    wait long enough -- but still bounded (`_RELOAD_CONFIRM_MAX_TIMEOUT_SECONDS`)
+    so `controls set` can never hang indefinitely on a wedged sidecar.
+    """
+    poll_interval = raw_config.get(
+        "poll_interval", config_mod.DEFAULT_POLL_INTERVAL_SECONDS
+    )
+    if not isinstance(poll_interval, int | float) or poll_interval <= 0:
+        poll_interval = config_mod.DEFAULT_POLL_INTERVAL_SECONDS
+    return min(
+        max(
+            poll_interval * _RELOAD_CONFIRM_TIMEOUT_MARGIN,
+            _RELOAD_CONFIRM_MIN_TIMEOUT_SECONDS,
+        ),
+        _RELOAD_CONFIRM_MAX_TIMEOUT_SECONDS,
+    )
+
+
+def _wait_for_config_pickup(
+    written_mtime: float, *, timeout: float
+) -> dict[str, Any] | None:
+    """Poll status.json (bounded) for a `config_reload` record covering `written_mtime`.
+
+    Returns the `config_reload` dict once its `config_mtime` is >=
+    `written_mtime` -- i.e. the running sidecar has processed a config.json
+    at least as new as the one just written -- or `None` if no such record
+    appears before `timeout` elapses (no sidecar running, a sidecar slower
+    than `timeout` to notice, or one that's wedged). Either way, callers
+    must not claim an effect they haven't actually observed.
+    """
+    from .statusfile import read_status
+
+    deadline = time.monotonic() + timeout
+    while True:
+        data = read_status()
+        if data is not None:
+            reload_info = data.get("config_reload")
+            if isinstance(reload_info, dict):
+                seen_mtime = reload_info.get("config_mtime")
+                if isinstance(seen_mtime, int | float) and seen_mtime >= written_mtime:
+                    return reload_info
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_RELOAD_CONFIRM_POLL_SECONDS)
+
+
+def _report_reload_effect(
+    config_path: str | None, raw_config_before_write: dict
+) -> None:
+    """Print one extra line after a `controls` write: did a running sidecar pick it up?
+
+    `raw_config_before_write` is the raw config the caller already loaded
+    (before patching) -- reused here only for its `poll_interval`, to size
+    the bounded wait; it is never re-read or re-validated.
+    """
+    from .statusfile import read_status
+
+    resolved = config_mod._resolve_config_path(config_path)
+    try:
+        written_mtime = resolved.stat().st_mtime
+    except OSError:
+        return  # can't stat what was just written -- nothing more to say
+
+    if read_status() is None:
+        print("  (no running sidecar detected -- this applies next time it starts)")
+        return
+
+    timeout = _reload_confirm_timeout(raw_config_before_write)
+    reload_info = _wait_for_config_pickup(written_mtime, timeout=timeout)
+    if reload_info is None:
+        print(
+            "  (a sidecar appears to be running but hasn't confirmed picking "
+            "this up yet -- check `muxplex-deck controls` or `muxplex-deck status`)"
+        )
+        return
+    error = reload_info.get("error")
+    if error:
+        print(f"  ! sidecar rejected the config: {error}", file=sys.stderr)
+        return
+    print("  + applied to the running sidecar")
 
 
 def check_controls(config_path: str | None = None) -> tuple[str, str]:

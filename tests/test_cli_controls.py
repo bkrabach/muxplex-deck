@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from muxplex_deck import cli
+from muxplex_deck import cli, statusfile
 from muxplex_deck.config import DEFAULT_CONFIG, load_raw_config, patch_raw_config
 
 
@@ -176,6 +176,175 @@ class TestControlsSetUnsetReset:
         cli.controls_reset(config_path)
         after_reset = load_raw_config(config_path)
         assert after_reset == before
+
+
+class TestControlsSetReloadReporting:
+    """`controls set`/`unset`/`reset` must say whether a running sidecar
+
+    picked the edit up -- "config written but not applied" is the exact
+    stale-state class this repo shipped five times in one day (see
+    AGENTS.md). No real sidecar process here -- `status.json` is written
+    directly, exactly as the real one would.
+    """
+
+    def test_no_running_sidecar_says_so_plainly(
+        self, config_path: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        """No status.json at all -- the honest "not running" case, not a hang."""
+        rc = cli.controls_set("key.0", "view_picker", config_path)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no running sidecar detected" in out
+
+    def test_confirmed_pickup_reports_applied(
+        self, config_path: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A status file already showing THIS write's mtime (or newer) is
+
+        reported as applied immediately -- no actual waiting needed for
+        the common case where the sidecar is faster than the CLI. Calls
+        `_report_reload_effect` directly (rather than through a second
+        `controls_set`) so the write whose mtime we seed the status with
+        is the same write being reported on -- a second real write would
+        advance the file's mtime again and invalidate the seeded value.
+        """
+        cli.controls_set("key.0", "view_picker", config_path)
+        capsys.readouterr()
+        written_mtime = Path(config_path).stat().st_mtime
+
+        statusfile.write_status(
+            statusfile.build_status(
+                pid=1234,
+                device_connected=True,
+                device_caps=None,
+                server_url="https://example.test:8088",
+                server_connected=True,
+                last_poll_at=None,
+                last_error=None,
+                active_session=None,
+                active_view=None,
+                page=None,
+                config_reload={
+                    "config_mtime": written_mtime,
+                    "checked_at": written_mtime,
+                    "applied": ["controls"],
+                    "restart_required": [],
+                    "error": None,
+                },
+            )
+        )
+
+        cli._report_reload_effect(config_path, {})
+        out = capsys.readouterr().out
+        assert "applied to the running sidecar" in out
+
+    def test_sidecar_rejection_is_surfaced_as_an_error(
+        self, config_path: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        """If the running sidecar's last reload attempt failed (e.g. some
+
+        OTHER concurrent hand-edit broke Gate 1), that error is surfaced
+        to the user instead of a false "applied".
+        """
+        cli.controls_set("key.0", "view_picker", config_path)
+        capsys.readouterr()
+        written_mtime = Path(config_path).stat().st_mtime
+
+        statusfile.write_status(
+            statusfile.build_status(
+                pid=1234,
+                device_connected=True,
+                device_caps=None,
+                server_url="https://example.test:8088",
+                server_connected=True,
+                last_poll_at=None,
+                last_error=None,
+                active_session=None,
+                active_view=None,
+                page=None,
+                config_reload={
+                    "config_mtime": written_mtime,
+                    "checked_at": written_mtime,
+                    "applied": [],
+                    "restart_required": [],
+                    "error": "Config field 'controls' has unknown action 'bogus'",
+                },
+            )
+        )
+
+        cli._report_reload_effect(config_path, {})
+        captured = capsys.readouterr()
+        assert "sidecar rejected the config" in captured.err
+
+    def test_stale_status_never_hangs_reports_unconfirmed(
+        self,
+        config_path: str,
+        capsys: pytest.CaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A status file exists (so a sidecar has run at some point) but its
+
+        `config_reload.config_mtime` never catches up with our write --
+        bounded wait, never an infinite hang, and never falsely claims
+        "applied".
+        """
+        statusfile.write_status(
+            statusfile.build_status(
+                pid=1234,
+                device_connected=True,
+                device_caps=None,
+                server_url="https://example.test:8088",
+                server_connected=True,
+                last_poll_at=None,
+                last_error=None,
+                active_session=None,
+                active_view=None,
+                page=None,
+                config_reload={
+                    "config_mtime": 1.0,  # far in the past, never advances
+                    "checked_at": 1.0,
+                    "applied": [],
+                    "restart_required": [],
+                    "error": None,
+                },
+            )
+        )
+        monkeypatch.setattr(cli, "_RELOAD_CONFIRM_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(cli, "_RELOAD_CONFIRM_MIN_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(cli, "_RELOAD_CONFIRM_MAX_TIMEOUT_SECONDS", 0.05)
+
+        rc = cli.controls_set("key.0", "view_picker", config_path)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "hasn't confirmed picking this up yet" in out
+
+    def test_unset_and_reset_also_report(
+        self, config_path: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        cli.controls_set("key.0", "view_picker", config_path)
+        capsys.readouterr()  # drain
+
+        cli.controls_unset("key.0", config_path)
+        assert "no running sidecar detected" in capsys.readouterr().out
+
+        cli.controls_set("key.0", "view_picker", config_path)
+        capsys.readouterr()
+        cli.controls_reset(config_path)
+        assert "no running sidecar detected" in capsys.readouterr().out
+
+
+class TestReloadConfirmTimeout:
+    def test_derives_from_poll_interval_bounded(self) -> None:
+        assert cli._reload_confirm_timeout({"poll_interval": 2.0}) == pytest.approx(3.0)
+        # A huge poll_interval is still capped.
+        assert (
+            cli._reload_confirm_timeout({"poll_interval": 100.0})
+            == cli._RELOAD_CONFIRM_MAX_TIMEOUT_SECONDS
+        )
+        # A missing/invalid poll_interval falls back to the config default.
+        assert cli._reload_confirm_timeout({}) == pytest.approx(3.0)
+        assert cli._reload_confirm_timeout({"poll_interval": -1}) == pytest.approx(3.0)
 
 
 class TestControlsActions:
