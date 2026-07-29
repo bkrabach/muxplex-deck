@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.11.0 (2026-07-28)
+
+### Features
+
+- **Changing a control binding now takes effect without restarting.** Editing a binding previously required stopping and starting the sidecar before the deck reflected it. The running sidecar now notices when its configuration file changes and re-applies it on its next cycle, within about two seconds. The change goes through exactly the same validation as a fresh start, so a hot change can never apply something a startup would have rejected.
+
+- **`controls set` now tells you whether it actually took effect.** It reports one of: applied to the running sidecar, no sidecar running so it will apply at next start, the sidecar rejected the configuration, or the confirmation timed out. It never claims success it hasn't observed.
+
+- **A bad hand-edit no longer disrupts a running deck.** At startup an invalid configuration is still refused outright. While running, an invalid edit leaves the last known-good settings in place and reports the problem, rather than crashing or blanking the deck. The next valid edit is picked up normally.
+
+- **Settings that cannot change while running now say so.** The server address, certificate authority file, and federation key are bound into a live connection, so a change to any of them is reported as requiring a restart instead of appearing to apply. Sort order, foreground-application matching, poll interval, and all control bindings apply live.
+
+### Design
+
+A design system for Stream Deck UI is documented in [docs/KEY_DESIGN_SYSTEM.md](docs/KEY_DESIGN_SYSTEM.md), capturing the fundamentals of the 72px medium (original/MK2/Mini/XL), component composition rules, typography constraints, label behavior across the key types (session, page, view, status), border and contrast strategy, and the test and iteration practices that keep all designs coherent. Session screens are the exemplar; this document establishes the vocabulary for bringing page, view, and control UI into the same family.
+
+### Verification
+
+- 858 tests passed via pytest (baseline 830 + 28 new across config hot-reload, sidecar signal verification, and applicability reporting).
+- All five CI jobs green on both pushes: Python 3.11/3.12/3.13, latest-deps, and ruff/pyright checks.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.10.1 (2026-07-28)
 
 ### Bug Fixes
