@@ -174,6 +174,24 @@ product. See `README.md` for setup, config, and verification checklists.
   muxplex's `on-failure`) plus a best-effort `loginctl enable-linger` on
   install -- this is a headless, always-on sidecar meant to survive logout,
   not a server a human restarts interactively.
+- **`KillMode=mixed` in `_SYSTEMD_UNIT_TEMPLATE` is safe here ONLY because the
+  sidecar owns no long-lived children -- that is a load-bearing invariant, not
+  an accident.** `mixed` SIGTERMs the main process and then **SIGKILLs every
+  other process in the service cgroup**. On the sibling repo that directive
+  destroyed 44 live tmux sessions in one `systemctl restart`, because muxplex
+  auto-spawns a tmux server that inherits its cgroup (see `muxplex/AGENTS.md`,
+  "Two ways to destroy every live tmux session on this host"). The sidecar has
+  no equivalent exposure today: everything concurrent is an in-process
+  `threading.Thread` (poll loop, optimistic connect, emulator HTTP server), and
+  every `subprocess.run` in `cli.py`/`service.py`/`wsl.py`/`focus.py` is a
+  short-lived, awaited command. `mixed` and `process` are therefore
+  behaviourally identical for this unit. **If the sidecar ever gains a
+  long-lived child -- a spawned helper, a detached usbip attach, a background
+  daemon -- `mixed` becomes a mass kill and the template must change with it.**
+  Do NOT copy muxplex's `KillMode=process` fix over pre-emptively: `mixed`'s
+  SIGKILL escalation is what the `service stop` deck-reset work below is
+  written against, and changing it would alter that path's assumptions for no
+  present benefit.
 - `doctor` additionally verifies `ca_file` is actually a CA (`openssl x509
   -noout -ext basicConstraints`, warns loudly on `CA:FALSE`) -- this is the
   exact real-world mistake (pointing `ca_file` at the server's *leaf* cert,
