@@ -352,12 +352,16 @@ option, not a session, until you pick one or back out.
 `"server"`):** in `"attention"` mode the view's sessions are reordered
 before paging so the most urgent land on page 1: sessions needing
 attention first (newest bell fire first), then the active session, then
-everything else by most-recent activity (`last_activity_at`, when the
-server exposes it -- older muxplex servers get a one-time INFO log and a
-graceful fallback to server order for that tier). `"server"` mode disables
-all of this and shows exactly what the PWA's own `sort_order` setting
-(`alphabetical` or manual/server order) produces -- the pre-existing
-behavior.
+everything else by most-recent bell fire (`bell.last_fired_at` descending;
+sessions that have never belled sort last, preserving incoming order among
+themselves). This tier deliberately does NOT use `last_activity_at` --
+that timestamp derives from tmux `#{window_activity}` and bumps on any pane
+output (spinners, redraws, status-line clocks), which reordered the grid on
+essentially every poll cycle with no real event behind it; a bell only
+fires on the actual agent-turn-completion signal, so ordering is stable
+between bells. `"server"` mode disables all of this and shows exactly what
+the PWA's own `sort_order` setting (`alphabetical` or manual/server order)
+produces -- the pre-existing behavior.
 
 **Key previews:** each occupied key renders a small monospace crop of the
 session's live pane (bottom-left corner, ANSI colors stripped in this first

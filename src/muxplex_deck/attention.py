@@ -5,9 +5,18 @@ session list into three stable tiers:
 
 1. Sessions needing attention (`Bell.needs_attention`), newest bell fire first.
 2. The active session, if it isn't already in tier 1.
-3. Everything else, by `last_activity_at` descending (most recently active
-   first, `None` last) when the server exposes that field -- otherwise the
-   incoming base order is preserved unchanged.
+3. Everything else, by `bell.last_fired_at` descending (sessions that have
+   never belled sort last, preserving incoming base order among themselves).
+
+Tier 3 deliberately keys off `bell.last_fired_at`, NOT `last_activity_at`:
+that timestamp derives from tmux `#{window_activity}` and bumps on ANY pane
+output (spinners, redraws, status-line clocks), so it reordered the grid on
+essentially every ~2s poll cycle even with no real event to justify it. A
+bell only fires on the actual agent-turn-completion signal, so keying tier 3
+off it mirrors tier 1 and keeps ordering stable between bells -- the whole
+point of an "attention" sort. See muxplex commit 3ed7490, which made the
+identical change server-side (`main.py`'s `_attention_order()`) and in the
+web client (`app.js`'s `sortByAttention()`) -- all three must move together.
 
 Applied to the view-resolved list *before* paging (`interaction.Pager`), so
 hot sessions land on the first page regardless of how many pages the view
@@ -24,22 +33,9 @@ from muxplex_client import Session
 NEG_INF = float("-inf")
 
 
-def activity_available(sessions: list[Session]) -> bool:
-    """True if at least one session in `sessions` carries a `last_activity_at`.
-
-    Servers predating the `feat/session-activity` branch never populate this
-    field (every session's value is `None`) -- callers use this to decide
-    whether to log the one-time "server doesn't expose this yet" notice and
-    to select the tier-3 fallback ordering.
-    """
-    return any(s.last_activity_at is not None for s in sessions)
-
-
 def apply_attention_sort(
     sessions: list[Session],
     active_session: str | None,
-    *,
-    activity_available: bool,
 ) -> list[Session]:
     """Reorder `sessions` (view-resolved, base-ordered) attention-first.
 
@@ -47,17 +43,13 @@ def apply_attention_sort(
         sessions: the view-resolved session list, in base order (whatever
             `views.resolve_view` produced -- alphabetical or server order).
         active_session: name of the currently active session, or None.
-        activity_available: whether this connection's server exposes
-            `last_activity_at` (see `activity_available()` above) -- pass
-            the result of checking the *full* unfiltered session list, not
-            just this view, since a view might legitimately contain zero
-            sessions with recorded activity even on a server that supports
-            the field.
 
     Returns:
         A new list in tier 1 -> tier 2 -> tier 3 order. Sessions not present
         in `sessions` (e.g. an active session outside this view) are not
-        added -- this function only reorders what's already there.
+        added -- this function only reorders what's already there. Tier 3 is
+        keyed off `bell.last_fired_at` descending (never-belled sessions
+        last, stable among ties) -- see the module docstring for why.
     """
     tier1 = [s for s in sessions if s.bell.needs_attention]
     tier1.sort(key=lambda s: s.bell.last_fired_at or NEG_INF, reverse=True)
@@ -70,12 +62,13 @@ def apply_attention_sort(
     remaining = [
         s for s in sessions if s.name not in tier1_names and s.name != active_session
     ]
-    if activity_available:
-        with_activity = [s for s in remaining if s.last_activity_at is not None]
-        without_activity = [s for s in remaining if s.last_activity_at is None]
-        with_activity.sort(key=lambda s: s.last_activity_at, reverse=True)  # type: ignore[arg-type,return-value]
-        tier3 = with_activity + without_activity
-    else:
-        tier3 = remaining
+    tier3 = sorted(
+        remaining,
+        key=lambda s: (
+            s.bell.last_fired_at is not None,
+            s.bell.last_fired_at or NEG_INF,
+        ),
+        reverse=True,
+    )
 
     return tier1 + tier2 + tier3

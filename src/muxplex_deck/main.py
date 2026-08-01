@@ -434,8 +434,7 @@ class _ActiveRuntime:
     view-cycle/paging state, per-key/strip change-detection caches, and the
     lock serializing every client HTTP call. Constructed fresh in
     `_run_active` for each connection, so a reconnect always starts from a
-    clean slate (fresh debounce state, fresh "have we logged the
-    no-last_activity_at notice yet" flag, etc.).
+    clean slate (fresh debounce state, etc.).
     """
 
     def __init__(
@@ -500,7 +499,6 @@ class _ActiveRuntime:
         self.last_key_state: list[object] = [None] * deck.key_count()
         self.last_strip: str | None = None
 
-        self.activity_logged = False
         self.last_seen_active_view: str | None = None
 
     def invalidate_paint_cache(self) -> None:
@@ -565,15 +563,8 @@ class _ActiveRuntime:
         filtered = views.resolve_view(sessions, settings, server_state.active_view)
 
         if self.sort_mode == "attention":
-            available = attention.activity_available(sessions)
-            if not available and not self.activity_logged:
-                logger.info(
-                    "server does not expose last_activity_at; attention sort "
-                    "using bell recency + base order"
-                )
-                self.activity_logged = True
             ordered = attention.apply_attention_sort(
-                filtered, server_state.active_session, activity_available=available
+                filtered, server_state.active_session
             )
         else:
             ordered = filtered
