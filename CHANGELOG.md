@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.1 (2026-08-04)
+
+### Bug Fixes
+
+- **The deck stopped reordering itself while you were reading it.** In attention sort, the sessions below the attention and active groups were ordered by most recent activity — a timestamp that comes from tmux and moves whenever anything at all draws on the screen: a spinner, a redraw, a clock ticking in a status line. Read fresh every two seconds, that reordered the key grid almost continuously with no event behind any of it, and a session could shift out from under a press. That group is now ordered by when a session last rang its bell, which is the same signal the attention group already used and the one that marks an agent's turn actually finishing. The order now holds still between bells, which is the entire point of sorting by attention. Sessions that have never rung keep the order they arrived in. The yellow attention band was always keyed off the bell; only the sort was not.
+
+- **The deck and the browser now agree on the order.** The same correction shipped server-side and in the web interface in muxplex v0.35.0. Until both sides moved, the same sessions could be listed in two different orders on two screens at the same time.
+
+### Internal
+
+- The check for whether a server publishes an activity timestamp is removed, along with the one-time log entry it fed. Both existed only to choose between two orderings for that group; with one ordering left there was nothing to choose, and leaving them in place would have meant keeping a fallback path that could no longer be reached. The timestamp itself is untouched.
+
+### Compatibility
+
+- **Unchanged against muxplex v0.35.0**, which replaced the single shared terminal server on a network port with one per session on a local socket. The deck was checked against that change rather than assumed safe: the only field it strictly requires from the affected exchange is the port number reported when connecting to a session, which v0.35.0 still sends deliberately for this reason, and which the deck never reads the value of. Everything else the deck reads tolerates a field being absent. The deck does not identify itself as a device to the server, so it continues to read the shared session state; a browser that has been deliberately moved into its own sync group will track a different active session, which is that feature working as designed rather than a mismatch.
+
+### Documentation
+
+- The systemd unit's `KillMode=mixed` setting is now documented as a safety invariant rather than an incidental choice. That setting kills every remaining process in the service's group after the main process stops. It is safe here only because the sidecar owns no long-lived child processes — everything it runs concurrently lives inside its own process, and every command it shells out to is short and awaited. In the sibling muxplex repository the same setting destroyed 44 live tmux sessions in a single restart, because that server spawns a tmux server which inherits its group. If the sidecar ever gains a long-lived child, that setting becomes a mass kill and has to change with it.
+
+- The soft-deck design document now records a keep-or-uninstall criterion for its first two weeks of use, names alt-tab as the baseline the deck has to beat, and gates the TLS/certificate migration behind that criterion — that migration being the one step that breaks both hardware sidecars and is not cheaply reversible.
+
+### Verification
+
+- 914 tests passed via pytest, run after the version bump (baseline 906 + 8 new covering attention-group ordering, a regression guard holding the two timestamps in opposition, never-rung sessions sorting last, and stable tie order).
+- ruff format, ruff check, and pyright all clean locally, matching what CI runs.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.12.0 (2026-07-29)
 
 ### Features
