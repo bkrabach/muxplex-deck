@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.13.0 (2026-08-04)
+
+### Bug Fixes
+
+- **A view that selects sessions by name pattern is no longer empty on the deck.** muxplex v0.36.0 introduced views that keep themselves up to date: as well as the sessions you pin into a view by hand, a view can carry one or more name patterns, and its contents become everything pinned together with everything matching. The deck knew nothing about any of that — it worked out a view's contents for itself, from the pinned list alone. A view defined only by a pattern therefore appeared completely empty on the hardware deck, while the same view listed its sessions correctly in the browser and on the soft deck. Sessions pinned into such a view did still show; only the pattern-matched ones were missing. The deck now reads the membership the server has already worked out and attaches to each session, so both kinds of view show the same contents on every screen.
+
+### Compatibility
+
+- **This release requires the muxplex client library 0.36.0 or newer, up from 0.19.0.** That is the first release carrying the per-session view membership this fix reads. The floor is a hard requirement rather than a preference: an older library's session object has no such field at all, so pairing this deck with one would fail on every polling cycle rather than quietly doing less. Anyone installing or upgrading gets the newer library automatically; anyone pinning the older one cannot install this release.
+
+- **Against a muxplex server older than v0.36.0, pin-based views continue to work exactly as before.** Such a server never sends view membership, and the deck falls back to its previous behaviour for any session it hears nothing about. A view defined purely by a pattern will show nothing on that server — which is also what that server's own browser interface shows, because it does not evaluate patterns either. That is an honest empty result rather than a silent malfunction.
+
+### Design
+
+- **The pattern matcher is deliberately not implemented here.** It exists in exactly one place, on the server, and this release does not port a copy of it into the deck. That single implementation is what stops the browser, the soft deck, and this sidecar from ever disagreeing about which sessions a pattern-based view contains — three independent copies of a matching rule would drift apart, which is a version of the very bug being fixed.
+
+- **Trust in the server's answer is per session, not blanket.** Where the server has stated which views a session belongs to, that answer is taken as final. Where it has said nothing, the previous pinned-list check still runs. The simpler alternative — always trusting the server and dropping the old check, as the browser interface does — was rejected: the browser is served by the very server it talks to, whereas this sidecar is versioned separately and has to keep working against older ones. Adopting blanket trust would have made *every* named view render empty against a pre-0.36.0 server, reproducing the exact fault being fixed here, only for pinned views instead.
+
+### Verification
+
+- 929 tests passed via pytest, run after the version bump (baseline 914 + 15 new covering server-resolved membership, the per-session fallback, and the pre-0.36.0-server case).
+- 929 tests also passed in a fresh dependency resolution ignoring the lock file, which is what a real install performs.
+- ruff format, ruff check, and pyright all clean locally, matching what CI runs.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.12.1 (2026-08-04)
 
 ### Bug Fixes
