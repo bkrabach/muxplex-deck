@@ -563,9 +563,7 @@ class _ActiveRuntime:
         filtered = views.resolve_view(sessions, settings, server_state.active_view)
 
         if self.sort_mode == "attention":
-            ordered = attention.apply_attention_sort(
-                filtered, server_state.active_session
-            )
+            ordered = attention.apply_attention_sort(filtered)
         else:
             ordered = filtered
 
