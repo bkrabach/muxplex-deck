@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.1 (2026-08-06)
+
+### Bug Fixes
+
+- **Selecting a session no longer moves it up the deck.** In attention sort, the session you had selected was lifted into a group of its own, just below the sessions ringing for attention — so the simple act of pressing a key changed where that key's session sat. That group is now gone. Ordering tracks when a session last rang its bell, which is the moment an agent's turn actually finishes, and nothing else moves it. Two groups remain: sessions needing attention, freshest bell first, then everything else by the same measure, with sessions that have never rung keeping the order they arrived in.
+
+- **This reverses a change made two days ago, on a diagnosis that turned out to be wrong.** The original complaint was real — the session being worked in sat at the bottom of the order — and the conclusion drawn was that the deck and the browser were missing a group the server had. They were not. The actual fault was on the muxplex server: the hook that records a bell was contacting itself over the wrong kind of connection, so an attached session's bells were never recorded at all and its last-rang time simply stopped moving. That hook was repaired in the same muxplex release. With bells recording properly again, a session being actively worked in rises to the top on its own — measured on the live host before this change, the session in question had rung 246 seconds earlier and stood fifth of fifty-seven by that measure alone. The group added to prop it up was fixing something that had already been fixed elsewhere.
+
+- **Removing it also restores an early warning.** A group that lifts the selected session to the top will keep lifting it whether bells are working or not. Had that group still been in place, a future repeat of the same hook failure would have been hidden behind it, with the deck looking correct while the signal underneath it was dead. Without it, the ordering tells the truth about bell state, and a failure shows up where it can be seen.
+
+### Design
+
+- **All three implementations of this ordering moved together, as muxplex's API notes require.** The rule lives in three places by necessity — the muxplex server, its browser interface, and this sidecar — and muxplex's own documentation states that a change to any one of them is a change to all three. The other two shipped in muxplex v0.40.0; this release is the third.
+
+- **Agreement between the three is now pinned by a shared set of test cases rather than by good intentions.** The same seven cases are stored in this repository and in muxplex's, byte for byte identical, and each of the three implementations has a test that runs them. Three of the seven exist specifically to hold the removed group down: that selecting a session must not change its position, that a selected session with the oldest bell still sorts last, and that a selected session which is also ringing appears once and is ranked by its bell. A future drift in any one of the three now fails a test instead of quietly disagreeing in production — which is how the wrong diagnosis reached a release in the first place. The duplication is deliberate: the two repositories release independently, so a single shared file is not available to them.
+
+- **Which session is selected is still tracked, and still used.** It drives the highlight painted on the deck's keys and the readout the CLI reports; only its influence on ordering is gone. `apply_attention_sort` no longer takes it as an argument at all, rather than accepting and ignoring it.
+
+### Verification
+
+- 929 tests passed via `uv run pytest -q`, run after the version bump.
+- The count in `AGENTS.md` said 240, a figure roughly 689 tests out of date; it now reads 929, matching what the suite actually reports.
+- The shared fixture in this repository and muxplex's were confirmed identical by checksum, not by inspection — both `a6a50d1b8632f6aa3c565eab87363022`.
+- The 246-second, fifth-of-fifty-seven measurement above is quoted from the muxplex fix that prompted this one. It was taken on the live host at that moment and is deliberately not re-measured here, since a fresh reading would describe a different moment and prove nothing about the state that justified the change.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.13.0 (2026-08-04)
 
 ### Bug Fixes
