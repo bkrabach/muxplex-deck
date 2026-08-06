@@ -72,7 +72,7 @@ product. See `README.md` for setup, config, and verification checklists.
 
 ## Testing
 
-- `uv run pytest` runs the whole suite (`tests/`) -- 240 tests, no
+- `uv run pytest` runs the whole suite (`tests/`) -- 929 tests, no
   hardware, no network, no real service, all in well under a second.
 - `tests/conftest.py` carries safety rails that make it structurally hard
   for a careless test to touch anything real, applied PREVENTIVELY: this
