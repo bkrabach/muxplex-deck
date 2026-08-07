@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.14.0 (2026-08-07)
+
+### Changes
+
+- **Bringing the muxplex window to the foreground is now done by the server, not by this sidecar.** Pressing a key that switches sessions can also raise the muxplex web app on screen, so you see the terminal you just switched to. Until now that was performed locally, by the machine the Stream Deck is plugged into — which meant it only ever worked if that same machine was also the one showing the window. Reaching for the deck from a phone, or from any machine that was not the one with the display, did nothing at all. The request now goes to the muxplex server, which raises the window on its own host. The practical gain is that the device you press no longer has to be the device you are looking at: a phone, a second laptop, or the hardware deck all produce the same result.
+
+- **The setting moved with it, and this sidecar no longer has one.** `focus_app` is gone from this program's `config.json` entirely — it is not a setting here any more, in any form. The equivalent setting now lives in the **server's** own `~/.config/muxplex/settings.json`, naming the application that server should raise on its own machine. Anyone who already had `focus_app` set here needs to move that value to the server to keep the behaviour.
+
+- **A value left behind in the old location is reported, not ignored.** Because the key is no longer part of this program's settings, a `focus_app` still sitting in an existing `config.json` would otherwise be read by nothing and silently do nothing — a setting that appears to be configured while having no effect. Both `muxplex-deck doctor` and the sidecar's own startup log now say so explicitly, naming the file, quoting the value found, and stating where to put it instead. Installations that never set it, or that have already migrated, see no additional output.
+
+### Compatibility
+
+- **This removes foreground focus on Windows, with no replacement, and that is a real loss.** The sidecar carried its own Windows implementation — it located the browser window by title and used a documented sequence of Win32 calls to pull it to the front. That code is deleted in this release. Focus is now the server's job, and muxplex has no Windows version at all, so there is nothing on the other side to take it over. If your muxplex window lives on a Windows machine, a key bound to `focus_app` will no longer raise it. Nothing else about that key changes — the session switch it performs still works exactly as before; only the window-raising is gone. This is stated plainly rather than buried because there is no workaround to offer: the fix that would restore it is known and described in the project's notes, but it is not built, and this release does not contain it.
+
+- **macOS is now the only platform where focus works at all, and the server is the one doing it.** The server raises its own host's window; that implementation exists only for macOS. A request made against any other kind of host — Linux, a Wayland desktop, or a server running under WSL — is refused outright and told why, in terms specific to that platform, rather than appearing to succeed and quietly doing nothing. Each refusal carries its own written explanation: under WSL, for instance, that the window in question is a Windows one and there is nothing on the Linux side of the boundary to raise. An honest, explicit refusal is the deliberate choice here over a silent no-op, which is the failure this project's own settings have historically tried hardest to avoid.
+
+- **This release requires the muxplex client library 0.42.0 or newer, up from 0.36.0.** That is the first release containing the call this feature depends on. The requirement is hard rather than advisory: an older library has no such call at all, and pairing one with this release does not degrade gracefully. It fails in a way worth spelling out, because the damage extends past the focus feature — the failure occurs *before* the session switch is sent, so with a too-old library **every key press that switches sessions stops working**, whether or not you use focus at all. The key would light up as though it had worked, the switch would never be sent, and the next refresh would quietly undo the highlight. Declaring the requirement correctly is what prevents that combination from ever being installed. Anyone installing or upgrading normally gets a suitable library automatically.
+
+### Design
+
+- **The Windows code was deleted rather than kept alongside the new path, and the reasoning is recorded rather than assumed obvious.** Keeping it would have meant maintaining two entirely separate focus mechanisms — one local and one remote — indefinitely, on the strength of an implementation that had never actually been confirmed to work. It was written against Microsoft's own documentation and reasoned through carefully, but the one report from real Windows hardware showed it flashing the taskbar icon rather than raising the window, and the follow-up fix for that was never verified either. Deleting an unproven mechanism to collapse a duplicated path was judged the better trade. The research behind it — which is genuinely hard-won — was deliberately not thrown away: it remains in full in the project's history and in the deleted file's own documentation, so a future Windows effort starts from it rather than rediscovering it.
+
+- **A test double that was more permissive than the real thing hid a broken call, and only the type checker caught it.** The change that introduced the new server call was committed while the locked library version still predated it — the call did not exist in the version installed. The entire test suite passed anyway, because every test that touches focus substitutes a stand-in object that simply defines whatever is asked of it and never consults the real library. The type checker was the only thing that noticed, and the only thing standing between that and an installed program failing on a key press. Recorded because the general shape recurs: a stand-in that accepts more than the real thing does will confirm whatever the code believes about it, which is precisely the class of error a type checker exists to catch and a test suite structurally cannot.
+
+- **The same gap left the stated requirement wrong for a further two commits, and that has now been written down as a known blind spot.** Correcting the locked version fixed the immediate failure but left the *declared minimum* untouched, so the project continued to claim compatibility with four library releases that cannot run it. Nothing in the automated checks was capable of noticing: one job tests the exact locked versions, another tests the newest available, and neither has ever tested the oldest version the project says it permits. This is the second time a mismatch of this kind has shipped. Both the gap and two candidate remedies are now recorded in the project's own notes rather than left to be rediscovered a third time.
+
+### Verification
+
+- 912 tests passed via `uv run pytest -q`, run after the version bump.
+- `ruff format --check`, `ruff check`, and `pyright` were all run explicitly and are clean — the same three checks the project's automated lint stage performs. `pyright` in particular was run deliberately rather than assumed, since it is the check that caught the broken call described above, and a release that skipped it would be repeating the mistake it exists to prevent.
+- The library requirement was checked against the dependency's own published history rather than inferred: the call this release needs is defined zero times in versions 0.36.0, 0.38.0, 0.40.0, and 0.41.0, and once in 0.42.0.
+- The test count recorded in `AGENTS.md` said 929, which stopped being true when this release's changes removed one test file and added coverage elsewhere; it now reads 912, matching what the suite actually reports.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.13.1 (2026-08-06)
 
 ### Bug Fixes
