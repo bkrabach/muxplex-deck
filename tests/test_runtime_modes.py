@@ -156,6 +156,14 @@ class FakeClient:
         self.view_patches: list[str] = []
         self.connect_event = threading.Event()
         self.view_patch_event = threading.Event()
+        # Backlog item 3: focus-grabbing moved server-side (POST
+        # /api/focus). Default no-op so every existing test that doesn't
+        # care about focus keeps working unchanged; tests that do care
+        # override `.raise_focus` directly (see test_new_actions.py).
+        self.raise_focus_calls = 0
+
+    def raise_focus(self) -> None:
+        self.raise_focus_calls += 1
 
     def sessions(self) -> list[Session]:
         return list(self._sessions)
@@ -284,22 +292,23 @@ class TestReducedRuntime:
         assert client.connected_names == ["session-00"]
         assert ctx.active_session == "session-00"  # optimistic highlight
 
-    def test_key_press_focuses_pwa_even_when_session_unchanged(
-        self, reduced, monkeypatch
-    ) -> None:
+    def test_key_press_focuses_pwa_even_when_session_unchanged(self, reduced) -> None:
         """Regression: re-pressing the already-active session's key must still
-        focus the PWA. `_do_connect` used to gate `focus.focus_app` on whether
+
+        focus the PWA. `_do_connect` used to gate the focus call on whether
         the press actually changed the active session, so pressing the SAME
         key twice only focused on the first press -- silently dropping the
         deck's "bring the window back" use case (e.g. after alt-tabbing away).
+        Focus-grabbing moved server-side (backlog item 3): the call under
+        test is now `client.raise_focus()`, via `_raise_focus_best_effort`.
         """
         _deck, client, ctx = reduced
-        focus_calls: list[str] = []
-        monkeypatch.setattr(
-            "muxplex_deck.main.focus.focus_app",
-            lambda name: focus_calls.append(name),
-        )
-        ctx.focus_app_name = "Muxplex"
+        focus_calls: list[None] = []
+
+        def recording_raise_focus() -> None:
+            focus_calls.append(None)
+
+        client.raise_focus = recording_raise_focus  # type: ignore[method-assign]
 
         ctx.handle_key(1)  # first press -> connects session-00 (changed)
         assert client.connect_event.wait(_WAIT_SECONDS)
@@ -308,7 +317,7 @@ class TestReducedRuntime:
         ctx.handle_key(1)  # second press, SAME slot/session -> must still focus
         assert client.connect_event.wait(_WAIT_SECONDS)
 
-        assert focus_calls == ["Muxplex", "Muxplex"], (
+        assert focus_calls == [None, None], (
             "every explicit key press must focus the PWA, whether or not the "
             f"active session actually changed; got {focus_calls!r}"
         )

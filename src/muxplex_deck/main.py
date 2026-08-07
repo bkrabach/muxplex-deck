@@ -68,7 +68,7 @@ from muxplex_client import (
     UnreachableError,
 )
 
-from . import attention, focus, interaction, layout, rendering, views
+from . import attention, interaction, layout, rendering, views
 from . import config as config_mod
 from . import controls as controls_mod
 from .config import Config
@@ -427,6 +427,27 @@ def _paint_status_only(deck: DeckDevice, message: str, plan: layout.LayoutPlan) 
             deck.set_key_image(status_key, rendering.render_status_key(deck, message))
 
 
+def _raise_focus_best_effort(client: MuxplexClient) -> None:
+    """Best-effort ``POST /api/focus`` against *client*'s server.
+
+    Focus-grabbing moved server-side (backlog item 3 /
+    docs/plans/2026-08-05-focus-grab-plan.md) -- this replaces the deleted
+    local ``focus.focus_app()``, and mirrors its never-raise contract
+    exactly: any failure (unsupported platform, unconfigured
+    ``focus_app``, mechanism failure, or an unreachable server) is logged
+    and swallowed, never raised. A foreground-focus request must never
+    disturb the session switch it rides alongside (see ``_do_connect``'s
+    docstring). The server-side endpoint takes no target of any kind --
+    this call carries no app name, no session name, nothing; the app that
+    gets raised is whatever THAT server's own operator configured in its
+    ``settings.json``.
+    """
+    try:
+        client.raise_focus()
+    except MuxplexError as exc:
+        logger.info("focus: server did not raise (%s)", exc)
+
+
 class _ActiveRuntime:
     """All per-connection mutable state for one active (device+server) session.
 
@@ -443,7 +464,6 @@ class _ActiveRuntime:
         client: MuxplexClient,
         hostname: str,
         sort_mode: str,
-        focus_app_name: str = "",
         controls: Mapping[str, str] | None = None,
         poll_interval: float = 2.0,
     ) -> None:
@@ -451,9 +471,6 @@ class _ActiveRuntime:
         self.client = client
         self.hostname = hostname
         self.sort_mode = sort_mode
-        # macOS app name of the local muxplex PWA to bring forward on a
-        # key-press session switch; "" disables (see `.focus`).
-        self.focus_app_name = focus_app_name
         # Read fresh on every wait in `_run_active`'s loop -- a plain
         # attribute (not captured into a closure), so `apply_reload` can
         # change it and the very next wait honors the new value.
@@ -535,7 +552,6 @@ class _ActiveRuntime:
                 layout.read_capabilities(self.deck), config.controls
             )
             self.sort_mode = config.sort
-            self.focus_app_name = config.focus_app
             self.poll_interval = config.poll_interval
             self.pager.page_size = max(1, self.plan.sessions_per_page)
             self.pager.set_item_count(len(self.ordered))
@@ -1024,7 +1040,7 @@ class _ActiveRuntime:
         elif action == "focus_app":
             logger.info("%s -> focus", label)
             threading.Thread(
-                target=focus.focus_app, args=(self.focus_app_name,), daemon=True
+                target=_raise_focus_best_effort, args=(self.client,), daemon=True
             ).start()
         elif action == "refresh_now":
             logger.info("%s -> refresh now", label)
@@ -1160,15 +1176,16 @@ class _ActiveRuntime:
         away on the Mac) -- gating focus on a session CHANGE silently
         dropped that use. Poll-driven repaints / dial actions never reach
         this method at all, so focus still never fires on anything but an
-        explicit key press. Focus runs before the connect POST (it's ~100ms
-        vs the server's multi-second ttyd respawn, so the window is
-        foreground by the time the switch lands) and is best-effort:
-        `focus_app` swallows every failure. The connect POST itself is
-        unconditional too -- harmless when unchanged: the server already
-        short-circuits a same-session connect (no ttyd kill/respawn, ~2ms)
-        rather than this method needing to skip it.
+        explicit key press. Focus runs before the connect POST (it's a
+        single HTTP round trip to the server's own `POST /api/focus`, well
+        ahead of the server's multi-second ttyd respawn) and is
+        best-effort: `_raise_focus_best_effort` swallows every failure. The
+        connect POST itself is unconditional too -- harmless when
+        unchanged: the server already short-circuits a same-session
+        connect (no ttyd kill/respawn, ~2ms) rather than this method
+        needing to skip it.
         """
-        focus.focus_app(self.focus_app_name)
+        _raise_focus_best_effort(self.client)
         try:
             with self.client_lock:
                 self.client.connect(name)
@@ -1393,7 +1410,6 @@ def _run_active(
         client,
         hostname,
         config.sort,
-        config.focus_app,
         config.controls,
         config.poll_interval,
     )
@@ -1634,6 +1650,17 @@ def run(
 
 def _run(config: Config, manager: DeviceManager, config_path: str | None = None) -> int:
     """The hotplug + server-connectivity loop, guarded by `run()`'s lock."""
+    # Backlog item 3 migration: focus-grabbing moved server-side. A legacy
+    # `focus_app` left in config.json is no longer merged by
+    # `load_config`/`load_raw_config` at all (it's not in `DEFAULT_CONFIG`
+    # any more), so without this it would silently stop doing anything --
+    # exactly the failure mode `legacy_focus_app_warning` exists to make
+    # loud instead. Checked once at startup, not per-tick: this is a
+    # one-time migration nudge, not a live-reload concern.
+    legacy_focus_warning = config_mod.legacy_focus_app_warning(config_path)
+    if legacy_focus_warning is not None:
+        logger.warning("%s", legacy_focus_warning)
+
     shutting_down = _install_signal_handler()
     hostname = urlparse(config.server_url).hostname or config.server_url
     logged_waiting = False

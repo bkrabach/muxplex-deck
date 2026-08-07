@@ -78,8 +78,8 @@ Linux, launchd on macOS), `doctor`, `update`, and `version`. Bare
 | `muxplex-deck version` / `--version` | Show the installed version |
 
 Every `config` key maps 1:1 to a `config.json` field: `server_url`,
-`key_file`, `ca_file`, `poll_interval`, `sort`, `focus_app`. See "Config"
-under "muxplex sidecar" below for what each one means.
+`key_file`, `ca_file`, `poll_interval`, `sort`. See "Config" under "muxplex
+sidecar" below for what each one means.
 
 ### The HID-permission caveat (why `service install` prints a udev block)
 
@@ -385,8 +385,7 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   "server_url": "https://<your-server>:8088",
   "key_file": "~/.config/muxplex-deck/federation_key",
   "poll_interval": 2.0,
-  "sort": "attention",
-  "focus_app": "muxplex"
+  "sort": "attention"
 }
 ```
 
@@ -407,8 +406,6 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   recently active); `"server"` disables that reordering and shows exactly
   what the PWA's own `sort_order` setting produces. See "Dial 0 / Dial 1 /
   Sort order" above for the full behavior.
-- `focus_app` (optional, default off) -- macOS app name of the locally
-  installed muxplex PWA; see "Bringing the PWA to the foreground" below.
 - `controls` (optional, default `{}`) -- per-control action overrides; see
   "Control mappings" below. Not settable via `config set` -- use
   `muxplex-deck controls set` instead.
@@ -476,37 +473,33 @@ Brightness set via `brightness_up`/`brightness_down`/`brightness_cycle` is
 brightness on every bring-up (real hardware powers on dim), so a dimmed
 value is never written to `config.json`.
 
-### Bringing the PWA to the foreground (macOS)
+### Bringing the PWA to the foreground (macOS, server-side)
 
-If the muxplex PWA is installed as a standalone app on the same Mac the
-sidecar runs on, set `focus_app` to its application name and every
-key-press session switch will also bring that window to the foreground --
-press a key, see the terminal you just switched to. It runs `open -a
-"<focus_app>"` on a background thread: it never delays the switch itself,
-and a focus failure (wrong name, app not installed) is logged as a warning
-and otherwise ignored.
+**This moved server-side (2026-08).** A key bound to `focus_app` now calls
+the muxplex *server*'s `POST /api/focus` -- there is nothing to configure
+in this sidecar's own `config.json` any more. Set `focus_app` in the
+**server's** `~/.config/muxplex/settings.json` instead (the `.app` bundle
+name macOS shows for the installed PWA -- see muxplex's own README for
+"Finding the app name"). If your `config.json` still has a `focus_app`
+value from before this change, `muxplex-deck doctor` and the sidecar's
+startup log will tell you loudly -- it no longer does anything from here.
 
-```json
-{
-  "server_url": "https://<your-server>:8088",
-  "focus_app": "muxplex"
-}
-```
+Scope, deliberately narrow, unchanged from before the move: focus fires
+**only** on an explicit key-press that changes (or re-selects) the active
+session -- never on dial turns, view/page changes, or poll-driven repaints
+-- so the window is never yanked forward while you're just browsing the
+deck. A focus failure (unsupported platform, unconfigured `focus_app` on
+the server, or the mechanism itself failing) is logged and otherwise
+ignored -- it never delays or blocks the session switch.
 
-**Finding the app name:** it's the name macOS shows for the installed PWA
--- in the menu bar next to the Apple logo while it's frontmost, or under
-its Dock icon. For a PWA installed via Chrome's "Install app" this is the
-PWA's own title (Chrome puts the `.app` bundle under `~/Applications/Chrome
-Apps.localized/`); for Safari's "Add to Dock" it's the name you gave it.
-If the sidecar logs `focus: ... failed`, the name doesn't match -- check
-what `open -a "<name>"` does in a terminal.
-
-Scope, deliberately narrow: focus fires **only** on an explicit key-press
-that changes the active session -- never on dial turns, view/page changes,
-poll-driven repaints, or pressing the already-active session's key -- so
-the window is never yanked forward while you're just browsing the deck.
-macOS-only today (on other platforms a configured `focus_app` logs one
-INFO notice and is ignored); a Windows implementation is planned.
+**Windows regression, stated plainly:** this sidecar's Windows-specific
+implementation (`AttachThreadInput` + a `SendInput` ALT-tap workaround) was
+**deleted, not moved** -- muxplex has no Windows port for it to move TO.
+Pressing a `focus_app`-bound key on a Windows-hosted PWA now gets a `501`
+from the server and the window does not raise. See `AGENTS.md`'s Windows
+foreground-focus section for the full history (preserved there and in git
+history, not carried forward) and the named-but-not-built future fix (a
+WSL-to-Windows interop path inside muxplex itself).
 
 Any missing/invalid config or unreadable key file produces a clear,
 actionable message on stderr and a non-zero exit -- there is no default

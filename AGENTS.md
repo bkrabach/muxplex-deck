@@ -382,6 +382,41 @@ product. See `README.md` for setup, config, and verification checklists.
   is Microsoft-doc-grounded, not yet hardware-confirmed) -- next real-deck
   session should confirm `focus_app` now raises the PWA window instead of
   only flashing its taskbar icon.
+
+  **Superseded (backlog item 3, 2026-08-05): `focus.py` was DELETED IN
+  FULL, including the Windows implementation documented above.**
+  Foreground-focus moved server-side into muxplex itself
+  (`POST /api/focus`, macOS only -- see muxplex's
+  `docs/plans/2026-08-05-focus-grab-plan.md` and `docs/API_SEMANTICS.md`).
+  A key bound to `focus_app` now calls `client.raise_focus()`
+  (`main._raise_focus_best_effort`) instead of a local subprocess/ctypes
+  call. **This is a real, deliberate regression on Windows**: muxplex has
+  no Windows port, so there is nothing server-side to move this
+  Windows-specific implementation TO, and it is UNVERIFIED besides (see
+  above) -- deleting an unproven implementation to collapse a duplicated
+  code path was judged the better trade than keeping a second,
+  never-confirmed-working focus mechanism alive indefinitely. **If you are
+  looking for the hard-won Windows research** (the `AttachThreadInput` +
+  `SendInput` ALT-tap technique, the `LockSetForegroundWindow` citation,
+  the rejected `SPI_SETFOREGROUNDLOCKTIMEOUT` alternative) it is preserved
+  in this file's git history and in the deleted `focus.py`'s own module
+  docstring -- `git log --all --oneline -- src/muxplex_deck/focus.py` or
+  `git show <pre-deletion-commit>:src/muxplex_deck/focus.py`. The correct
+  future fix, named but not built: a WSL->Windows interop mechanism INSIDE
+  muxplex (`powershell.exe` from the WSL server, driving the same Win32
+  sequence), which would restore the capability for every client at once
+  rather than for this sidecar alone.
+
+  **Config migration**: `config.json`'s `focus_app` field is REMOVED (no
+  longer in `DEFAULT_CONFIG`). `config_mod.legacy_focus_app_warning()` is
+  the loud-migration mechanism -- surfaced both by `muxplex-deck doctor`
+  (a `focus_app` line in the `config` group) and at sidecar startup (a
+  `logger.warning`) whenever an existing config.json still has a non-empty
+  `focus_app` value, so the key does not silently stop doing anything (the
+  exact failure mode this project's own `focus_app` no-op branch used to
+  guard against). Set `focus_app` in the SERVER's own
+  `~/.config/muxplex/settings.json` instead (that key is `LOCAL_ONLY_KEYS`
+  there, same fence shape, different host).
 - **`service stop` left the deck showing its last-painted frame forever --
   VERIFIED on real Windows hardware (2026-07-28); fix implemented,
   screen-clear NOT yet hardware-confirmed (needs a real deck + a hard-killed

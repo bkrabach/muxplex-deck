@@ -40,7 +40,6 @@ BASE_CONFIG: dict = {
     "ca_file": "",
     "poll_interval": 2.0,
     "sort": "attention",
-    "focus_app": "",
     "controls": {},
 }
 
@@ -95,21 +94,19 @@ class TestReloadApplied:
         assert outcome.restart_required == ()
         assert watcher.current.controls == {"key.0": "view_picker"}
 
-    def test_sort_and_focus_app_are_reloadable(self, config_path: Path) -> None:
+    def test_sort_is_reloadable(self, config_path: Path) -> None:
         initial = load_config(str(config_path))
         watcher = ConfigWatcher(str(config_path), initial)
 
         data = json.loads(config_path.read_text(encoding="utf-8"))
         data["sort"] = "server"
-        data["focus_app"] = "muxplex"
         _write_config(config_path, data)
         _bump_mtime(config_path)
 
         outcome = watcher.poll()
 
-        assert set(outcome.applied) == {"sort", "focus_app"}
+        assert set(outcome.applied) == {"sort"}
         assert watcher.current.sort == "server"
-        assert watcher.current.focus_app == "muxplex"
 
     def test_poll_interval_is_reloadable(self, config_path: Path) -> None:
         """Verified, not assumed: `poll_interval` is a local variable in

@@ -43,7 +43,6 @@ DEFAULT_CONFIG: dict = {
     "ca_file": "",
     "poll_interval": DEFAULT_POLL_INTERVAL_SECONDS,
     "sort": DEFAULT_SORT_MODE,
-    "focus_app": "",
     # address -> action; empty means "all capability-derived defaults" (see
     # `layout.default_bindings`). Defaults are computed, never stored here --
     # a fresh install has no "controls" key at all and sees zero behavior
@@ -111,30 +110,45 @@ class Config:
     means "use the capability-derived defaults for whatever deck connects".
     See docs/CONTROL_MAPPING_DESIGN.md.
     """
-    focus_app: str
-    """Identifier for the locally installed muxplex PWA, used to bring it to
-    the foreground when a key press switches the active session (see
-    `.focus`). Empty (the default) disables the feature entirely -- no
-    subprocess/API calls, no log noise.
 
-    Meaning is platform-specific -- one field, two interpretations, not a
-    second config key, because each platform has exactly one natural way
-    to address "the PWA" and they're different shapes: macOS's PWA is a
-    real, individually-launchable `.app` bundle (addressed by name, via
-    `open -a`); Windows' runs inside a generic browser process with no
-    per-app identity of its own, so the only thing that reliably names it
-    is its window TITLE (addressed by substring match). Concretely:
 
-    - macOS: the `.app` bundle name (as `open -a <name>` expects).
-    - Windows: a substring to match against a top-level window's title
-      (see `focus._focus_windows` for the matching + foreground-steal
-      mechanics, and its real, documented limits).
-    - Linux/WSL: no implementation exists yet; a configured value logs one
-      INFO notice per process and is otherwise ignored.
+def legacy_focus_app_warning(config_path: str | None = None) -> str | None:
+    """Warn loudly if the on-disk config still has a non-empty `focus_app`.
 
-    Existing macOS configs are unaffected -- this only changes what the
-    same field means when read on Windows.
+    `focus_app` was REMOVED from `DEFAULT_CONFIG` (see muxplex's
+    ``docs/plans/2026-08-05-focus-grab-plan.md`` §4/§7): focus-grabbing now
+    lives server-side, behind muxplex's own ``POST /api/focus``, configured
+    via that server's ``~/.config/muxplex/settings.json`` (``focus_app``,
+    ``LOCAL_ONLY_KEYS``) -- never here. Because `load_raw_config()` only
+    merges keys present in `DEFAULT_CONFIG`, a legacy `focus_app` value left
+    behind in an EXISTING config.json is now silently ignored by that
+    path -- exactly the "a key that silently stops doing anything" failure
+    this function exists to prevent (see this project's own `focus.py`
+    module docstring, which used to describe the deleted local
+    implementation). Reads the raw JSON directly, bypassing the
+    DEFAULT_CONFIG merge, so it can see a key that is no longer in the
+    merge table at all.
+
+    Returns None when there is nothing to warn about (no config file, no
+    `focus_app` key, or an empty one).
     """
+    path = _resolve_config_path(config_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("focus_app")
+    if not isinstance(value, str) or not value:
+        return None
+    return (
+        f"{path} still has focus_app={value!r}, which no longer does "
+        "anything here -- foreground-focus moved to the muxplex SERVER "
+        "(POST /api/focus). Set focus_app in that server's own "
+        "~/.config/muxplex/settings.json instead, then remove this key "
+        f"from {path}."
+    )
 
 
 def _resolve_config_path(explicit: str | None) -> Path:
@@ -268,14 +282,6 @@ def load_config(config_path: str | None = None) -> Config:
             f"Config field 'sort' must be one of {VALID_SORT_MODES}, got {sort!r}"
         )
 
-    focus_app = raw.get("focus_app", "")
-    if not isinstance(focus_app, str):
-        raise ConfigError(
-            "Config field 'focus_app' must be a string (macOS: .app bundle "
-            "name; Windows: browser window title substring), "
-            f"got {focus_app!r}"
-        )
-
     controls_value = _validate_controls(raw.get("controls", {}))
 
     return Config(
@@ -285,7 +291,6 @@ def load_config(config_path: str | None = None) -> Config:
         poll_interval=float(poll_interval),
         sort=sort,
         controls=controls_value,
-        focus_app=focus_app.strip(),
     )
 
 
@@ -369,12 +374,12 @@ def patch_raw_config(patch: dict, config_path: str | None = None) -> dict:
 # them out from under a live `httpx.Client`/TLS context is not attempted --
 # changing any of them is reported (`ReloadOutcome.restart_required`) but
 # never applied, and a sidecar restart is still required. Everything else in
-# `DEFAULT_CONFIG` is read fresh on every tick already (`controls`/`sort`/
-# `focus_app` are plain values threaded through `_ActiveRuntime`;
-# `poll_interval` is a local variable in `_run_active`'s wait call) --
-# verified by inspection, not assumed: none of them are captured into a
-# closure, a constructed client, or any other object that would go stale.
-RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "focus_app", "poll_interval")
+# `DEFAULT_CONFIG` is read fresh on every tick already (`controls`/`sort`
+# are plain values threaded through `_ActiveRuntime`; `poll_interval` is a
+# local variable in `_run_active`'s wait call) -- verified by inspection,
+# not assumed: none of them are captured into a closure, a constructed
+# client, or any other object that would go stale.
+RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "poll_interval")
 
 # (report name as it appears in config.json / `config list`, Config attribute
 # to compare) -- reported when different, but NEVER applied to the running

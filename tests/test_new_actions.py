@@ -159,30 +159,65 @@ class TestRefreshNow:
 
 
 class TestFocusAppAction:
-    def test_focus_app_bound_key_triggers_focus_in_background(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        calls: list[str] = []
-        done = threading.Event()
+    """Backlog item 3: focus-grabbing moved server-side -- a key bound to
 
-        def fake_focus(name: str) -> None:
-            calls.append(name)
+    `focus_app` now fires `client.raise_focus()` (POST /api/focus on the
+    configured server) in a background thread, via
+    `main._raise_focus_best_effort`, instead of the deleted local
+    `focus.focus_app()`.
+    """
+
+    def test_focus_app_bound_key_triggers_client_raise_focus_in_background(
+        self,
+    ) -> None:
+        done = threading.Event()
+        _deck, client, ctx = _reduced_with({"key.11": "focus_app"})
+
+        def recording_raise_focus() -> None:
+            client.raise_focus_calls += 1
             done.set()
 
-        monkeypatch.setattr("muxplex_deck.main.focus.focus_app", fake_focus)
-        _deck, _client, ctx = _reduced_with({"key.11": "focus_app"})
-        ctx.focus_app_name = "Muxplex"
+        client.raise_focus = recording_raise_focus  # type: ignore[method-assign]
         ctx.handle_key(11)
         assert done.wait(_WAIT_SECONDS)
-        assert calls == ["Muxplex"]
+        assert client.raise_focus_calls == 1
 
-    def test_focus_app_never_connects_a_session(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr("muxplex_deck.main.focus.focus_app", lambda name: None)
+    def test_focus_app_swallows_a_raise_focus_failure(self) -> None:
+        """`_raise_focus_best_effort` must never propagate a MuxplexError --
+
+        same never-raise contract the deleted local `focus.focus_app` had.
+        """
+        from muxplex_client import ApiError
+
+        done = threading.Event()
         _deck, client, ctx = _reduced_with({"key.11": "focus_app"})
+
+        def failing_raise_focus() -> None:
+            done.set()
+            raise ApiError(409, "focus_app is not set")
+
+        client.raise_focus = failing_raise_focus  # type: ignore[method-assign]
+        ctx.handle_key(11)  # must not raise out of the HID callback thread
+        assert done.wait(_WAIT_SECONDS)
+
+    def test_focus_app_never_connects_a_session(self) -> None:
+        _deck, client, ctx = _reduced_with({"key.11": "focus_app"})
+        client.raise_focus = lambda: None  # type: ignore[method-assign]
         ctx.handle_key(11)
         assert client.connected_names == []
+
+    def test_focus_module_is_gone(self) -> None:
+        """Import guard: `muxplex_deck.focus` was deleted in full (backlog
+
+        item 3 -- focus-grabbing moved server-side). If a future change
+        ever re-adds it, this failing test makes the revival visible in
+        review rather than silently reintroducing the duplicated,
+        Windows-specific implementation this item removed.
+        """
+        import importlib
+
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("muxplex_deck.focus")
 
 
 class TestToggleLast:

@@ -759,6 +759,19 @@ def check_config_file(config_path: str | None = None) -> tuple[str, str]:
     return "warn", f"Config: {resolved} (not yet created -- run: muxplex-deck init)"
 
 
+def check_legacy_focus_app(config_path: str | None = None) -> tuple[str, str] | None:
+    """Warn if config.json still has a non-empty `focus_app` (backlog item 3).
+
+    Returns None (no check line at all) when there's nothing to warn
+    about, so a migrated/fresh install adds no doctor output -- same shape
+    as `check_hidapi_dll`'s "only relevant on some configs" convention.
+    """
+    warning = config_mod.legacy_focus_app_warning(config_path)
+    if warning is None:
+        return None
+    return "warn", warning
+
+
 def check_federation_key(key_file: Path) -> tuple[str, str]:
     """Federation key presence + permission check. Never prints the key itself.
 
@@ -1365,14 +1378,20 @@ def doctor(config_path: str | None = None, *, show_all: bool = False) -> int:
         ca_file = config_mod._expand(raw["ca_file"])
     ca_status, ca_message = check_ca_file(ca_file)
 
-    config_group = report.Group(
-        "config",
-        [
-            report.Check("file", _status_glyph(cfg_status), cfg_message),
-            report.Check("key", _status_glyph(key_status), key_message),
-            report.Check("ca", _status_glyph(ca_status), ca_message),
-        ],
-    )
+    config_members = [
+        report.Check("file", _status_glyph(cfg_status), cfg_message),
+        report.Check("key", _status_glyph(key_status), key_message),
+        report.Check("ca", _status_glyph(ca_status), ca_message),
+    ]
+    legacy_focus_check = check_legacy_focus_app(config_path)
+    if legacy_focus_check is not None:
+        legacy_focus_status, legacy_focus_message = legacy_focus_check
+        config_members.append(
+            report.Check(
+                "focus_app", _status_glyph(legacy_focus_status), legacy_focus_message
+            )
+        )
+    config_group = report.Group("config", config_members)
     config_created = cfg_status == "ok"
 
     ctrl_status, ctrl_message = check_controls(config_path)

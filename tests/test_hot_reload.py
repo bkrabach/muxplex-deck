@@ -280,7 +280,6 @@ class TestApplyReload:
             poll_interval=2.0,
             sort="server",
             controls={"key.11": "view_next"},
-            focus_app="",
         )
 
         ctx.apply_reload(reloaded)
@@ -290,7 +289,7 @@ class TestApplyReload:
         # to view_next drops it to 11.
         assert ctx.plan.sessions_per_page == 11
 
-    def test_sort_focus_app_and_poll_interval_are_updated(self) -> None:
+    def test_sort_and_poll_interval_are_updated(self) -> None:
         deck = _make_reduced_deck()
         client = FakeClient(_make_sessions(5), SETTINGS)
         ctx = self._make_ctx(deck, client)
@@ -304,13 +303,11 @@ class TestApplyReload:
             poll_interval=7.5,
             sort="attention",
             controls={},
-            focus_app="muxplex",
         )
 
         ctx.apply_reload(reloaded)
 
         assert ctx.sort_mode == "attention"
-        assert ctx.focus_app_name == "muxplex"
         assert ctx.poll_interval == 7.5
 
     def test_paint_cache_is_invalidated_so_next_repaint_redraws_everything(
@@ -331,7 +328,6 @@ class TestApplyReload:
             poll_interval=2.0,
             sort="server",
             controls={},
-            focus_app="",
         )
         ctx.apply_reload(reloaded)
 

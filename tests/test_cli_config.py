@@ -153,7 +153,6 @@ class TestConfigSetRoundTrip:
             ),
             ("poll_interval", "4.5", 4.5),
             ("sort", "server", "server"),
-            ("focus_app", "muxplex", "muxplex"),
         ],
     )
     def test_every_shipped_key_round_trips_exactly(
@@ -182,7 +181,6 @@ class TestConfigSetRoundTrip:
             "ca_file",
             "poll_interval",
             "sort",
-            "focus_app",
         }
         # "controls" is deliberately excluded from the scalar round-trip
         # above -- it's a dict, refused by `config set` entirely (see
@@ -270,5 +268,5 @@ class TestConfigList:
             assert key in out
         assert 'sort: "server" (modified)' in out
         # An unmodified key shows no marker.
-        assert 'focus_app: ""' in out
-        assert 'focus_app: "" (modified)' not in out
+        assert "poll_interval: 2.0" in out
+        assert "poll_interval: 2.0 (modified)" not in out

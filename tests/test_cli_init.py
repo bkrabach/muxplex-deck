@@ -528,7 +528,7 @@ class TestFederationDisabledWarning:
 
 
 class TestIdempotentReRun:
-    def test_rerun_preserves_sort_poll_interval_focus_app(
+    def test_rerun_preserves_sort_and_poll_interval(
         self,
         deck_home: Path,
         config_path: str,
@@ -548,7 +548,6 @@ class TestIdempotentReRun:
                 "server_url": "https://spark-1.test:8088",
                 "sort": "server",
                 "poll_interval": 5.0,
-                "focus_app": "muxplex",
             },
             config_path,
         )
@@ -577,7 +576,6 @@ class TestIdempotentReRun:
         final = config_mod.load_raw_config(config_path)
         assert final["sort"] == "server"
         assert final["poll_interval"] == 5.0
-        assert final["focus_app"] == "muxplex"
         assert final["server_url"] == "https://spark-1.test:8088"
         # Key file untouched (getpass_func was never called -- asserted via
         # _fail_getpass above; the on-disk content also should be unchanged).
