@@ -109,6 +109,50 @@ product. See `README.md` for setup, config, and verification checklists.
   aware / `XDG_STATE_HOME`-aware fallback logic -- those tests set/delete
   the env var themselves, which simply overrides the autouse default.
 
+- **No CI job exercises the OLDEST ALLOWED dependency, and this repo has now
+  shipped a floor/code mismatch twice.** `.github/workflows/ci.yml`'s `test`
+  job runs against `uv.lock` (pinned/newest-known) and `test-latest-deps`
+  does a fresh resolve (newest available). Both land on the same modern
+  `muxplex-client`. Nothing installs the *minimum* `pyproject.toml`
+  actually permits, so a call to a client attribute that only exists above
+  the declared floor is invisible to all three jobs -- green everywhere,
+  broken for anyone who resolves to the floor.
+  - **v0.13.0**: `Session.views` read while the floor still allowed a
+    client with no such attribute. Caught in review; floor moved to
+    `>=0.36.0` in the feature commit (`3e2f941`).
+  - **v0.14.0**: `client.raise_focus()` called while the floor still said
+    `>=0.36.0`. `raise_focus` first exists in muxplex-client **0.42.0**
+    (verified against muxplex's own tags: 0.36.0/0.38.0/0.40.0/0.41.0 all
+    define it zero times, 0.42.0 once). The lock bump (`4a7f77d`) fixed
+    CI; the floor stayed wrong until the release audit caught it.
+  - Why this one bit harder than a focus bug: `_raise_focus_best_effort`
+    catches `MuxplexError`, and `AttributeError` is not one, so on a
+    floor-resolved install it escapes `_do_connect` BEFORE
+    `self.client.connect(name)` -- every key-press session switch silently
+    dies (highlight paints, connect never fires, next poll reverts it),
+    whether or not anything is bound to `focus_app`.
+  - **A guard is wanted but is NOT free -- measured, not assumed.** The
+    obvious `uv pip install --resolution lowest-direct -e . --group dev`
+    fails on this project for an UNRELATED reason: it drags in
+    `pillow==10.0.0`, which has no cp313 wheel and fails to build from
+    source (`KeyError: '__version__'` in its setup.py under modern
+    setuptools). Making that job green means also raising the pillow floor
+    -- a real change to the install surface, not a CI tweak. Two cheaper
+    options, neither built: (a) a CI step installing ONLY the declared
+    muxplex-client floor (`uv pip install muxplex-client==<floor>`) before
+    running the suite, which is the dependency that keeps drifting; (b) a
+    plain unit test asserting `tests/test_runtime_modes.py`'s `FakeClient`
+    surface is a subset of the real `MuxplexClient`'s -- no network, no CI
+    change, and it attacks the actual root cause, which is a fake more
+    permissive than the type it stands in for.
+  - **The general lesson: a fake that is more permissive than the real
+    type is exactly the hole a type checker exists to plug.** The suite
+    passed at 912/912 with `raise_focus` unresolvable, because every test
+    that touches focus overrides `.raise_focus` on a `FakeClient` and never
+    consults the real class. `pyright` was the only thing between that and
+    a shipped `AttributeError` -- which is why the `lint` job is not
+    optional and must never be skipped for a release.
+
 ## Config
 
 - `~/.config/muxplex-deck/config.json` (`--config` / `MUXPLEX_DECK_CONFIG`
