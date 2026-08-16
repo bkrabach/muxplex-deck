@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.15.0 (2026-08-16)
+
+### Features
+
+- **The Stream Deck no longer yanks every other connected device's view every time you turn the view dial.** Until now, turning dial-0 (the view dial) always PATCHed the server's shared `active_view` immediately — so switching your own view on the deck silently switched it for every browser tab and every other device following the server's shared state too. Optional new config `view_pin`: set it to a view name, and the deck keeps that view locally, dial turns update ONLY this deck's own display, and nothing is sent to the server. Set it via the existing config CLI: `muxplex-deck config set view_pin <name>` (clear with `muxplex-deck config set view_pin ""`). Unset (the default): behavior is byte-identical to before, dial turns still update the server exactly as they always have.
+
+### Design
+
+- **This is Step 0 of a larger design for letting decks and browsers choose what they follow/control.** It is deliberately minimal, changes nothing server-side, and requires no API additions or modifications. Unset, it is completely invisible; set, it provides immediate relief to one acute pain point while the fuller design lands incrementally. Steps 1–6 are documented in `muxplex/docs/plans/2026-08-16-deck-control-target-design.md`.
+
+- **Hot-reloadable without restart.** The `view_pin` key is already listed in `RELOADABLE_KEYS`, so toggling it in `config.json` takes effect on the next poll without stopping/starting the service.
+
+### Verification
+
+- 934 tests passed via `uv run pytest -q`, including 14 new tests in `tests/test_view_pin.py` covering pin/unpin behavior, hot-reload, PATCH vs no-PATCH branching, and local state tracking.
+- Regression tests fixed in `test_hot_reload.py`, `test_main_logging.py`, `test_cli_config.py`, `test_config.py`.
+- `ruff format --check`, `ruff check`, and `pyright` all clean — 0 errors/warnings.
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.14.0 (2026-08-07)
 
 ### Changes
