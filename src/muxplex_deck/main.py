@@ -135,6 +135,7 @@ def _control_key_display(
     page_text: str,
     brightness_text: str,
     previous_session: str,
+    pinned: bool = False,
 ) -> tuple[str, str, str]:
     """(name, body, state) for a non-"session"/"none" control key's paint.
 
@@ -150,9 +151,16 @@ def _control_key_display(
     indistinguishable at a glance. Swapping which text goes in which band
     (not just resizing) is the actual fix; see the design doc's "critical
     inversion" note.
+
+    `pinned` (default False, byte-identical to before it existed) brackets
+    the VIEW key's label (`[work]` vs `work`) when this deck is locally
+    pinned -- the same "state that requires a hover/config-read to
+    discover is state the user doesn't have" lesson the v0.48.3 muxplex
+    frontend fix was for (see docs/plans's deck control target design).
     """
     if action == "view_picker":
-        body = f"> {view_label}" if turning else view_label
+        label = f"[{view_label}]" if pinned else view_label
+        body = f"> {label}" if turning else label
         return "VIEW", body, view_position
     if action == "view_prev":
         return "< PREV", "VIEW", view_position
@@ -376,9 +384,18 @@ def _build_strip_message(
     hostname: str,
     total: int,
     active_session: str | None,
+    pinned: bool = False,
 ) -> str:
-    """Compose the touch-strip headline: view (+ live turn echo) + page + host + status."""
+    """Compose the touch-strip headline: view (+ live turn echo) + page + host + status.
+
+    `pinned` (default False -- byte-identical to before it existed)
+    brackets the view name (`[work]`) so a locally-pinned deck is visibly
+    distinguishable from one following the server, without needing to
+    inspect config.json to discover it.
+    """
     view_part = _truncate_view(view_label)
+    if pinned:
+        view_part = f"[{view_part}]"
     if turning:
         # ASCII, not "\u2192" (RIGHTWARDS ARROW): the real device's default
         # PIL font has no glyph for it and renders a .notdef box instead
@@ -466,6 +483,7 @@ class _ActiveRuntime:
         sort_mode: str,
         controls: Mapping[str, str] | None = None,
         poll_interval: float = 2.0,
+        view_pin: str | None = None,
     ) -> None:
         self.deck = deck
         self.client = client
@@ -475,6 +493,14 @@ class _ActiveRuntime:
         # attribute (not captured into a closure), so `apply_reload` can
         # change it and the very next wait honors the new value.
         self.poll_interval = poll_interval
+
+        # Optional local-only view pin (`Config.view_pin`) -- `None` (the
+        # default) means every dial-0 commit still PATCHes the server and
+        # `_process()` still adopts the server's reported `active_view`
+        # (byte-identical to before this field existed). When set, this
+        # deck's rendered session list ignores the server's `active_view`
+        # entirely and never PATCHes it -- see `_process`/`_commit_view`.
+        self.view_pin = view_pin
 
         # Guards every actual HTTP call -- poll-loop GETs, a dial-0 commit's
         # PATCH+refresh, and key-press connects can each originate from a
@@ -502,7 +528,10 @@ class _ActiveRuntime:
         # `_note_active_session_locked`, both on local key-press connects
         # and on a server-side switch observed through `_process`.
         self.previous_session: str | None = None
-        self.active_view: str = "all"
+        # Seeded from the pin (if any) so a deck that starts up already
+        # pinned filters correctly from frame one, instead of showing
+        # "all" until the first `_process()` call catches up.
+        self.active_view: str = view_pin if view_pin is not None else "all"
         self.session_names: list[str] = []  # current page's key-index -> session name
 
         # Session-local, never persisted: real hardware powers on dim
@@ -546,6 +575,14 @@ class _ActiveRuntime:
         cache is invalidated so the next `repaint()` redraws every key
         under the new bindings instead of trusting a diff cache computed
         under the old ones.
+
+        A newly-set or changed `view_pin` (was `None`, or a different
+        value than before) also snaps `active_view` to it immediately, so
+        a hot-edit that pins the deck takes effect on this very tick
+        rather than waiting for the next poll. Clearing the pin (back to
+        `None`) needs no special handling here -- the next `_process()`
+        call resumes tracking the server's `active_view` on its own (see
+        `_process`).
         """
         with self.paint_lock:
             self.plan = layout.plan_layout(
@@ -553,6 +590,9 @@ class _ActiveRuntime:
             )
             self.sort_mode = config.sort
             self.poll_interval = config.poll_interval
+            if config.view_pin is not None and config.view_pin != self.view_pin:
+                self.active_view = config.view_pin
+            self.view_pin = config.view_pin
             self.pager.page_size = max(1, self.plan.sessions_per_page)
             self.pager.set_item_count(len(self.ordered))
             self.last_key_state = [None] * self.deck.key_count()
@@ -576,7 +616,21 @@ class _ActiveRuntime:
     def _process(
         self, sessions: list[Session], server_state: ServerState, settings: Settings
     ) -> None:
-        filtered = views.resolve_view(sessions, settings, server_state.active_view)
+        """Resolve the current view, sort, and repaint from one poll's results.
+
+        When `view_pin` is set, this deck's own sticky `active_view` (last
+        set by `_commit_view`, or seeded from the pin at construction/
+        reload) drives filtering/cycling/paging instead of the server's
+        reported `active_view` -- and `active_view` is left exactly as-is
+        at the end (never overwritten from the server), since a pinned
+        deck's local selection is authoritative. With no pin (the
+        default), behavior is byte-identical to before this field
+        existed: everything here tracks `server_state.active_view`.
+        """
+        pinned = self.view_pin is not None
+        effective_view = self.active_view if pinned else server_state.active_view
+
+        filtered = views.resolve_view(sessions, settings, effective_view)
 
         if self.sort_mode == "attention":
             ordered = attention.apply_attention_sort(filtered)
@@ -584,19 +638,20 @@ class _ActiveRuntime:
             ordered = filtered
 
         view_names = [v.name for v in settings.views]
-        self.view_cycler.sync(view_names, server_state.active_view)
+        self.view_cycler.sync(view_names, effective_view)
 
         with self.paint_lock:
             if (
                 self.last_seen_active_view is not None
-                and self.last_seen_active_view != server_state.active_view
+                and self.last_seen_active_view != effective_view
             ):
                 self.pager.reset()
-            self.last_seen_active_view = server_state.active_view
+            self.last_seen_active_view = effective_view
 
             self.ordered = ordered
             self._note_active_session_locked(server_state.active_session)
-            self.active_view = server_state.active_view
+            if not pinned:
+                self.active_view = server_state.active_view
             self.pager.set_item_count(len(ordered))
 
         self.repaint()
@@ -625,6 +680,7 @@ class _ActiveRuntime:
             view_label = (
                 self.view_cycler.candidate_view() if turning else self.active_view
             )
+            pinned = self.view_pin is not None
             with self.deck:
                 self._paint_keys(page_sessions, active_session)
                 # Unconditional in both modes: the default FULL-mode plan
@@ -632,7 +688,7 @@ class _ActiveRuntime:
                 # nothing there -- byte-identical to the old REDUCED-only
                 # gate -- unless the user has remapped a FULL-mode key
                 # away from "session".
-                self._paint_control_keys(view_label, turning)
+                self._paint_control_keys(view_label, turning, pinned=pinned)
                 if self.plan.use_strip:
                     message = _build_strip_message(
                         view_label=view_label,
@@ -642,6 +698,7 @@ class _ActiveRuntime:
                         hostname=self.hostname,
                         total=len(self.ordered),
                         active_session=active_session,
+                        pinned=pinned,
                     )
                     if message != self.last_strip:
                         rendering.paint_status_strip(self.deck, message)
@@ -840,7 +897,9 @@ class _ActiveRuntime:
                 )
             self.last_key_state[key_index] = identity
 
-    def _paint_control_keys(self, view_label: str, turning: bool) -> None:
+    def _paint_control_keys(
+        self, view_label: str, turning: bool, *, pinned: bool = False
+    ) -> None:
         """Paint every key whose resolved action isn't "session", diffed.
 
         This is the generalized replacement for the old hardcoded
@@ -851,6 +910,10 @@ class _ActiveRuntime:
         blanks a "none"-bound key or renders a labeled control key via
         `_control_key_display`. Unconditional in both layout modes -- see
         the call site in `_repaint_sessions`.
+
+        `view_label` (used for the position lookup below) is always the
+        raw, unbracketed view name -- `pinned` only affects the VIEW key's
+        displayed body text inside `_control_key_display`.
         """
         page = self.pager.page
         page_count = self.pager.page_count
@@ -881,6 +944,7 @@ class _ActiveRuntime:
                 page_text=page_text,
                 brightness_text=brightness_text,
                 previous_session=previous_session,
+                pinned=pinned,
             )
             identity = ("control", name, body, state)
             if self.last_key_state[key_index] == identity:
@@ -938,11 +1002,24 @@ class _ActiveRuntime:
             )
 
     def _commit_view(self, view: str) -> None:
-        """Debounced (or press-immediate) view-cycle commit: PATCH, then refresh fast."""
+        """Debounced (or press-immediate) view-cycle commit.
+
+        Normally: PATCH the server-global `active_view`, then refresh fast
+        -- unchanged from before `view_pin` existed. When this deck is
+        locally pinned (`view_pin` is not None), turning the dial instead
+        just picks a new pinned view -- update `view_pin`/`active_view`
+        locally and skip the PATCH entirely, so a pinned deck never yanks
+        any other connected client's view.
+        """
         logger.info("view cycle commit -> %r", view)
         try:
-            with self.client_lock:
-                self.client.set_active_view(view)
+            if self.view_pin is not None:
+                with self.paint_lock:
+                    self.view_pin = view
+                    self.active_view = view
+            else:
+                with self.client_lock:
+                    self.client.set_active_view(view)
             self.refresh()
         except MuxplexError:
             logger.exception("failed to commit view switch to %r", view)
@@ -1412,6 +1489,7 @@ def _run_active(
         config.sort,
         config.controls,
         config.poll_interval,
+        config.view_pin,
     )
     logger.info("%s", layout.describe_plan(ctx.plan))
     _log_plan_diagnostics(ctx.plan)

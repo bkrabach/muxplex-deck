@@ -43,6 +43,11 @@ DEFAULT_CONFIG: dict = {
     "ca_file": "",
     "poll_interval": DEFAULT_POLL_INTERVAL_SECONDS,
     "sort": DEFAULT_SORT_MODE,
+    # Optional local-only view pin (deck-side "Step 0" of the deck control
+    # target design). "" (default, like `ca_file`) means "no pin" --
+    # byte-identical to pre-existing behavior. See `Config.view_pin`'s
+    # docstring; `load_config` normalizes "" to `None`.
+    "view_pin": "",
     # address -> action; empty means "all capability-derived defaults" (see
     # `layout.default_bindings`). Defaults are computed, never stored here --
     # a fresh install has no "controls" key at all and sees zero behavior
@@ -100,6 +105,19 @@ class Config:
     pre-existing behavior -- honor muxplex's own `sort_order` (alphabetical
     vs server/manual order) with no client-side reordering. See `.attention`
     for the "attention" mode's tie-break rules.
+    """
+    view_pin: str | None
+    """Optional local-only view name this deck should stay pinned to.
+
+    `None` (default) means "no pin" -- behavior is byte-identical to before
+    this field existed: dial-0 view changes still `PATCH /api/state`
+    (server-global), and this deck still adopts whatever `active_view` the
+    server reports on every poll. When set, this deck stops sending that
+    PATCH on a dial-0 commit (so it no longer yanks every other connected
+    client's view) and instead tracks its own local view selection,
+    ignoring the server's reported `active_view` entirely. See
+    `main._ActiveRuntime` (`view_pin`/`active_view`/`_commit_view`) for the
+    runtime behavior this drives. Hot-reloadable: see `RELOADABLE_KEYS`.
     """
     controls: dict[str, str]
     """Resolved (address -> action) overrides, Gate-1 validated (grammar +
@@ -282,6 +300,13 @@ def load_config(config_path: str | None = None) -> Config:
             f"Config field 'sort' must be one of {VALID_SORT_MODES}, got {sort!r}"
         )
 
+    view_pin_value = raw.get("view_pin")
+    if view_pin_value is not None and not isinstance(view_pin_value, str):
+        raise ConfigError(
+            f"Config field 'view_pin' must be a string or null, got {view_pin_value!r}"
+        )
+    view_pin = view_pin_value or None
+
     controls_value = _validate_controls(raw.get("controls", {}))
 
     return Config(
@@ -290,6 +315,7 @@ def load_config(config_path: str | None = None) -> Config:
         ca_file=ca_file,
         poll_interval=float(poll_interval),
         sort=sort,
+        view_pin=view_pin,
         controls=controls_value,
     )
 
@@ -379,7 +405,7 @@ def patch_raw_config(patch: dict, config_path: str | None = None) -> dict:
 # local variable in `_run_active`'s wait call) -- verified by inspection,
 # not assumed: none of them are captured into a closure, a constructed
 # client, or any other object that would go stale.
-RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "poll_interval")
+RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "poll_interval", "view_pin")
 
 # (report name as it appears in config.json / `config list`, Config attribute
 # to compare) -- reported when different, but NEVER applied to the running

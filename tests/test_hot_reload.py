@@ -279,6 +279,7 @@ class TestApplyReload:
             ca_file=None,
             poll_interval=2.0,
             sort="server",
+            view_pin=None,
             controls={"key.11": "view_next"},
         )
 
@@ -302,6 +303,7 @@ class TestApplyReload:
             ca_file=None,
             poll_interval=7.5,
             sort="attention",
+            view_pin=None,
             controls={},
         )
 
@@ -327,6 +329,7 @@ class TestApplyReload:
             ca_file=None,
             poll_interval=2.0,
             sort="server",
+            view_pin=None,
             controls={},
         )
         ctx.apply_reload(reloaded)
