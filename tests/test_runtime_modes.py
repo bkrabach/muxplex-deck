@@ -172,6 +172,21 @@ class FakeClient:
         self.view_patch_device_ids: list[str | None] = []
         self.heartbeat_calls: list[dict[str, object]] = []
         self.heartbeat_event = threading.Event()
+        # Step 5 (deck control target design ADR §9.2/§10): this server's
+        # own device registry (§6.1), keyed by device_id -- surfaced via
+        # `state()`'s `ServerState.raw["devices"]`, exactly like the real
+        # server's `GET /api/state` (see `_ActiveRuntime._local_devices`'s
+        # docstring). Empty by default so every existing test (which never
+        # sets this) sees an empty registry, same as before this field
+        # existed.
+        self.devices: dict[str, dict[str, object]] = {}
+        # When set, the NEXT `heartbeat()` call raises this (recording the
+        # call first, then clearing itself so a following call -- e.g. a
+        # `refresh()`-internal fallback retry -- succeeds normally). Lets
+        # tests exercise `_ActiveRuntime`'s `TargetGoneError`/
+        # `TargetNotSelfOwningError` degrade-and-retry path without a real
+        # server.
+        self.heartbeat_error: Exception | None = None
 
     def raise_focus(self) -> None:
         self.raise_focus_calls += 1
@@ -185,6 +200,7 @@ class FakeClient:
             active_session=self.active_session,
             active_view=self.active_view,
             active_remote_id=self.active_remote_id,
+            raw={"devices": self.devices},
         )
 
     def settings(self) -> Settings:
@@ -229,6 +245,15 @@ class FakeClient:
             }
         )
         self.heartbeat_event.set()
+        # Step 5: `heartbeat_error` (see this class's __init__ docstring)
+        # is recorded above THEN raised, mirroring a real server that
+        # rejects the payload it received -- and cleared immediately so a
+        # caller's own fallback retry (the very next `heartbeat()` call)
+        # succeeds normally.
+        if self.heartbeat_error is not None:
+            error = self.heartbeat_error
+            self.heartbeat_error = None
+            raise error
 
 
 def _make_sessions(count: int) -> list[Session]:

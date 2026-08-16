@@ -55,6 +55,11 @@ ACTIONS: dict[str, ActionSpec] = {
     ),
     "view_picker": ActionSpec(MOMENTARY, "Open/close the paged view picker"),
     "page_picker": ActionSpec(MOMENTARY, "Open/close the page picker"),
+    "target_picker": ActionSpec(
+        MOMENTARY,
+        "Open/close the paged control-target picker (opt-in, not bound by "
+        "default -- lists local devices to follow, plus Shared/Just me)",
+    ),
     "page_prev": ActionSpec(MOMENTARY, "Page -1 (clamped)"),
     "page_next": ActionSpec(MOMENTARY, "Page +1 (clamped)"),
     NONE_ACTION: ActionSpec(

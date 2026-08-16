@@ -239,6 +239,15 @@ class PickerMode(Enum):
     NONE = "none"
     VIEW = "view"
     PAGE = "page"
+    TARGET = "target"
+    """Deck control target design ADR §9.2/§10 Step 5: the opt-in
+    `target_picker` action's chooser -- lists this server's local-registry
+    devices plus the "Shared"/"Just me" escape hatches (§7.0(a)-style
+    client-local pinning, applied to the control-target axis rather than
+    view display). Not bound by default (§9.2: "a reserved key is
+    expensive") -- reachable only via `PickerController.press_target()`,
+    itself only invoked when a user has explicitly bound some key/dial
+    push to the `target_picker` action."""
 
 
 class PickerController:
@@ -289,6 +298,28 @@ class PickerController:
         with self._lock:
             self._mode = (
                 PickerMode.NONE if self._mode == PickerMode.PAGE else PickerMode.PAGE
+            )
+            self._window_start = 0
+            return self._mode
+
+    def press_target(self) -> PickerMode:
+        """`target_picker` action press: open the TARGET picker, or close it.
+
+        Unlike VIEW/PAGE, this isn't bound to a fixed physical dial --
+        `target_picker` is an opt-in catalog action (deck control target
+        design ADR §9.2/§10 Step 5) bindable to any key or dial push. The
+        same toggle rules apply regardless: pressing it again while TARGET
+        is already open closes it; pressing it while VIEW/PAGE is open
+        switches straight to TARGET (no intermediate NONE); pressing it
+        from NONE opens TARGET. Callers (`main.py`) are responsible for
+        never invoking this while the deck is in the §7.2 remote-session
+        degraded state -- this method has no way to know that itself.
+        """
+        with self._lock:
+            self._mode = (
+                PickerMode.NONE
+                if self._mode == PickerMode.TARGET
+                else PickerMode.TARGET
             )
             self._window_start = 0
             return self._mode

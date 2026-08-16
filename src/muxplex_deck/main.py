@@ -60,12 +60,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from muxplex_client import (
+    ApiError,
     AuthError,
     MuxplexClient,
     MuxplexError,
     ServerState,
     Session,
     Settings,
+    TargetGoneError,
+    TargetNotSelfOwningError,
     UnreachableError,
 )
 
@@ -104,6 +107,18 @@ AUTH_RETRY_SECONDS = 30.0
 # fields by default (verified directly against this checkout's pydantic
 # 2.12.5), so sending it now is forward-compatible and never 422s.
 CLIENT_KIND = "deck"
+
+# Step 5 (deck control target design ADR §9.2/§10): `_ActiveRuntime.target_selection`
+# values for the target_picker's two escape hatches (§7.0(a)-style client-local
+# pinning, applied to the control-target axis rather than view display -- see
+# `_resolve_heartbeat_sync_group`'s docstring for why these are distinct from
+# `Config.view_pin`, which is Axis 2/display pinning, not Axis 1/control target).
+#
+# `TARGET_SHARED` doubles as the literal wire value the server expects for the
+# shared group (`"global"`) -- no translation needed when sending it.
+# `TARGET_LOCAL` is a purely client-side sentinel, NEVER sent over the wire.
+TARGET_SHARED = "global"
+TARGET_LOCAL = "local"
 
 # Real hardware powers on at a dim firmware default; the sidecar always
 # asserts full brightness itself on every bring-up (fresh connect or
@@ -183,6 +198,8 @@ def _control_key_display(
         return "GO TO", "ALL", ""
     if action == "page_picker":
         return "PAGE", page_text, ""
+    if action == "target_picker":
+        return "TARGET", "PICK", ""
     if action == "page_prev":
         return "< PREV", "PAGE", page_text
     if action == "page_next":
@@ -388,6 +405,50 @@ def _truncate_view(name: str) -> str:
     return name[: _MAX_VIEW_LABEL_CHARS - 1] + "\u2026"
 
 
+def _target_indicator_text(
+    *,
+    target_selection: str | None,
+    active_remote_id: str | None,
+    target_label: str | None = None,
+) -> str:
+    """The trailing "> ..." segment appended to the strip headline (§9.2).
+
+    Deck control target design ADR §9.2/§10 Step 5. Precedence, most
+    urgent/authoritative first:
+
+    1. `TARGET_LOCAL` ("Just me") -- always wins: this deck was explicitly
+       told to ignore whatever any resolved group reports (§7.0(a)-style
+       client-local pinning applied to the control-target axis), so
+       nothing else here is relevant to show.
+    2. `active_remote_id` non-null -- the §4.5/§7.2 ship-blocking hazard.
+       Must stay visible even when this deck also thinks it's "shared" or
+       paired to a specific device, since a same-named LOCAL session
+       could otherwise look safe to press when it isn't. This is why it
+       outranks a normal "paired"/"shared" reading.
+    3. A specific paired device -- `target_label` (its `display_name`/
+       `label`, resolved by the caller from the local device registry --
+       see `_ActiveRuntime._resolve_target_label`) if known, else the raw
+       selection value as an honest last-resort fallback (e.g. right after
+       pairing, before this deck's own registry entry for that peer has
+       been re-fetched).
+    4. Shared -- the default (`target_selection is None`, i.e. the
+       target_picker has never been touched) and `TARGET_SHARED`'s
+       explicit re-selection read identically here; both mean "this
+       deck's presses/highlight resolve to the shared group."
+
+    ASCII only, like the view-cycle turn indicator right above it in
+    `_build_strip_message` -- the real device's default PIL font renders
+    "\u2192" as a `.notdef` box (documented real-hardware finding).
+    """
+    if target_selection == TARGET_LOCAL:
+        return "> local"
+    if active_remote_id is not None:
+        return f"> remote ({active_remote_id})"
+    if target_selection is None or target_selection == TARGET_SHARED:
+        return "> shared"
+    return f"> {target_label}" if target_label else f"> {target_selection}"
+
+
 def _build_strip_message(
     *,
     view_label: str,
@@ -398,6 +459,7 @@ def _build_strip_message(
     total: int,
     active_session: str | None,
     pinned: bool = False,
+    target_text: str = "",
 ) -> str:
     """Compose the touch-strip headline: view (+ live turn echo) + page + host + status.
 
@@ -405,6 +467,14 @@ def _build_strip_message(
     brackets the view name (`[work]`) so a locally-pinned deck is visibly
     distinguishable from one following the server, without needing to
     inspect config.json to discover it.
+
+    `target_text` (default "" -- byte-identical to before it existed):
+    Step 5's control-target indicator (`_target_indicator_text`),
+    appended as its own trailing segment when non-empty. Composes with
+    `pinned` freely -- a deck can be both pinned to a display view AND
+    following a specific target at the same time (deck control target
+    design ADR §9.2's own explicit requirement: "make sure the strip can
+    show both without becoming unreadable").
     """
     view_part = _truncate_view(view_label)
     if pinned:
@@ -420,6 +490,8 @@ def _build_strip_message(
     parts.append(hostname)
     parts.append(f"{total} sessions")
     parts.append(f"ACTIVE: {active_session or 'none'}")
+    if target_text:
+        parts.append(target_text)
     return " \u00b7 ".join(parts)
 
 
@@ -518,10 +590,72 @@ class _ActiveRuntime:
         self.name = name
 
         # Parsed from `ServerState.active_remote_id` on every `refresh()`
-        # (ADR §8.1 #10) -- stored only, never acted on yet. Render
-        # suppression when non-None is Step 5's ship-blocker (§7.2/§9.2);
-        # this just proves the field round-trips without erroring.
+        # (ADR §8.1 #10). Non-None is Step 5's ship-blocker (§4.5/§7.2):
+        # `_repaint_sessions` suppresses the active-session highlight (and
+        # the "ACTIVE: x" strip text) whenever this is set, and the strip's
+        # target indicator (`_target_indicator_text`) shows "> remote
+        # (...)" in preference to a normal shared/paired reading.
         self.active_remote_id: str | None = None
+
+        # Step 5's target_picker selection (deck control target design ADR
+        # §9.2/§10) -- Axis 1, control target: whose group this deck's
+        # heartbeat claims, and therefore whose active_session/view/
+        # remote_id it adopts. Deliberately a SEPARATE field from
+        # `view_pin` below (Axis 2, display pinning) -- see §1's two-axis
+        # table; conflating them was explicitly flagged as wrong during
+        # this step's design review.
+        #
+        # `None` (the default, never touched by the picker): byte-identical
+        # to Step 1's shipped behavior -- `_resolve_heartbeat_sync_group`
+        # omits `sync_group` on every heartbeat (server "leaves it
+        # unchanged", which for a never-paired device is always "global"),
+        # and `_process` adopts the resolved group's `active_session`/
+        # `active_view`/`active_remote_id` normally.
+        #
+        # `TARGET_SHARED` ("global"): an explicit re-claim of the shared
+        # group -- needed to force this deck OUT of a foreign group it was
+        # previously paired to (omitting `sync_group` only ever means
+        # "leave unchanged", never "reset").
+        #
+        # `TARGET_LOCAL` ("Just me" -- this repo's equivalent of the
+        # browser dropdown's own "None" escape hatch, §6.2.3/§6.2.6/
+        # §7.0(a)): also omits `sync_group` on the wire (a purely
+        # client-side rendering choice, never a server write), but ALSO
+        # makes `_process` stop adopting `active_session`/`active_remote_id`
+        # from the resolved group -- this deck freezes whatever it last had
+        # and ignores further server-side session-selection updates,
+        # exactly mirroring `view_pin`'s "ignore the server, I choose what
+        # I render" contract, just applied to Axis 1 instead of Axis 2.
+        #
+        # `f"device:{id}"`: paired to a specific local-registry device --
+        # sent on EVERY heartbeat (§6.2.4's stickiness requirement), with
+        # `TargetGoneError`/`TargetNotSelfOwningError` handled by
+        # `_degrade_target_to_shared` (sticky + visible fallback to
+        # `TARGET_SHARED`, never a silent retry loop).
+        self.target_selection: str | None = None
+
+        # The last poll's full `/api/state` JSON body (`ServerState.raw`),
+        # kept only so the target_picker can read the server's `devices`
+        # registry (§6.1) -- a field `ServerState` doesn't type yet (see
+        # `_local_devices`'s docstring). Never includes federated/foreign-
+        # server devices (Step 6, out of scope): this is THIS server's own
+        # registry, the only one this deck's `server_url` ever talks to.
+        self.last_server_state_raw: Mapping[str, Any] = {}
+
+        # Set by `_degrade_target_to_shared` (Step 5) when a heartbeat
+        # target is rejected; consumed exactly once by the very next
+        # `_repaint_sessions()` call, which shows it INSTEAD OF the
+        # normally-composed strip message for that one repaint, then
+        # clears it. This is what makes the degrade notice genuinely
+        # VISIBLE rather than clobbered: `_degrade_target_to_shared` runs
+        # mid-`refresh()`, before that same call's own `_process()`/
+        # `repaint()` -- without this, the normal message computed a few
+        # lines later in the SAME tick would silently overwrite the
+        # notice before a human could ever see it. Once shown, it
+        # persists as `self.last_strip` (the paint-diff cache) until the
+        # NEXT tick produces a genuinely different message.
+        self._target_degrade_notice: str | None = None
+
         # Read fresh on every wait in `_run_active`'s loop -- a plain
         # attribute (not captured into a closure), so `apply_reload` can
         # change it and the very next wait honors the new value.
@@ -663,20 +797,92 @@ class _ActiveRuntime:
         the server has never seen 404s at the HTTP boundary (ADR §2.1),
         so this registers/refreshes this deck's identity before asking
         the server to resolve anything by that id, on every single tick
-        -- not just the first. `sync_group` is never passed, so this
-        deck's resolved group is always `global`, exactly as before this
-        method existed (ADR §10 Step 1: "everyone stays global").
+        -- not just the first. `sync_group` is never passed while
+        `target_selection` is untouched, so this deck's resolved group is
+        `global`, exactly as before this method existed (ADR §10 Step 1:
+        "everyone stays global").
+
+        Step 5 addition (§9.2/§10, §6.2.4/§7.1/§7.0(b)): once the
+        target_picker has been used, `sync_group` is resolved from
+        `self.target_selection` via `_resolve_heartbeat_sync_group` and
+        sent on EVERY heartbeat (not just once) -- §6.2.4's stickiness
+        requirement, so a paired deck keeps re-claiming its target across
+        every poll tick until the user explicitly changes it. A rejected
+        target (`TargetGoneError`/`TargetNotSelfOwningError`) is degraded
+        sticky + visible by `_degrade_target_to_shared` and immediately
+        retried with the fallback so this same tick still completes --
+        neither exception ever propagates out of this method.
         """
+        sync_group = self._resolve_heartbeat_sync_group()
         with self.client_lock:
-            self.client.heartbeat(
-                device_id=self.device_id,
-                label=self._device_label(),
-                kind=CLIENT_KIND,
-            )
+            try:
+                self.client.heartbeat(
+                    device_id=self.device_id,
+                    label=self._device_label(),
+                    kind=CLIENT_KIND,
+                    sync_group=sync_group,
+                )
+            except (TargetGoneError, TargetNotSelfOwningError) as exc:
+                self._degrade_target_to_shared(exc)
+                self.client.heartbeat(
+                    device_id=self.device_id,
+                    label=self._device_label(),
+                    kind=CLIENT_KIND,
+                    sync_group=TARGET_SHARED,
+                )
             sessions = self.client.sessions()
             server_state = self.client.state(device_id=self.device_id)
             settings = self.client.settings()
         self._process(sessions, server_state, settings)
+
+    def _resolve_heartbeat_sync_group(self) -> str | None:
+        """The `sync_group` to send on this heartbeat (Step 5, §6.2.4).
+
+        `None` (never touched by the target_picker, the default) and
+        `TARGET_LOCAL` ("Just me") both omit the field entirely --
+        byte-identical to Step 1's shipped behavior for the former, and a
+        purely client-side rendering choice for the latter (see
+        `target_selection`'s own docstring on `_ActiveRuntime.__init__`).
+        Any other selection (`TARGET_SHARED` or a specific `"device:<id>"`)
+        is the literal wire value, sent as-is.
+        """
+        if self.target_selection in (None, TARGET_LOCAL):
+            return None
+        return self.target_selection
+
+    def _degrade_target_to_shared(self, exc: ApiError) -> None:
+        """Fall back to the shared group after a rejected heartbeat target.
+
+        Sticky + visible degrade (deck control target design ADR §6.2.4/
+        §7.1 for `target_gone`, §6.2.5/§7.0(b) for
+        `target_not_self_owning`) -- ports the same policy already proven
+        in the Soft Deck (Step 3) and PWA (Step 4): never silently keep
+        resending a dead/rejected target.
+
+        Sticky: `target_selection` is reset to `TARGET_SHARED` and STAYS
+        there -- this deck never auto-retries the same rejected target on
+        a later tick; only an explicit new target_picker selection changes
+        it again.
+
+        Visible: records `_target_degrade_notice`, which the very next
+        `_repaint_sessions()` call (this SAME `refresh()` tick's own
+        `_process()` -> `repaint()`, run right after this method returns)
+        shows INSTEAD OF the normally-composed strip message -- otherwise
+        that normal message, computed a few lines later in this identical
+        tick, would silently overwrite the notice before a human ever saw
+        it. See that field's own docstring on `_ActiveRuntime.__init__`.
+
+        Called with `client_lock` already held by `refresh()` -- this
+        method itself does no device I/O and needs no lock of its own.
+        """
+        reason = "target gone" if isinstance(exc, TargetGoneError) else "cannot follow"
+        logger.warning(
+            "heartbeat target %r rejected (%s) -- falling back to shared",
+            self.target_selection,
+            reason,
+        )
+        self.target_selection = TARGET_SHARED
+        self._target_degrade_notice = f"target unavailable ({reason}) -- back to shared"
 
     def _process(
         self, sessions: list[Session], server_state: ServerState, settings: Settings
@@ -714,12 +920,23 @@ class _ActiveRuntime:
             self.last_seen_active_view = effective_view
 
             self.ordered = ordered
-            self._note_active_session_locked(server_state.active_session)
-            # Parsed and stored only (ADR §8.1 #10) -- independent of
-            # `view_pin`, since it describes the resolved group's active
-            # session origin, not view state. Acting on it (render
-            # suppression) is Step 5's ship-blocker (§7.2/§9.2).
-            self.active_remote_id = server_state.active_remote_id
+            self.last_server_state_raw = server_state.raw
+            # Step 5's "Just me" target selection (Axis 1, control target
+            # -- see `target_selection`'s docstring): freeze whatever this
+            # deck's active_session/active_remote_id already locally are,
+            # never adopt the resolved group's reported values. Mirrors
+            # `view_pin`'s own "leave it exactly as-is" contract for
+            # `active_view`, just applied to a different axis -- these two
+            # freezes are independent and either, both, or neither may be
+            # active at once.
+            if self.target_selection != TARGET_LOCAL:
+                self._note_active_session_locked(server_state.active_session)
+                # Independent of `view_pin`, since it describes the
+                # resolved group's active session origin, not view state.
+                # Suppressing the highlight/strip text when non-None is
+                # Step 5's ship-blocker (§4.5/§7.2/§9.2) -- see
+                # `_repaint_sessions`.
+                self.active_remote_id = server_state.active_remote_id
             if not pinned:
                 self.active_view = server_state.active_view
             self.pager.set_item_count(len(ordered))
@@ -746,11 +963,26 @@ class _ActiveRuntime:
             page_sessions = self.ordered[start:stop][: len(slots)]
             self.session_names = [s.name for s in page_sessions]
             active_session = self.active_session
+            if self.active_remote_id is not None:
+                # §4.5/§7.2 ship-blocker: this deck's own connect() always
+                # writes to ITS OWN server, never the remote one a
+                # followed browser tab might be viewing via federation --
+                # so the "active" session name/highlight this deck sees
+                # could collide with a same-named LOCAL session. Render as
+                # if nothing is selected (both the key highlight below AND
+                # the "ACTIVE: x" strip text) rather than risk connecting
+                # the wrong machine's session on the next press.
+                active_session = None
             turning = self.view_cycler.is_turning()
             view_label = (
                 self.view_cycler.candidate_view() if turning else self.active_view
             )
             pinned = self.view_pin is not None
+            target_text = _target_indicator_text(
+                target_selection=self.target_selection,
+                active_remote_id=self.active_remote_id,
+                target_label=self._resolve_target_label(self.target_selection),
+            )
             with self.deck:
                 self._paint_keys(page_sessions, active_session)
                 # Unconditional in both modes: the default FULL-mode plan
@@ -760,16 +992,25 @@ class _ActiveRuntime:
                 # away from "session".
                 self._paint_control_keys(view_label, turning, pinned=pinned)
                 if self.plan.use_strip:
-                    message = _build_strip_message(
-                        view_label=view_label,
-                        turning=turning,
-                        page=self.pager.page,
-                        page_count=self.pager.page_count,
-                        hostname=self.hostname,
-                        total=len(self.ordered),
-                        active_session=active_session,
-                        pinned=pinned,
-                    )
+                    if self._target_degrade_notice is not None:
+                        # Consumed exactly once -- see that field's
+                        # docstring on `_ActiveRuntime.__init__` for why
+                        # this must win over the normal composition below
+                        # for this one repaint.
+                        message = self._target_degrade_notice
+                        self._target_degrade_notice = None
+                    else:
+                        message = _build_strip_message(
+                            view_label=view_label,
+                            turning=turning,
+                            page=self.pager.page,
+                            page_count=self.pager.page_count,
+                            hostname=self.hostname,
+                            total=len(self.ordered),
+                            active_session=active_session,
+                            pinned=pinned,
+                            target_text=target_text,
+                        )
                     if message != self.last_strip:
                         rendering.paint_status_strip(self.deck, message)
                         self.last_strip = message
@@ -799,6 +1040,11 @@ class _ActiveRuntime:
                 options = self.view_cycler.names()
                 current = self.active_view
                 kind = "VIEW"
+            elif mode == PickerMode.TARGET:
+                target_options = self._target_options()
+                options = [label for _, label in target_options]
+                current = self._current_target_label(target_options)
+                kind = "TARGET"
             else:
                 options = [str(n) for n in range(1, self.pager.page_count + 1)]
                 current = str(self.pager.page)
@@ -1126,6 +1372,13 @@ class _ActiveRuntime:
         if mode == PickerMode.PAGE:
             self._select_page_option(key)
             return
+        if mode == PickerMode.TARGET:
+            # Same simple "physical key index = option slot" dispatch as
+            # PAGE above -- no REDUCED-specific BACK/PREV/NEXT repurposing
+            # for this picker (that machinery is VIEW-specific; PAGE
+            # already establishes the precedent of not needing one).
+            self._select_target_option(key)
+            return
 
         action, slot = layout.classify_key(self.plan, key)
         self._dispatch_control_action(action, slot=slot, label=f"key[{key}]")
@@ -1156,6 +1409,18 @@ class _ActiveRuntime:
             self.repaint()
         elif action == "page_picker":
             logger.info("%s -> %s", label, self.picker.press_page_dial())
+            self.repaint()
+        elif action == "target_picker":
+            # §7.2 guard: never offer the picker while this deck is in the
+            # remote-session degraded state -- the strip's "> remote
+            # (...)" text is already the visible explanation for why.
+            if self.active_remote_id is not None:
+                logger.info(
+                    "%s -> target picker blocked (remote-session degraded state)",
+                    label,
+                )
+                return
+            logger.info("%s -> %s", label, self.picker.press_target())
             self.repaint()
         elif action == "page_prev":
             page = self.pager.turn(-1)
@@ -1407,6 +1672,124 @@ class _ActiveRuntime:
         logger.info("page picker: key[%d] selected -> page %d", key, page)
         self.pager.go_to(page)
         self.repaint()
+
+    # --- target picker (Step 5, §9.2/§10) -----------------------------------
+
+    def _local_devices(self) -> dict[str, Mapping[str, Any]]:
+        """This server's own device registry (§6.1), from the last poll's raw state.
+
+        `muxplex_client.ServerState` doesn't type the `devices` map yet --
+        it's server-side state (`state.json`), not (yet) part of the
+        typed client model -- but `ServerState.raw` carries the full
+        `GET /api/state` JSON body verbatim (see that dataclass's own
+        docstring on why `raw` exists: "a caller needing a field the
+        model doesn't expose yet can still reach it"), and the server's
+        `get_state()` already returns the whole registry there
+        (`main.py`'s own `get_state` docstring, verified directly against
+        this checkout). Never includes federated/foreign-server devices
+        (Step 6, explicitly out of scope) -- this map only ever reflects
+        THIS server's own registry, the only one this deck's `server_url`
+        ever talks to.
+        """
+        devices = self.last_server_state_raw.get("devices")
+        return devices if isinstance(devices, dict) else {}
+
+    def _target_options(self) -> list[tuple[str, str]]:
+        """(sync_group value, display label) pairs for the target_picker.
+
+        Escape hatches first, never alphabetical (mirrors §9.1's own
+        dropdown ordering rule), then local-registry devices -- excluding
+        THIS deck's own entry (following yourself is meaningless; the
+        server's own self-owning validation would reject it as a no-op
+        self-claim anyway). No federated/"Elsewhere" entries (Step 6,
+        explicitly out of scope) -- see `_local_devices`.
+        """
+        options: list[tuple[str, str]] = [
+            (TARGET_SHARED, "Shared"),
+            (TARGET_LOCAL, "Just me"),
+        ]
+        for device_id, info in sorted(self._local_devices().items()):
+            if device_id == self.device_id or not isinstance(info, dict):
+                continue
+            label = info.get("display_name") or info.get("label") or device_id
+            options.append((f"device:{device_id}", str(label)))
+        return options
+
+    def _current_target_label(self, options: list[tuple[str, str]]) -> str:
+        """The display label matching `self.target_selection`, for highlighting.
+
+        `None` (never touched) reads identically to `TARGET_SHARED` here
+        -- both resolve to the "Shared" option. Returns "" (nothing
+        highlighted) if the current selection's device has vanished from
+        the registry since it was chosen -- an honest "we don't know
+        which option this is anymore" rather than a stale guess.
+        """
+        current_value = self.target_selection or TARGET_SHARED
+        for value, label in options:
+            if value == current_value:
+                return label
+        return ""
+
+    def _resolve_target_label(self, value: str | None) -> str | None:
+        """Human label for a `"device:<id>"` selection, from the local registry.
+
+        Used by the strip's target indicator (`_target_indicator_text`)
+        so a paired target shows its `display_name`/`label` rather than
+        the raw `device:<id>` wire value. Returns `None` for anything
+        that isn't a specific device pairing (escape hatches, or an
+        untouched/None selection) -- the caller falls back to the raw
+        value in that case.
+        """
+        if value in (None, TARGET_SHARED, TARGET_LOCAL):
+            return None
+        for option_value, label in self._target_options():
+            if option_value == value:
+                return label
+        return None
+
+    def _select_target_option(self, key: int) -> None:
+        """Dispatch a key press while the TARGET picker is open (FULL-mode
+
+        dial scroll, or the simple physical-key-index mapping REDUCED mode
+        also uses for the PAGE picker -- see `handle_key`'s docstring).
+        """
+        target_options = self._target_options()
+        start = self.picker.window_start
+        index = start + key
+        self.picker.exit()
+        if index >= len(target_options):
+            logger.info("target picker: key[%d] pressed (empty slot, ignoring)", key)
+            self.repaint()
+            return
+        value, option_label = target_options[index]
+        logger.info(
+            "target picker: key[%d] selected -> %s (%r)", key, option_label, value
+        )
+        self._commit_target(value)
+        self.repaint()
+
+    def _commit_target(self, value: str) -> None:
+        """Apply a target_picker selection: update local state, then heartbeat.
+
+        Mirrors `_commit_view`'s shape (called from the HID/dial-press
+        thread, synchronous): `refresh()` does the actual heartbeat + GETs
+        immediately, so the new target takes effect this same tick rather
+        than waiting for the next poll. `refresh()` itself already handles
+        `TargetGoneError`/`TargetNotSelfOwningError` internally (degrade +
+        retry, via `_degrade_target_to_shared`) and never raises them here
+        -- the `except MuxplexError` below only ever catches a genuine
+        failure (unreachable server, auth, or some other API error).
+        """
+        logger.info("target picker commit -> %r", value)
+        self.target_selection = value
+        try:
+            self.refresh()
+        except MuxplexError:
+            logger.exception("failed to commit target switch to %r", value)
+            message = f"target switch failed: {value}"
+            with self.paint_lock, self.deck:
+                rendering.paint_status_strip(self.deck, message)
+                self.last_strip = message
 
 
 def _make_key_callback(ctx: _ActiveRuntime):
