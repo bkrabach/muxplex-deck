@@ -3,7 +3,7 @@
 validation gates (docs/CONTROL_MAPPING_DESIGN.md §3, §6).
 
 - `TestAddressGrammar` / `TestCatalog`: pure `controls.py` unit tests.
-- `TestKindCorrectness`: table-driven over all 19 actions -- the test that
+- `TestKindCorrectness`: table-driven over all 20 actions -- the test that
   keeps the momentary/relative split honest as the catalog grows (design
   test requirement #10).
 - `TestGate1Validation`: `config.load_config`'s capability-blind checks --
@@ -86,8 +86,10 @@ class TestAddressGrammar:
 
 
 class TestCatalog:
-    def test_catalog_has_19_actions(self) -> None:
-        assert len(controls.ACTIONS) == 19
+    def test_catalog_has_20_actions(self) -> None:
+        # 19 pre-Step-5 actions + "target_picker" (deck control target
+        # design ADR §9.2/§10 Step 5).
+        assert len(controls.ACTIONS) == 20
 
     def test_catalog_help_lines_cover_every_action(self) -> None:
         lines = controls.catalog_help_lines()
@@ -120,8 +122,8 @@ class TestKindCorrectness:
         )
     )
 
-    def test_all_19_actions_are_classified(self) -> None:
-        assert len(self.MOMENTARY_ACTIONS) + len(self.RELATIVE_ACTIONS) + 1 == 19
+    def test_all_20_actions_are_classified(self) -> None:
+        assert len(self.MOMENTARY_ACTIONS) + len(self.RELATIVE_ACTIONS) + 1 == 20
 
     @pytest.mark.parametrize("action", MOMENTARY_ACTIONS)
     def test_momentary_action_accepted_on_key_and_dial_push(self, action: str) -> None:
