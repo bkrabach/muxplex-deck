@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import socket
 import sys
 import threading
 import time
@@ -71,6 +72,7 @@ from muxplex_client import (
 from . import attention, interaction, layout, rendering, views
 from . import config as config_mod
 from . import controls as controls_mod
+from . import identity as identity_mod
 from .config import Config
 from .device import (
     DeckDevice,
@@ -91,6 +93,17 @@ HEALTH_CHECK_TICK_SECONDS = 1.0
 INITIAL_BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 30.0
 AUTH_RETRY_SECONDS = 30.0
+
+# This sidecar's `heartbeat()` `kind` (deck-side "Step 1" of the deck
+# control target design, ADR §8.1 #6). Hardcoded, not user-configurable:
+# a physical Stream Deck sidecar's kind never varies -- "soft-deck" is
+# `deck.js` (a browser tab in muxplex's own frontend), a different codebase
+# entirely; this repo only ever produces "deck". Omitted server-side today
+# (verified: the live `HeartbeatPayload` model has no `kind` field yet) --
+# a plain `pydantic.BaseModel` with no `model_config` ignores unknown
+# fields by default (verified directly against this checkout's pydantic
+# 2.12.5), so sending it now is forward-compatible and never 422s.
+CLIENT_KIND = "deck"
 
 # Real hardware powers on at a dim firmware default; the sidecar always
 # asserts full brightness itself on every bring-up (fresh connect or
@@ -484,11 +497,31 @@ class _ActiveRuntime:
         controls: Mapping[str, str] | None = None,
         poll_interval: float = 2.0,
         view_pin: str | None = None,
+        device_id: str = "",
+        name: str = "",
     ) -> None:
         self.deck = deck
         self.client = client
         self.hostname = hostname
         self.sort_mode = sort_mode
+
+        # Deck-side "Step 1" identity (deck control target design ADR
+        # §8.3/§8.4/§10): a stable id minted/persisted once by
+        # `identity.load_device_id` and passed on every group-touching
+        # client call (`state()`/`connect()`/`set_active_view()`) plus
+        # `heartbeat()`. `""` (the default here) is only ever seen in
+        # tests that don't care about identity -- `main._run_active`
+        # always supplies a real, non-empty id. `name` is `Config.name`
+        # (raw, possibly ""); see `_device_label()` for the effective
+        # heartbeat `label` this resolves to.
+        self.device_id = device_id
+        self.name = name
+
+        # Parsed from `ServerState.active_remote_id` on every `refresh()`
+        # (ADR §8.1 #10) -- stored only, never acted on yet. Render
+        # suppression when non-None is Step 5's ship-blocker (§7.2/§9.2);
+        # this just proves the field round-trips without erroring.
+        self.active_remote_id: str | None = None
         # Read fresh on every wait in `_run_active`'s loop -- a plain
         # attribute (not captured into a closure), so `apply_reload` can
         # change it and the very next wait honors the new value.
@@ -557,6 +590,20 @@ class _ActiveRuntime:
             self.last_key_state = [None] * self.deck.key_count()
             self.last_strip = None
 
+    def _device_label(self) -> str:
+        """This deck's `heartbeat()` `label`: configured `name`, or this
+
+        machine's own hostname (ADR §8.4 -- "empty means derive from
+        hostname"). Resolved here, at the point of use, rather than
+        stored on `Config` -- `self.hostname` already names a *different*
+        value on this object (the SERVER's hostname, used for the strip
+        display), so the device's own hostname is deliberately never
+        cached under a similarly-named attribute that could be confused
+        with it. `socket.gethostname()` is cheap enough to call fresh on
+        every heartbeat (every poll tick already does far more I/O).
+        """
+        return self.name or socket.gethostname()
+
     def apply_reload(self, config: Config) -> None:
         """Apply a hot-reloaded config's safe fields to this live session.
 
@@ -590,6 +637,7 @@ class _ActiveRuntime:
             )
             self.sort_mode = config.sort
             self.poll_interval = config.poll_interval
+            self.name = config.name
             if config.view_pin is not None and config.view_pin != self.view_pin:
                 self.active_view = config.view_pin
             self.view_pin = config.view_pin
@@ -602,14 +650,31 @@ class _ActiveRuntime:
     # --- fetch + process ---------------------------------------------------
 
     def refresh(self) -> None:
-        """One GET-sessions/state/settings + process + repaint cycle.
+        """One heartbeat + GET-sessions/state/settings + process + repaint cycle.
 
         Raises `AuthError` / `UnreachableError` / `MuxplexError` on failure;
         callers (the poll loop, and a dial-0 commit) handle those.
+
+        `heartbeat()` fires FIRST, on this same existing poll tick and
+        under this same `client_lock` (deck control target design ADR
+        §8.3/§10, risk #6 -- a second HTTP thread against one
+        `httpx.Client` is exactly the concurrency this module avoids).
+        Ordering it ahead of `state(device_id=...)` matters: a device_id
+        the server has never seen 404s at the HTTP boundary (ADR §2.1),
+        so this registers/refreshes this deck's identity before asking
+        the server to resolve anything by that id, on every single tick
+        -- not just the first. `sync_group` is never passed, so this
+        deck's resolved group is always `global`, exactly as before this
+        method existed (ADR §10 Step 1: "everyone stays global").
         """
         with self.client_lock:
+            self.client.heartbeat(
+                device_id=self.device_id,
+                label=self._device_label(),
+                kind=CLIENT_KIND,
+            )
             sessions = self.client.sessions()
-            server_state = self.client.state()
+            server_state = self.client.state(device_id=self.device_id)
             settings = self.client.settings()
         self._process(sessions, server_state, settings)
 
@@ -650,6 +715,11 @@ class _ActiveRuntime:
 
             self.ordered = ordered
             self._note_active_session_locked(server_state.active_session)
+            # Parsed and stored only (ADR §8.1 #10) -- independent of
+            # `view_pin`, since it describes the resolved group's active
+            # session origin, not view state. Acting on it (render
+            # suppression) is Step 5's ship-blocker (§7.2/§9.2).
+            self.active_remote_id = server_state.active_remote_id
             if not pinned:
                 self.active_view = server_state.active_view
             self.pager.set_item_count(len(ordered))
@@ -1019,7 +1089,7 @@ class _ActiveRuntime:
                     self.active_view = view
             else:
                 with self.client_lock:
-                    self.client.set_active_view(view)
+                    self.client.set_active_view(view, device_id=self.device_id)
             self.refresh()
         except MuxplexError:
             logger.exception("failed to commit view switch to %r", view)
@@ -1265,7 +1335,7 @@ class _ActiveRuntime:
         _raise_focus_best_effort(self.client)
         try:
             with self.client_lock:
-                self.client.connect(name)
+                self.client.connect(name, device_id=self.device_id)
         except MuxplexError:
             logger.exception("failed to switch to session %r", name)
             with self.paint_lock, self.deck:
@@ -1456,6 +1526,7 @@ def _run_active(
     hostname: str,
     reporter: StatusReporter,
     watcher: config_mod.ConfigWatcher,
+    device_id: str = "",
 ) -> None:
     """Run one connected-device session against the muxplex server.
 
@@ -1469,6 +1540,13 @@ def _run_active(
     while -- always starts from whatever config.json currently says, not a
     snapshot from an earlier bring-up; it's polled again every tick inside
     the loop below for genuine hot-reload while the connection stays up.
+
+    `device_id` (deck-side "Step 1" identity, ADR §8.3/§8.4/§10) is minted
+    once per process by `main._run` (via `identity.load_device_id`) and
+    passed in here unchanged across reconnects -- a fresh `_ActiveRuntime`
+    is constructed per connection, but the device's identity must not
+    churn just because the deck was unplugged and replugged. Defaults to
+    `""` only for callers (tests) that don't care about identity.
     """
     watcher.poll()
     config = watcher.current
@@ -1490,6 +1568,8 @@ def _run_active(
         config.controls,
         config.poll_interval,
         config.view_pin,
+        device_id,
+        config.name,
     )
     logger.info("%s", layout.describe_plan(ctx.plan))
     _log_plan_diagnostics(ctx.plan)
@@ -1744,6 +1824,18 @@ def _run(config: Config, manager: DeviceManager, config_path: str | None = None)
     logged_waiting = False
     last_heartbeat = 0.0
 
+    # Deck-side "Step 1" identity (deck control target design ADR
+    # §8.3/§8.4/§10): minted once and persisted by `identity.load_device_id`
+    # (colocated with this process's own config.json -- see that module's
+    # docstring), then held for this process's entire lifetime and reused
+    # across every reconnect below, so the deck's identity never churns
+    # just because it was unplugged/replugged or the server was briefly
+    # unreachable (ADR assumption 2: a persisted deck identity is
+    # acceptable; churn is flagged there as a real risk for a future
+    # picker UI).
+    device_id = identity_mod.load_device_id(config_path)
+    logger.info("device_id=%s", device_id)
+
     # Hot reload (see config.py's "Hot reload" section): one watcher for
     # the whole process lifetime, seeded with whatever `config` this
     # process started with. `_run_active` polls it on its existing
@@ -1855,6 +1947,7 @@ def _run(config: Config, manager: DeviceManager, config_path: str | None = None)
                         hostname,
                         reporter,
                         watcher,
+                        device_id,
                     )
             except Exception:
                 logger.exception("Unexpected error during active session; recovering")

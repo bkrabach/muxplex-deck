@@ -280,6 +280,7 @@ class TestApplyReload:
             poll_interval=2.0,
             sort="server",
             view_pin=None,
+            name="",
             controls={"key.11": "view_next"},
         )
 
@@ -304,6 +305,7 @@ class TestApplyReload:
             poll_interval=7.5,
             sort="attention",
             view_pin=None,
+            name="",
             controls={},
         )
 
@@ -330,6 +332,7 @@ class TestApplyReload:
             poll_interval=2.0,
             sort="server",
             view_pin=None,
+            name="",
             controls={},
         )
         ctx.apply_reload(reloaded)
