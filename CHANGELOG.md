@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.16.0 (2026-08-16)
+
+**This sidecar now has its own identity, and can be pointed at a specific
+device instead of always acting on the server's shared state.** First half
+shipped in v0.15.0 (local view pinning); this release adds the other half.
+
+### Added
+
+- **Device identity**: this sidecar mints and persists a `device_id` (UUID)
+  across restarts, sends it on every server call, and heartbeats
+  periodically with a human-readable label (config `name`, falling back to
+  hostname) and `kind: "deck"`. It now shows up in the server's own device
+  registry (`muxplex` v0.50.0+'s "Decks" settings tab / "Follows" dropdown).
+  This is purely additive: nothing about existing behavior changes unless
+  you use the new `target_picker` action below.
+- **`target_picker` action** (opt-in — not bound to any key/dial by default;
+  add it via `muxplex-deck config` like any other control binding): lets
+  this deck follow ("pair to") a specific other device registered with the
+  same server, instead of always following the server's shared state. Two
+  escape hatches are always available too: "Shared" (today's default
+  behavior) and a local-only "Just me" option (a second, independent axis
+  from the existing `view_pin` — one is about which SESSION this deck
+  controls, the other about which VIEW it displays).
+- **Honest failure handling for a paired target**: if the server rejects a
+  pairing attempt (the target is already being followed by someone else,
+  or the target no longer exists), this deck shows a visible, sticky
+  notice rather than silently reverting to "Shared" or retrying forever.
+- **Remote-session safety (ship-blocking fix, not cosmetic)**: if this deck
+  is following a browser tab that is itself viewing a session on a
+  *different* federated server, this deck can no longer mistakenly
+  highlight or connect to a same-named LOCAL session as if it were the
+  remote one. The active-session highlight is suppressed and the strip
+  (on hardware with a touchscreen) shows `> remote (<id>)` instead, so the
+  degraded state is visible rather than silently wrong.
+- **Strip target indicator** (hardware with a touchscreen only — e.g. a
+  Stream Deck+; a plain Stream Deck Original has no touchscreen and simply
+  doesn't render this, confirmed on real hardware): appends `> shared`,
+  `> <label>`, or `> remote (<id>)` to the existing strip headline. ASCII
+  only (`>`, not `→` — the real device's font can't render the arrow).
+
+### Verified
+
+- Full test suite green at every step (973 → 1009 tests across this
+  release's two features), including explicit byte-identical regression
+  tests for every existing behavior.
+- Real hardware sign-off: installed and ran on an actual Stream Deck
+  Original for 30+ seconds of continuous operation against the real
+  production server — zero errors, device identity persisted correctly
+  across a service restart, heartbeat/sessions/state/settings all healthy.
+
 ## v0.15.0 (2026-08-16)
 
 ### Features
