@@ -152,6 +152,7 @@ class FakeClient:
         self._settings = settings
         self.active_session: str | None = None
         self.active_view = "all"
+        self.active_remote_id: str | None = None
         self.connected_names: list[str] = []
         self.view_patches: list[str] = []
         self.connect_event = threading.Event()
@@ -161,6 +162,16 @@ class FakeClient:
         # care about focus keeps working unchanged; tests that do care
         # override `.raise_focus` directly (see test_new_actions.py).
         self.raise_focus_calls = 0
+        # Deck control target design ADR §8.3/§10 ("Step 1"): every
+        # `state()`/`connect()`/`set_active_view()` call's `device_id`
+        # kwarg is recorded (None when omitted) so tests can assert it was
+        # actually passed through, without needing a real server. Every
+        # `heartbeat()` call is recorded in full for the same reason.
+        self.state_device_ids: list[str | None] = []
+        self.connect_device_ids: list[str | None] = []
+        self.view_patch_device_ids: list[str | None] = []
+        self.heartbeat_calls: list[dict[str, object]] = []
+        self.heartbeat_event = threading.Event()
 
     def raise_focus(self) -> None:
         self.raise_focus_calls += 1
@@ -168,16 +179,20 @@ class FakeClient:
     def sessions(self) -> list[Session]:
         return list(self._sessions)
 
-    def state(self) -> ServerState:
+    def state(self, *, device_id: str | None = None) -> ServerState:
+        self.state_device_ids.append(device_id)
         return ServerState(
-            active_session=self.active_session, active_view=self.active_view
+            active_session=self.active_session,
+            active_view=self.active_view,
+            active_remote_id=self.active_remote_id,
         )
 
     def settings(self) -> Settings:
         return self._settings
 
-    def connect(self, name: str) -> None:
+    def connect(self, name: str, *, device_id: str | None = None) -> None:
         self.connected_names.append(name)
+        self.connect_device_ids.append(device_id)
         # Matches real muxplex server behavior: a successful connect updates
         # server-side active_session, so the NEXT poll/refresh reports it --
         # needed for tests that call `ctx.refresh()` after a local connect
@@ -185,10 +200,35 @@ class FakeClient:
         self.active_session = name
         self.connect_event.set()
 
-    def set_active_view(self, view: str) -> None:
+    def set_active_view(self, view: str, *, device_id: str | None = None) -> None:
         self.view_patches.append(view)
+        self.view_patch_device_ids.append(device_id)
         self.active_view = view
         self.view_patch_event.set()
+
+    def heartbeat(
+        self,
+        *,
+        device_id: str,
+        label: str,
+        viewing_session: str | None = None,
+        view_mode: str = "grid",
+        last_interaction_at: float = 0.0,
+        sync_group: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        self.heartbeat_calls.append(
+            {
+                "device_id": device_id,
+                "label": label,
+                "viewing_session": viewing_session,
+                "view_mode": view_mode,
+                "last_interaction_at": last_interaction_at,
+                "sync_group": sync_group,
+                "kind": kind,
+            }
+        )
+        self.heartbeat_event.set()
 
 
 def _make_sessions(count: int) -> list[Session]:

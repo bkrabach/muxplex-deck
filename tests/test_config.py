@@ -187,3 +187,70 @@ class TestViewPinParsing:
         assert "view_pin" in config_mod.DEFAULT_CONFIG
         assert config_mod.DEFAULT_CONFIG["view_pin"] == ""  # sentinel, like ca_file
         assert "view_pin" in config_mod.RELOADABLE_KEYS
+
+
+# ---------------------------------------------------------------------------
+# `name` -- Gate 1 parsing (deck identity/label, deck-side "Step 1")
+# ---------------------------------------------------------------------------
+
+
+class TestNameParsing:
+    def test_absent_name_defaults_to_empty_string(self, tmp_path: Path) -> None:
+        """No `name` key at all -- byte-identical to before the field existed."""
+        path = _write_minimal_config(tmp_path)
+        cfg = load_config(str(path))
+        assert cfg.name == ""
+
+    def test_string_name_is_kept(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"name": "alienware-deck"})
+        cfg = load_config(str(path))
+        assert cfg.name == "alienware-deck"
+
+    def test_empty_string_name_stays_empty(self, tmp_path: Path) -> None:
+        """Unlike `view_pin`, "" is `name`'s own real value (not normalized
+
+        to `None`) -- `main._ActiveRuntime._device_label()` is what resolves
+        "" to the hostname fallback, not `config.py`.
+        """
+        path = _write_minimal_config(tmp_path, {"name": ""})
+        cfg = load_config(str(path))
+        assert cfg.name == ""
+
+    def test_non_string_name_raises_config_error(self, tmp_path: Path) -> None:
+        """Fails closed -- never silently coerces a bad type into a string."""
+        path = _write_minimal_config(tmp_path, {"name": 42})
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(str(path))
+        assert "name" in str(excinfo.value)
+
+    def test_non_string_name_null_raises_config_error(self, tmp_path: Path) -> None:
+        """Unlike `view_pin`/`ca_file`, `name` has no "null means unset"
+
+        convention -- it's always a plain string field, defaulting to "".
+        """
+        path = _write_minimal_config(tmp_path, {"name": None})
+        with pytest.raises(ConfigError):
+            load_config(str(path))
+
+    def test_name_is_in_default_config_and_reloadable(self) -> None:
+        """Full accounting: `name` must be discoverable via `config list`/`config set`
+
+        and hot-reloadable without a restart -- both silent-ignore failure
+        modes this repo has hit before (the `focus_app` incident).
+        """
+        assert "name" in config_mod.DEFAULT_CONFIG
+        assert config_mod.DEFAULT_CONFIG["name"] == ""
+        assert "name" in config_mod.RELOADABLE_KEYS
+
+    def test_name_round_trips_through_raw_config_helpers(self, tmp_path: Path) -> None:
+        """`patch_raw_config`/`save_raw_config` only persist keys present in
+
+        `DEFAULT_CONFIG` -- this is the exact mechanism the `focus_app`
+        incident broke on. Prove `name` actually survives a save/reload
+        round trip through the raw (unvalidated) config helpers the CLI's
+        `config set`/`config get` commands use.
+        """
+        config_path = str(tmp_path / "config.json")
+        config_mod.patch_raw_config({"name": "studio-deck"}, config_path)
+        reloaded = config_mod.load_raw_config(config_path)
+        assert reloaded["name"] == "studio-deck"

@@ -48,6 +48,15 @@ DEFAULT_CONFIG: dict = {
     # byte-identical to pre-existing behavior. See `Config.view_pin`'s
     # docstring; `load_config` normalizes "" to `None`.
     "view_pin": "",
+    # Human-readable device label, sent to the server as `heartbeat()`'s
+    # `label` (deck-side "Step 1" of the deck control target design, ADR
+    # §8.4). "" (default) means "derive from this machine's own hostname" --
+    # resolved at the point of use (`main.py`), not here, matching how
+    # `hostname` is otherwise computed from live state rather than stored.
+    # Must be a real `DEFAULT_CONFIG` key, not merely read from an optional
+    # field -- see the `focus_app` incident above: a key absent from this
+    # dict is silently discarded by `load_raw_config`/`patch_raw_config`.
+    "name": "",
     # address -> action; empty means "all capability-derived defaults" (see
     # `layout.default_bindings`). Defaults are computed, never stored here --
     # a fresh install has no "controls" key at all and sees zero behavior
@@ -118,6 +127,20 @@ class Config:
     ignoring the server's reported `active_view` entirely. See
     `main._ActiveRuntime` (`view_pin`/`active_view`/`_commit_view`) for the
     runtime behavior this drives. Hot-reloadable: see `RELOADABLE_KEYS`.
+    """
+    name: str
+    """Human-readable device label, sent to the server as `heartbeat()`'s
+    `label` field (deck-side "Step 1" of the deck control target design,
+    ADR §8.4).
+
+    `""` (default) means "derive from this machine's own hostname" -- the
+    fallback is resolved at the point of use (see `main._ActiveRuntime`'s
+    device-label helper), not here: this field just holds whatever
+    `config.json` says, exactly like every other raw config value.
+    Hot-reloadable: see `RELOADABLE_KEYS`. This is the *default* label --
+    the server's own `display_name` (a later step) is the override and
+    wins, since renaming a deck shouldn't require SSH-ing to whichever
+    machine it's plugged into.
     """
     controls: dict[str, str]
     """Resolved (address -> action) overrides, Gate-1 validated (grammar +
@@ -307,6 +330,10 @@ def load_config(config_path: str | None = None) -> Config:
         )
     view_pin = view_pin_value or None
 
+    name_value = raw.get("name", "")
+    if not isinstance(name_value, str):
+        raise ConfigError(f"Config field 'name' must be a string, got {name_value!r}")
+
     controls_value = _validate_controls(raw.get("controls", {}))
 
     return Config(
@@ -316,6 +343,7 @@ def load_config(config_path: str | None = None) -> Config:
         poll_interval=float(poll_interval),
         sort=sort,
         view_pin=view_pin,
+        name=name_value,
         controls=controls_value,
     )
 
@@ -405,7 +433,13 @@ def patch_raw_config(patch: dict, config_path: str | None = None) -> dict:
 # local variable in `_run_active`'s wait call) -- verified by inspection,
 # not assumed: none of them are captured into a closure, a constructed
 # client, or any other object that would go stale.
-RELOADABLE_KEYS: tuple[str, ...] = ("controls", "sort", "poll_interval", "view_pin")
+RELOADABLE_KEYS: tuple[str, ...] = (
+    "controls",
+    "sort",
+    "poll_interval",
+    "view_pin",
+    "name",
+)
 
 # (report name as it appears in config.json / `config list`, Config attribute
 # to compare) -- reported when different, but NEVER applied to the running

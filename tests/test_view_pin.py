@@ -215,6 +215,7 @@ class TestApplyReloadViewPin:
             poll_interval=2.0,
             sort="server",
             view_pin=view_pin,
+            name="",
             controls={},
         )
 
