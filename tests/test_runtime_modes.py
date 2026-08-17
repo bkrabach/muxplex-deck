@@ -27,7 +27,9 @@ from typing import cast
 import pytest
 from muxplex_client import (
     Bell,
+    FederationSessions,
     MuxplexClient,
+    RemoteStatus,
     ServerState,
     Session,
     Settings,
@@ -180,6 +182,21 @@ class FakeClient:
         # sets this) sees an empty registry, same as before this field
         # existed.
         self.devices: dict[str, dict[str, object]] = {}
+        # v2 federation-aware deck rendering (design doc §4.5): peer
+        # status entries `federation_sessions()` reports alongside
+        # `self._sessions` (empty tuple by default -- see that method's
+        # own real-server docstring: "if not remote_instances: return ...
+        # local_sessions", i.e. zero status entries when no peers are
+        # configured, exactly this default). A test exercising degraded
+        # peers sets this directly, mirroring how `active_remote_id`
+        # above is a plain settable attribute.
+        self.statuses: tuple[RemoteStatus, ...] = ()
+        # Every `connect()` call's `remote_id` kwarg (`None` when
+        # omitted) -- the federation-aware counterpart to
+        # `connect_device_ids` above, so tests can assert a remote press
+        # actually routed through the federation-proxy kwarg rather than
+        # the local `device_id` one.
+        self.connect_remote_ids: list[str | None] = []
         # When set, the NEXT `heartbeat()` call raises this (recording the
         # call first, then clearing itself so a following call -- e.g. a
         # `refresh()`-internal fallback retry -- succeeds normally). Lets
@@ -194,6 +211,21 @@ class FakeClient:
     def sessions(self) -> list[Session]:
         return list(self._sessions)
 
+    def federation_sessions(self) -> FederationSessions:
+        """`GET /api/federation/sessions` fake -- see `MuxplexClient.federation_sessions`.
+
+        Wraps the SAME `self._sessions` list `sessions()` reads (a test
+        wanting a merged local+remote list just constructs `Session`
+        objects with `remote_id` set and passes them all to
+        `FakeClient(...)` up front -- exactly how the real server merges
+        local + peer entries into one list), plus `self.statuses` (empty
+        by default, matching the real server's own "no configured peers"
+        default -- see that method's docstring).
+        """
+        return FederationSessions(
+            sessions=tuple(self._sessions), statuses=self.statuses
+        )
+
     def state(self, *, device_id: str | None = None) -> ServerState:
         self.state_device_ids.append(device_id)
         return ServerState(
@@ -206,9 +238,16 @@ class FakeClient:
     def settings(self) -> Settings:
         return self._settings
 
-    def connect(self, name: str, *, device_id: str | None = None) -> None:
+    def connect(
+        self,
+        name: str,
+        *,
+        device_id: str | None = None,
+        remote_id: str | None = None,
+    ) -> None:
         self.connected_names.append(name)
         self.connect_device_ids.append(device_id)
+        self.connect_remote_ids.append(remote_id)
         # Matches real muxplex server behavior: a successful connect updates
         # server-side active_session, so the NEXT poll/refresh reports it --
         # needed for tests that call `ctx.refresh()` after a local connect

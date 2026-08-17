@@ -28,7 +28,13 @@ from __future__ import annotations
 
 from typing import cast
 
-from muxplex_client import MuxplexClient, TargetGoneError, TargetNotSelfOwningError
+from muxplex_client import (
+    Bell,
+    MuxplexClient,
+    Session,
+    TargetGoneError,
+    TargetNotSelfOwningError,
+)
 from test_runtime_modes import SETTINGS, FakeClient, FakeDeck, _make_sessions
 
 from muxplex_deck.device import DeckDevice
@@ -168,32 +174,65 @@ class TestBuildStripMessageComposesTarget:
 
 
 # ---------------------------------------------------------------------------
-# §4.5/§7.2 ship-blocker: highlight + strip suppression when active_remote_id
+# §4.5/§7.2 ship-blocker, generalized by v2 federation-aware rendering
+# (design doc §4.5): a same-named LOCAL session must never be painted/
+# treated as active when the resolved group's actual active session is a
+# DIFFERENT (remote) one -- see `_paint_keys`'s own docstring and
+# `active_remote_id`'s docstring on `_ActiveRuntime.__init__` for the full
+# reasoning this class now exercises. Step 5's original fix was a blanket
+# "hide the name/highlight whenever active_remote_id is set"; v2 replaces
+# that with per-entry (name, remote_id) matching, which fixes the SAME
+# hazard while also correctly highlighting/connecting the true remote
+# entry when it's actually present in this deck's own (now
+# federation-aware) session list. `TestRemoteSessionSuppression` below
+# covers the "not present" (still-safe) case; `TestRemoteSessionResolved`
+# covers the new "present, now correctly resolved" case.
 # ---------------------------------------------------------------------------
 
 
 class TestRemoteSessionSuppression:
-    def test_key_highlight_suppressed_when_active_remote_id_set(self) -> None:
+    """The remote entry is NOT present in this deck's own session list this
+    tick (e.g. excluded from the merged federation fetch) -- the safe
+    fallback Step 5 always had: no key highlights as active. Uses plain
+    `_make_sessions()` (all `remote_id=None`), so `self.ordered` here never
+    contains an entry matching `active_remote_id` at all.
+    """
+
+    def test_key_highlight_not_active_when_remote_entry_absent(self) -> None:
         deck = _make_full_deck()
         client = FakeClient(_make_sessions(8), SETTINGS)
         client.active_session = "session-03"
         ctx = _make_runtime(deck, client)
         ctx.refresh()
-        # Sanity: without the hazard, session-03's key IS painted active.
+        # Sanity: without the hazard, session-03's key IS painted active
+        # (active_remote_id is None here, matching its own remote_id=None).
         identity = cast(tuple, ctx.last_key_state[3])
-        assert identity[1] is True  # (name, active, bell, snapshot)
+        assert identity[3] is True  # (name, remote_id, device_name, active, ...)
 
         client.active_remote_id = "remote-uuid"
         ctx.refresh()
 
+        # session-03 is LOCAL (remote_id=None); active_remote_id is now
+        # "remote-uuid" -- the two can never match, so this same key is
+        # correctly no longer active, even though its NAME still matches
+        # ctx.active_session. This is the structural fix, not a lookup.
         identity = cast(tuple, ctx.last_key_state[3])
-        assert identity[1] is False
+        assert identity[3] is False
         # The underlying tracked state is NOT corrupted -- only the paint
-        # is suppressed. toggle_last/previous_session bookkeeping must
+        # doesn't match. toggle_last/previous_session bookkeeping must
         # still see the real value.
         assert ctx.active_session == "session-03"
+        assert ctx.active_remote_id == "remote-uuid"
 
-    def test_strip_active_text_suppressed_when_active_remote_id_set(self) -> None:
+    def test_strip_shows_true_active_name_plus_remote_indicator(self) -> None:
+        """v2 change from the old blanket suppression (see class docstring):
+
+        the strip's "ACTIVE: x" text is no longer forced to "none" --
+        it's read-only display with no connect action behind it, and the
+        real mis-connect hazard is now closed at the matching layer
+        (`_paint_keys`), not by hiding the name. The "> remote (...)"
+        target segment still marks it as non-local.
+        """
         deck = _make_full_deck()
         client = FakeClient(_make_sessions(8), SETTINGS)
         client.active_session = "session-03"
@@ -203,9 +242,55 @@ class TestRemoteSessionSuppression:
 
         strip = ctx.last_strip
         assert strip is not None
-        assert "ACTIVE: none" in strip
-        assert "session-03" not in strip
+        assert "ACTIVE: session-03" in strip
         assert "> remote (remote-uuid)" in strip
+
+
+class TestRemoteSessionResolved:
+    """v2 federation-aware rendering (design doc §4.5): the resolved
+
+    group's active session IS present in this deck's own (now
+    federation-aware) `self.ordered` -- the new case Step 5's original
+    fix could never reach, because its own session list was local-only.
+    """
+
+    def test_matching_remote_entry_is_highlighted_active(self) -> None:
+        bell = Bell(last_fired_at=None, seen_at=None, unseen_count=0)
+        sessions = [
+            # A LOCAL session sharing the exact same name as the remote
+            # one below -- the collision `session_key`/`remote_id` exist
+            # to resolve (see `Session`'s own docstring).
+            Session(name="dotfiles", snapshot="local\n", bell=bell),
+            Session(
+                name="dotfiles",
+                snapshot="remote\n",
+                bell=bell,
+                device_id="d-mbp",
+                device_name="MacBook",
+                remote_id="d-mbp",
+                session_key="d-mbp:dotfiles",
+            ),
+        ]
+        deck = _make_full_deck()
+        client = FakeClient(sessions, SETTINGS)
+        client.active_session = "dotfiles"
+        client.active_remote_id = "d-mbp"
+        ctx = _make_runtime(deck, client)
+        ctx.refresh()
+
+        # Slot 0 (the LOCAL "dotfiles") must NOT be active -- it shares a
+        # name with the true active session but not its remote_id.
+        local_identity = cast(tuple, ctx.last_key_state[0])
+        assert local_identity[3] is False
+        # Slot 1 (the REMOTE "dotfiles", peer "d-mbp") IS the true active
+        # session and is now correctly resolvable/highlighted.
+        remote_identity = cast(tuple, ctx.last_key_state[1])
+        assert remote_identity[3] is True
+
+        strip = ctx.last_strip
+        assert strip is not None
+        assert "ACTIVE: dotfiles" in strip
+        assert "> remote (d-mbp)" in strip
 
     def test_target_picker_blocked_while_remote_degraded(self) -> None:
         deck = _make_full_deck()

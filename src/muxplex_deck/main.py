@@ -64,6 +64,10 @@ from muxplex_client import (
     AuthError,
     MuxplexClient,
     MuxplexError,
+    RemoteError,
+    RemoteNotFoundError,
+    RemoteStatus,
+    RemoteUnreachableError,
     ServerState,
     Session,
     Settings,
@@ -460,6 +464,7 @@ def _build_strip_message(
     active_session: str | None,
     pinned: bool = False,
     target_text: str = "",
+    remote_status_text: str = "",
 ) -> str:
     """Compose the touch-strip headline: view (+ live turn echo) + page + host + status.
 
@@ -475,6 +480,13 @@ def _build_strip_message(
     following a specific target at the same time (deck control target
     design ADR §9.2's own explicit requirement: "make sure the strip can
     show both without becoming unreadable").
+
+    `remote_status_text` (v2 federation-aware rendering, default "" --
+    byte-identical to before this parameter existed): `_remote_status_summary`'s
+    one-line summary of degraded federation peers, appended as the final
+    trailing segment when non-empty -- never silently omitted (this
+    whole design's "sticky and loud" discipline, applied to federation
+    peer health).
     """
     view_part = _truncate_view(view_label)
     if pinned:
@@ -492,7 +504,75 @@ def _build_strip_message(
     parts.append(f"ACTIVE: {active_session or 'none'}")
     if target_text:
         parts.append(target_text)
+    if remote_status_text:
+        parts.append(remote_status_text)
     return " \u00b7 ".join(parts)
+
+
+def _session_origin_label(session: Session) -> str | None:
+    """STATE-band text distinguishing a federation-remote session tile.
+
+    v2 federation-aware rendering (design doc §4.5): `None` for a local
+    session (`remote_id is None`) -- the key's STATE band (see
+    `rendering.render_session_key`) stays empty exactly as before this
+    field existed, so a deck that never talks to a federation peer
+    renders byte-identical session tiles. A remote entry (from
+    `federation_sessions()`'s merged list) shows its origin device's
+    display name, falling back to the raw `remote_id` if the server
+    ever omits `deviceName` for that peer -- never a blank label for a
+    session that IS remote, which would silently reintroduce the exact
+    same-name collision hazard `session_key`/`remote_id` exist to fix
+    (see `Session`'s own docstring).
+    """
+    if session.remote_id is None:
+        return None
+    return session.device_name or session.remote_id
+
+
+def _remote_status_summary(statuses: tuple[RemoteStatus, ...]) -> str:
+    """One-line strip summary of degraded federation peers, or "" if none.
+
+    v2 federation-aware rendering (design doc §4.5): `federation_sessions()`
+    surfaces a peer that contributed NO sessions this poll as a
+    `RemoteStatus` entry (`"unreachable"`/`"auth_failed"`/`"empty"` --
+    see that method's docstring) rather than silently shrinking the
+    merged list. This never crashes the poll loop and never hides the
+    degradation -- ASCII only, matching this strip's existing convention
+    (see `_target_indicator_text`'s docstring on why: the real device's
+    default PIL font has no glyph for many Unicode punctuation marks).
+    """
+    if not statuses:
+        return ""
+    if len(statuses) == 1:
+        status = statuses[0]
+        label = status.device_name or status.device_id or status.remote_id
+        return f"{label}: {status.status}"
+    return f"{len(statuses)} peers degraded"
+
+
+def _remote_statuses_for_status(
+    statuses: tuple[RemoteStatus, ...],
+) -> list[dict[str, str | None]] | None:
+    """JSON-serializable form of `_ActiveRuntime.remote_statuses`, or None if empty.
+
+    Published to `status.json` (`StatusReporter.update(remote_statuses=...)`)
+    so a degraded federation peer stays visible even on a strip-less deck
+    (Original/MK2/XL/Mini) via `muxplex-deck status --json` -- the same
+    "additive, optional field" pattern `_unapplied_for_status`/
+    `_config_reload_status` already establish for this status file.
+    """
+    if not statuses:
+        return None
+    return [
+        {
+            "device_id": s.device_id,
+            "remote_id": s.remote_id,
+            "device_name": s.device_name,
+            "status": s.status,
+            "device_version": s.device_version,
+        }
+        for s in statuses
+    ]
 
 
 def _build_picker_strip_message(
@@ -590,12 +670,72 @@ class _ActiveRuntime:
         self.name = name
 
         # Parsed from `ServerState.active_remote_id` on every `refresh()`
-        # (ADR §8.1 #10). Non-None is Step 5's ship-blocker (§4.5/§7.2):
-        # `_repaint_sessions` suppresses the active-session highlight (and
-        # the "ACTIVE: x" strip text) whenever this is set, and the strip's
-        # target indicator (`_target_indicator_text`) shows "> remote
-        # (...)" in preference to a normal shared/paired reading.
+        # (ADR §8.1 #10). Identifies which federation peer (if any) the
+        # resolved group's `active_session` actually lives on -- `None`
+        # means it's local to whichever server issued `state()`.
+        #
+        # v2 federation-aware deck rendering update (design doc §4.5):
+        # Step 5 originally used non-None here to blank-suppress the
+        # active-session highlight/strip text entirely, because this
+        # deck's OWN session list (`sessions()`, local-only) could never
+        # contain the actually-active remote session -- so matching by
+        # bare name risked highlighting/reconnecting a same-named LOCAL
+        # session by mistake (the real hazard; see that ship-blocker's
+        # design-doc section). Now that `self.ordered` is built from
+        # `federation_sessions()` and DOES carry remote entries (each
+        # uniquely identified by its own `remote_id`), the blanket
+        # suppression is gone: `_paint_keys` instead matches a page
+        # entry active iff BOTH `session.name == self.active_session`
+        # AND `session.remote_id == self.active_remote_id` (see that
+        # method). This generalizes Step 5's fix rather than replacing
+        # it -- a same-named LOCAL entry (`remote_id is None`) can never
+        # satisfy `remote_id == self.active_remote_id` when the latter is
+        # a real peer id, so the original hazard stays structurally
+        # impossible; the difference is that the TRUE remote entry now
+        # highlights correctly when it's present in this deck's own
+        # (federation-aware) list, instead of nothing ever highlighting.
+        # When the true entry ISN'T present this tick (peer excluded
+        # from the merged fetch, unreachable, wrong page, ...), no key
+        # matches -- the safe fallback Step 5 always had. The strip's
+        # "ACTIVE: x" text is no longer forced to "none" either (see
+        # `_repaint_sessions`): it's a read-only value with no connect
+        # action behind it, so hiding the name bought nothing once the
+        # actual mis-connect risk is closed at the matching layer; the
+        # target indicator ("> remote (...)") still marks it as remote.
         self.active_remote_id: str | None = None
+
+        # Federation-aware additions (v2, design doc §4.5): the pressed
+        # slot's actual `Session` objects for the CURRENT page, parallel
+        # to `session_names` below -- `connect_slot`/`_toggle_last` need
+        # more than the bare name to route a press correctly (a remote
+        # session's connect must go through `connect(remote_id=...)`,
+        # never the local endpoint -- see `_do_connect`). Populated in
+        # `_repaint_sessions`, alongside `session_names`.
+        self.page_sessions: list[Session] = []
+
+        # `RemoteStatus` entries from the last `federation_sessions()`
+        # call -- one per federation peer that contributed NO sessions
+        # this poll (unreachable/auth_failed/empty; see that method's
+        # docstring). Never silently dropped: `_process` logs a change
+        # in this set, `_repaint_sessions` appends a summary to the
+        # strip (Stream Deck+ only), and `main._run_active` publishes it
+        # to `status.json` (`_remote_statuses_for_status`) so it's
+        # visible even on a strip-less deck (Original/MK2/XL/Mini) via
+        # `muxplex-deck status --json`. Empty tuple (the default) is
+        # byte-identical to before this field existed -- a server with
+        # no configured federation peers reports zero status entries
+        # (see `federation_sessions()`'s own docstring: "if not
+        # remote_instances: return ... local_sessions" server-side).
+        self.remote_statuses: tuple[RemoteStatus, ...] = ()
+        # Last logged snapshot of `remote_statuses`, so a degraded peer
+        # is logged once per STATE CHANGE (new peer degrades, a peer
+        # recovers, a peer's status kind changes) rather than once per
+        # ~2s poll tick forever -- same "loud once, not spammy forever"
+        # judgment `_FailureEpisode` already applies elsewhere in this
+        # module, just keyed on equality of the whole tuple rather than
+        # a signature string (RemoteStatus is a frozen, comparable
+        # dataclass, so tuple equality is exact and cheap).
+        self._logged_remote_statuses: tuple[RemoteStatus, ...] = ()
 
         # Step 5's target_picker selection (deck control target design ADR
         # §9.2/§10) -- Axis 1, control target: whose group this deck's
@@ -695,6 +835,15 @@ class _ActiveRuntime:
         # `_note_active_session_locked`, both on local key-press connects
         # and on a server-side switch observed through `_process`.
         self.previous_session: str | None = None
+        # Federation-aware companion to `previous_session` (v2, design doc
+        # §4.5): the displaced session's own origin peer id, `None` for
+        # local -- kept as its own field (not folded into a tuple) so
+        # every pre-v2 read of `previous_session` alone keeps compiling.
+        # `toggle_last` uses this pair to route its reconnect correctly
+        # (`_do_connect`) and to look up the right entry in `self.ordered`
+        # by (name, remote_id) instead of by a possibly-ambiguous bare
+        # name -- see `_toggle_last`.
+        self.previous_remote_id: str | None = None
         # Seeded from the pin (if any) so a deck that starts up already
         # pinned filters correctly from frame one, instead of showing
         # "all" until the first `_process()` call catches up.
@@ -830,10 +979,27 @@ class _ActiveRuntime:
                     kind=CLIENT_KIND,
                     sync_group=TARGET_SHARED,
                 )
-            sessions = self.client.sessions()
+            # v2 federation-aware deck rendering (design doc §4.5): the
+            # hot poll-tick GET is now `federation_sessions()`, not the
+            # local-only `sessions()` -- the same aggregated local+remote
+            # merge the PWA already polls (`GET /api/federation/sessions`).
+            # Safe unconditionally, even for a deck whose server has no
+            # federation peers configured at all: that server's own
+            # `federation_sessions()` route returns exactly the local
+            # session list (tagged, `statuses=()`) in that case -- see
+            # this method's docstring in muxplex_client -- so a
+            # never-federated deck sees byte-identical CONTENT, just
+            # routed through one endpoint instead of two. `.statuses`
+            # (peer entries that contributed no sessions this poll) is
+            # handed to `_process` alongside the merged session list --
+            # never silently dropped, per this whole design's "sticky and
+            # loud" discipline (see `remote_statuses`'s own docstring).
+            federation = self.client.federation_sessions()
+            sessions = list(federation.sessions)
+            statuses = federation.statuses
             server_state = self.client.state(device_id=self.device_id)
             settings = self.client.settings()
-        self._process(sessions, server_state, settings)
+        self._process(sessions, server_state, settings, statuses)
 
     def _resolve_heartbeat_sync_group(self) -> str | None:
         """The `sync_group` to send on this heartbeat (Step 5, §6.2.4).
@@ -884,8 +1050,35 @@ class _ActiveRuntime:
         self.target_selection = TARGET_SHARED
         self._target_degrade_notice = f"target unavailable ({reason}) -- back to shared"
 
+    def _log_remote_status_change(self, statuses: tuple[RemoteStatus, ...]) -> None:
+        """Log a change in degraded federation peers, once per change -- not
+
+        once per ~2s poll tick forever. Compares the incoming `statuses`
+        against `_logged_remote_statuses` (the last logged snapshot);
+        `RemoteStatus` is a frozen, comparable dataclass, so tuple
+        equality is exact. Called outside `paint_lock` -- this method
+        does no device I/O and only reads/writes its own dedicated
+        tracking field, never contended with painting.
+        """
+        if statuses == self._logged_remote_statuses:
+            return
+        for status in statuses:
+            logger.warning(
+                "federation peer %s (%s) contributed no sessions this poll: %s",
+                status.device_name or status.device_id,
+                status.remote_id,
+                status.status,
+            )
+        if not statuses and self._logged_remote_statuses:
+            logger.info("all federation peers recovered")
+        self._logged_remote_statuses = statuses
+
     def _process(
-        self, sessions: list[Session], server_state: ServerState, settings: Settings
+        self,
+        sessions: list[Session],
+        server_state: ServerState,
+        settings: Settings,
+        statuses: tuple[RemoteStatus, ...] = (),
     ) -> None:
         """Resolve the current view, sort, and repaint from one poll's results.
 
@@ -897,6 +1090,12 @@ class _ActiveRuntime:
         deck's local selection is authoritative. With no pin (the
         default), behavior is byte-identical to before this field
         existed: everything here tracks `server_state.active_view`.
+
+        `statuses` (v2 federation-aware rendering, default `()` --
+        byte-identical to before this parameter existed): the degraded
+        federation peers reported alongside this tick's merged session
+        list -- see `remote_statuses`'s own docstring for how this is
+        surfaced (log, strip, status.json) rather than silently dropped.
         """
         pinned = self.view_pin is not None
         effective_view = self.active_view if pinned else server_state.active_view
@@ -921,6 +1120,7 @@ class _ActiveRuntime:
 
             self.ordered = ordered
             self.last_server_state_raw = server_state.raw
+            self.remote_statuses = statuses
             # Step 5's "Just me" target selection (Axis 1, control target
             # -- see `target_selection`'s docstring): freeze whatever this
             # deck's active_session/active_remote_id already locally are,
@@ -930,17 +1130,21 @@ class _ActiveRuntime:
             # freezes are independent and either, both, or neither may be
             # active at once.
             if self.target_selection != TARGET_LOCAL:
-                self._note_active_session_locked(server_state.active_session)
-                # Independent of `view_pin`, since it describes the
-                # resolved group's active session origin, not view state.
-                # Suppressing the highlight/strip text when non-None is
-                # Step 5's ship-blocker (§4.5/§7.2/§9.2) -- see
-                # `_repaint_sessions`.
-                self.active_remote_id = server_state.active_remote_id
+                # Both halves of "whose session is this" travel together
+                # through the one helper -- see `_note_active_session_locked`
+                # and `active_remote_id`'s own docstring for why keeping
+                # them paired (rather than assigning `active_remote_id`
+                # separately, as before v2) matters: `previous_session`/
+                # `previous_remote_id` must snapshot the OLD (name,
+                # remote_id) pair atomically, not just the old name.
+                self._note_active_session_locked(
+                    server_state.active_session, server_state.active_remote_id
+                )
             if not pinned:
                 self.active_view = server_state.active_view
             self.pager.set_item_count(len(ordered))
 
+        self._log_remote_status_change(statuses)
         self.repaint()
 
     # --- painting ------------------------------------------------------
@@ -962,17 +1166,21 @@ class _ActiveRuntime:
             slots = self.plan.session_slots
             page_sessions = self.ordered[start:stop][: len(slots)]
             self.session_names = [s.name for s in page_sessions]
+            self.page_sessions = list(page_sessions)
             active_session = self.active_session
-            if self.active_remote_id is not None:
-                # §4.5/§7.2 ship-blocker: this deck's own connect() always
-                # writes to ITS OWN server, never the remote one a
-                # followed browser tab might be viewing via federation --
-                # so the "active" session name/highlight this deck sees
-                # could collide with a same-named LOCAL session. Render as
-                # if nothing is selected (both the key highlight below AND
-                # the "ACTIVE: x" strip text) rather than risk connecting
-                # the wrong machine's session on the next press.
-                active_session = None
+            active_remote_id = self.active_remote_id
+            # v2 federation-aware rendering (design doc §4.5): the old
+            # blanket "force active_session to None whenever
+            # active_remote_id is set" suppression is gone -- see
+            # `active_remote_id`'s own docstring on `__init__` for the
+            # full reasoning. `_paint_keys` now matches per-entry on
+            # BOTH `name` and `remote_id`, which keeps the original
+            # hazard (a same-named LOCAL session looking "active" when
+            # the real active session is remote) structurally
+            # impossible without needing to hide the name here too. The
+            # strip's "ACTIVE: x" text below reflects the true value --
+            # `_target_indicator_text`'s "> remote (...)" segment
+            # already marks it as non-local when relevant.
             turning = self.view_cycler.is_turning()
             view_label = (
                 self.view_cycler.candidate_view() if turning else self.active_view
@@ -983,8 +1191,9 @@ class _ActiveRuntime:
                 active_remote_id=self.active_remote_id,
                 target_label=self._resolve_target_label(self.target_selection),
             )
+            remote_status_text = _remote_status_summary(self.remote_statuses)
             with self.deck:
-                self._paint_keys(page_sessions, active_session)
+                self._paint_keys(page_sessions, active_session, active_remote_id)
                 # Unconditional in both modes: the default FULL-mode plan
                 # has zero non-"session" key bindings, so this loop does
                 # nothing there -- byte-identical to the old REDUCED-only
@@ -1010,6 +1219,7 @@ class _ActiveRuntime:
                             active_session=active_session,
                             pinned=pinned,
                             target_text=target_text,
+                            remote_status_text=remote_status_text,
                         )
                     if message != self.last_strip:
                         rendering.paint_status_strip(self.deck, message)
@@ -1172,29 +1382,55 @@ class _ActiveRuntime:
             self.last_key_state[key_index] = blank_identity
 
     def _paint_keys(
-        self, page_sessions: list[Session], active_session: str | None
+        self,
+        page_sessions: list[Session],
+        active_session: str | None,
+        active_remote_id: str | None = None,
     ) -> None:
         """Paint only the session-slot keys whose rendered content changed.
 
         Iterates the plan's `session_slots` (every key in FULL mode; the
         non-reserved keys in REDUCED mode), mapping slot position -> the
         page's session at that position. `identity` captures every input
-        that affects a key's pixels (name, active flag, bell flag, and the
-        raw snapshot text driving the mini terminal preview) as a plain
-        tuple, compared by equality against the last-painted identity for
-        that slot. A literal hash isn't needed here -- tuple equality is
-        exactly as correct and simpler -- but it serves the same purpose:
-        skip a repaint (and a JPEG encode) for a key whose preview hasn't
-        scrolled since last poll.
+        that affects a key's pixels (name, origin, active flag, bell
+        flag, and the raw snapshot text driving the mini terminal
+        preview) as a plain tuple, compared by equality against the
+        last-painted identity for that slot. A literal hash isn't needed
+        here -- tuple equality is exactly as correct and simpler -- but
+        it serves the same purpose: skip a repaint (and a JPEG encode)
+        for a key whose preview hasn't scrolled since last poll.
+
+        `active_remote_id` (v2 federation-aware rendering, default
+        `None` -- byte-identical to before this parameter existed): a
+        page entry is active iff BOTH its `name` matches `active_session`
+        AND its `remote_id` matches this value -- never name alone. This
+        is what keeps a same-named LOCAL and REMOTE entry (now that both
+        can appear in `self.ordered` at once -- see `Session.session_key`'s
+        docstring) from ever being ambiguous: a local entry's `remote_id`
+        is always `None`, so it can only match when `active_remote_id`
+        is also `None` (the resolved group's active session is itself
+        local); a remote entry only matches the ONE peer that's actually
+        active. See `active_remote_id`'s own docstring on
+        `_ActiveRuntime.__init__` for the full Step 5 interaction
+        reasoning this generalizes.
         """
         for slot, key_index in enumerate(self.plan.session_slots):
             session = page_sessions[slot] if slot < len(page_sessions) else None
-            active = session is not None and session.name == active_session
+            active = (
+                session is not None
+                and session.name == active_session
+                and session.remote_id == active_remote_id
+            )
+            origin_label = (
+                _session_origin_label(session) if session is not None else None
+            )
             identity: object = (
                 None
                 if session is None
                 else (
                     session.name,
+                    session.remote_id,
+                    session.device_name,
                     active,
                     session.bell.needs_attention,
                     session.snapshot,
@@ -1209,7 +1445,9 @@ class _ActiveRuntime:
             else:
                 self.deck.set_key_image(
                     key_index,
-                    rendering.render_session_key(self.deck, session, active=active),
+                    rendering.render_session_key(
+                        self.deck, session, active=active, origin_label=origin_label
+                    ),
                 )
             self.last_key_state[key_index] = identity
 
@@ -1506,21 +1744,43 @@ class _ActiveRuntime:
         (someone switched sessions from the PWA).
         """
         target = self.previous_session
+        target_remote_id = self.previous_remote_id
         if target is None:
             logger.info("%s TOGGLE pressed (no previous session)", label)
             return
         with self.paint_lock:
-            exists = any(s.name == target for s in self.ordered)
+            # Matched by (name, remote_id) pair, not bare name (v2
+            # federation-aware rendering) -- `self.ordered` can now
+            # contain a same-named LOCAL and REMOTE entry at once (the
+            # exact collision hazard `Session.session_key`/`remote_id`
+            # exist to resolve; see that model's own docstring), so a
+            # name-only existence check could find the wrong one and
+            # report "still exists" when the actual previous session
+            # (identified by its remote_id too) is gone.
+            exists = any(
+                s.name == target and s.remote_id == target_remote_id
+                for s in self.ordered
+            )
         if not exists:
             logger.info(
                 "%s TOGGLE pressed -> %r no longer exists, ignoring", label, target
             )
             return
-        logger.info("%s TOGGLE pressed -> connect session %r", label, target)
+        logger.info(
+            "%s TOGGLE pressed -> connect session %r%s",
+            label,
+            target,
+            f" [remote:{target_remote_id}]" if target_remote_id else "",
+        )
         with self.paint_lock:
-            self._note_active_session_locked(target)
+            self._note_active_session_locked(target, target_remote_id)
         self.repaint()
-        threading.Thread(target=self._do_connect, args=(target,), daemon=True).start()
+        threading.Thread(
+            target=self._do_connect,
+            args=(target,),
+            kwargs={"remote_id": target_remote_id},
+            daemon=True,
+        ).start()
 
     def _adjust_brightness(self, delta: int, label: str) -> None:
         """Step `self.brightness` by `delta`, clamped to [floor, 100], and apply it.
@@ -1537,28 +1797,63 @@ class _ActiveRuntime:
         except Exception:
             logger.exception("failed to set brightness to %d%%", self.brightness)
 
-    def _note_active_session_locked(self, new_name: str | None) -> None:
-        """Update `active_session` + `previous_session` together.
+    def _note_active_session_locked(
+        self, new_name: str | None, new_remote_id: str | None = None
+    ) -> None:
+        """Update `active_session`/`active_remote_id` + their `previous_*`
+        counterparts together, as one atomic (name, remote_id) identity.
 
         Caller must hold `paint_lock`. The single home for this pairing so
         `toggle_last` sees every active-session change, whether it came
-        from a local key-press connect (`connect_slot`) or a server-side
-        switch observed by `_process` (someone switched in the PWA).
+        from a local key-press connect (`connect_slot`), a server-side
+        switch observed by `_process` (someone switched in the PWA), or
+        `_toggle_last` itself re-adopting the previous identity.
+
+        `new_remote_id` (v2 federation-aware rendering, default `None` --
+        byte-identical to before this parameter existed for any caller
+        that never passes it): the session's origin peer id, `None` for
+        local. The OLD identity is only snapshotted into `previous_session`/
+        `previous_remote_id` when the (name, remote_id) PAIR actually
+        changes -- not just the name -- so a same-named session that
+        moves from local to a different federation peer (or vice versa)
+        is correctly treated as a genuine session change, not a no-op.
+        This is a strict generalization of the pre-v2 rule (`new_name !=
+        self.active_session`): when `new_remote_id`/`self.active_remote_id`
+        are always `None` (a deck that never touches federation), the pair
+        comparison reduces to exactly the old name-only comparison.
         """
-        if new_name != self.active_session and self.active_session is not None:
+        old_identity = (self.active_session, self.active_remote_id)
+        new_identity = (new_name, new_remote_id)
+        if new_identity != old_identity and self.active_session is not None:
             self.previous_session = self.active_session
+            self.previous_remote_id = self.active_remote_id
         self.active_session = new_name
+        self.active_remote_id = new_remote_id
 
     def connect_slot(self, slot: int, label: str) -> None:
-        """Connect the session shown in `slot` (pressed via `label`, e.g. "key[3]")."""
+        """Connect the session shown in `slot` (pressed via `label`, e.g. "key[3]").
+
+        v2 federation-aware rendering (design doc §4.5): resolves the
+        pressed slot to its full `Session` (via `page_sessions`, not just
+        its display name), so a remote entry's press routes through
+        `_do_connect`'s `remote_id`-aware connect rather than always
+        hitting the local endpoint -- see `_paint_keys`/`page_sessions`
+        for how the slot -> `Session` mapping is kept in lockstep with
+        what's actually painted.
+        """
         with self.paint_lock:
             names = list(self.session_names)
-        if slot >= len(names):
+            sessions = list(self.page_sessions)
+        if slot >= len(names) or slot >= len(sessions):
             logger.info("%s pressed (empty slot, ignoring)", label)
             return
         name = names[slot]
+        session = sessions[slot]
         logger.info(
-            "%s pressed -> connect session %r (optimistic highlight)", label, name
+            "%s pressed -> connect session %r (optimistic highlight)%s",
+            label,
+            name,
+            f" [remote:{session.remote_id}]" if session.remote_id else "",
         )
         # Move the highlight NOW (don't wait for the next poll tick) and run
         # the actual HTTP connect on a background thread -- real-hardware
@@ -1567,11 +1862,16 @@ class _ActiveRuntime:
         # input and delayed the highlight by up to a full poll interval. The
         # PWA already does this optimistically; this mirrors it.
         with self.paint_lock:
-            self._note_active_session_locked(name)
+            self._note_active_session_locked(name, session.remote_id)
         self.repaint()
-        threading.Thread(target=self._do_connect, args=(name,), daemon=True).start()
+        threading.Thread(
+            target=self._do_connect,
+            args=(name,),
+            kwargs={"remote_id": session.remote_id},
+            daemon=True,
+        ).start()
 
-    def _do_connect(self, name: str) -> None:
+    def _do_connect(self, name: str, *, remote_id: str | None = None) -> None:
         """Background-thread body for a key-press connect (see `connect`).
 
         On failure, logs loudly and shows it on the strip -- but does not
@@ -1596,11 +1896,48 @@ class _ActiveRuntime:
         unchanged: the server already short-circuits a same-session
         connect (no ttyd kill/respawn, ~2ms) rather than this method
         needing to skip it.
+
+        `remote_id` (v2 federation-aware rendering, default `None` --
+        byte-identical to before this parameter existed): when set,
+        routes through `MuxplexClient.connect`'s `remote_id` kwarg (the
+        federation connect-proxy, `POST /api/federation/{remote_id}/
+        connect/{name}`) instead of the local endpoint -- this is the
+        actual fix for the hazard Step 5's suppression used to defend
+        against: a caller (`connect_slot`/`_toggle_last`) that resolved
+        `remote_id` from the pressed/previous `Session` itself, so this
+        method never has to guess whether `name` is local or remote.
+        `device_id`/`remote_id` are mutually exclusive on the real client
+        (raises `ValueError` if both given) -- passing at most one here
+        (never both) is what keeps that contract satisfied.
         """
         _raise_focus_best_effort(self.client)
         try:
             with self.client_lock:
-                self.client.connect(name, device_id=self.device_id)
+                if remote_id is not None:
+                    self.client.connect(name, remote_id=remote_id)
+                else:
+                    self.client.connect(name, device_id=self.device_id)
+        except (RemoteNotFoundError, RemoteUnreachableError, RemoteError) as exc:
+            # Federation connect-proxy failures (design doc §4.5): distinct
+            # from a plain local-connect failure below, since the failure
+            # describes the PROXY hop (this server reaching the peer on
+            # our behalf), not a property of `name` itself -- see
+            # `MuxplexClient.connect`'s own docstring on `_connect_remote`.
+            reason = {
+                RemoteNotFoundError: "peer not configured",
+                RemoteUnreachableError: "peer unreachable",
+                RemoteError: "peer error",
+            }[type(exc)]
+            logger.exception(
+                "failed to switch to remote session %r via peer %r (%s)",
+                name,
+                remote_id,
+                reason,
+            )
+            with self.paint_lock, self.deck:
+                message = f"remote switch failed: {name} ({reason})"
+                rendering.paint_status_strip(self.deck, message)
+                self.last_strip = message
         except MuxplexError:
             logger.exception("failed to switch to session %r", name)
             with self.paint_lock, self.deck:
@@ -2042,6 +2379,7 @@ def _run_active(
                 active_session=ctx.active_session,
                 active_view=ctx.active_view,
                 page=ctx.pager.page,
+                remote_statuses=_remote_statuses_for_status(ctx.remote_statuses),
             )
 
             # Hot reload (§ config.py "Hot reload"): cheap on this existing
