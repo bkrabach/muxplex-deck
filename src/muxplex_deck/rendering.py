@@ -343,7 +343,13 @@ def _preview_lines(snapshot: str, max_lines: int, max_columns: int) -> list[str]
     return [line[:max_columns] for line in tail]
 
 
-def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> bytes:
+def render_session_key(
+    deck: DeckDevice,
+    session: Session,
+    *,
+    active: bool,
+    origin_label: str | None = None,
+) -> bytes:
     """Render one key: mini terminal preview, NAME band, active/attention state.
 
     Layering (bottom to top): near-black background -> preview text,
@@ -354,6 +360,16 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
     string lives in -- the key *is* that session, the name is what you
     hunt for, and the preview beneath is TEXTURE (see
     docs/KEY_DESIGN_SYSTEM.md §6.1).
+
+    `origin_label` (v2 federation-aware deck rendering, default `None` --
+    byte-identical to before this parameter existed): when given, drawn
+    in the STATE band -- reserved but previously always empty on this
+    face (see `_zone_geometry`/`main._session_origin_label`) -- at
+    SECONDARY size/ink, the same treatment `render_control_key` already
+    gives its own STATE text. This is the ONLY visual difference a
+    federation-remote session tile gets: the NAME band still shows the
+    plain session name unchanged, so truncation/fit behavior for every
+    existing (local) session is untouched.
     """
     image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_SESSION)
     draw = ImageDraw.Draw(image)
@@ -408,6 +424,25 @@ def render_session_key(deck: DeckDevice, session: Session, *, active: bool) -> b
         band_top=geo.name_top,
         band_height=geo.name_height,
     )
+
+    if origin_label:
+        # STATE band: reserved but always empty on this face before v2 --
+        # see this function's own docstring. SECONDARY size/ink, same
+        # treatment `render_control_key` gives its own STATE text; drawn
+        # on the flattened RGB image (not the RGBA overlay above), same
+        # as every other band on this face except NAME.
+        state_font = ImageFont.load_default(size=_secondary_size(size))
+        state_text = _fit_label(draw, origin_label, state_font, geo.content_width)
+        _draw_band_text(
+            draw,
+            state_text,
+            state_font,
+            _INK_SECONDARY,
+            content_left=geo.content_left,
+            content_width=geo.content_width,
+            band_top=geo.state_top,
+            band_height=geo.state_height,
+        )
 
     if active:
         # The other split state channel: a ring at the face edge, costing

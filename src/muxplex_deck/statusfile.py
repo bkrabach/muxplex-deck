@@ -110,6 +110,7 @@ def build_status(
     hint: str | None = None,
     unapplied: list[dict[str, str]] | None = None,
     config_reload: dict[str, Any] | None = None,
+    remote_statuses: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the status dict written to disk. Pure -- no I/O, easy to test.
 
@@ -141,6 +142,14 @@ def build_status(
     `controls set`/`unset`/`reset` compare their own write's mtime against
     `config_mtime` to report whether a running sidecar applied it (see
     `cli._wait_for_config_pickup`).
+
+    `remote_statuses` (optional, additive -- v2 federation-aware deck
+    rendering, design doc §4.5) is `main._remote_statuses_for_status`'s
+    JSON form of the last poll's degraded federation peers
+    (unreachable/auth_failed/empty -- see `RemoteStatus`'s own
+    docstring), published so a degraded peer stays visible via
+    `muxplex-deck status --json` even on a strip-less deck
+    (Original/MK2/XL/Mini) that has no other surface to show it on.
     """
     device: dict[str, Any] = {"connected": device_connected}
     if device_connected and device_caps is not None:
@@ -169,6 +178,8 @@ def build_status(
     }
     if config_reload is not None:
         status["config_reload"] = config_reload
+    if remote_statuses:
+        status["remote_statuses"] = remote_statuses
     return status
 
 
@@ -237,6 +248,7 @@ class StatusReporter:
             "hint": None,
             "unapplied": None,
             "config_reload": None,
+            "remote_statuses": None,
         }
 
     def update(self, **fields: Any) -> None:

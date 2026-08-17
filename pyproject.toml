@@ -11,7 +11,12 @@ dependencies = [
     "streamdeck>=0.9.5",
     "pillow>=10.0.0",
     "httpx>=0.27.0",
-    "muxplex-client>=0.50.0",
+    # federation_sessions()/Session.remote_id+device_id+device_name+
+    # device_version+session_key/connect(remote_id=...)/RemoteNotFoundError/
+    # RemoteError/RemoteUnreachableError -- real PyPI release, verified by
+    # downloading the actual published wheel (v0.54.0 already had it;
+    # v0.55.0 confirmed too). No [tool.uv.sources] override needed anymore.
+    "muxplex-client>=0.54.0",
 ]
 
 [project.scripts]
