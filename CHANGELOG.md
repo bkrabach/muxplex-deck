@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.17.0 (2026-08-16)
+
+**The deck now sees and can connect to sessions across the whole federation,
+matching the aggregated view the browser PWA already has.** Until now, this
+sidecar was limited to sessions on its configured `server_url` only — a
+single-server view. A federated muxplex deployment meant the deck could not
+see or control sessions running on peer servers, even though the web
+interface showed all of them. This release completes the deck's federation
+awareness by polling the server's aggregated federation endpoint instead of
+the local-only list, rendering remote sessions with their origin device
+labeled, and routing connect requests through the federation proxy for
+cross-server sessions.
+
+### Added
+
+- **Federation-aware session polling**: `_ActiveRuntime.refresh()` now calls
+  `client.federation_sessions()` instead of the local-only `sessions()` —
+  this merges the local session list with sessions from all configured peer
+  servers in a single call. For a server with no federation peers
+  configured, this returns exactly the local list (verified against the real
+  server implementation); decks attached to single-server deployments see
+  zero change in behavior, rendering byte-identical session tiles exactly as
+  before.
+
+- **Remote session visual identification**: A session originating from a
+  federated peer carries an origin label in its STATE band (the display name
+  of the device it came from, falling back to the raw `remote_id` if the
+  server omits `device_name`). Local sessions keep their STATE band empty, so
+  a deck with no federation awareness continues rendering pixel-identical
+  tiles. Same-named sessions on the local server and a peer server key
+  distinctly via `session_key` and `remote_id`, never conflated.
+
+- **Remote-session connect routing**: Pressing a key on a federated session
+  routes the connect request through the server's federation proxy (via
+  `connect(remote_id=...)`) instead of trying to connect directly. The deck
+  automatically selects the right mechanism based on whether the session is
+  local (route via `device_id`) or remote (route via `remote_id`).
+  Toggle-last correctly reconnects to whichever session (local or remote) was
+  active before.
+
+- **Peer degradation visibility**: When a federation peer becomes
+  unreachable, auth-fails, or returns an empty session list, the deck now
+  records that `RemoteStatus` (unreachable/auth_failed/empty) and displays it
+  on the strip (on hardware with a touchscreen only — e.g. Stream Deck+) as a
+  summary: either the peer's device name + status, or a count if multiple
+  peers are degraded. The summary clears automatically when the peer
+  recovers. Servers with no federation peers see no change.
+
+### Verified
+
+- **Unit test coverage**: 17 new tests in `tests/test_federation_sessions.py`
+  covering byte-identical behavior with no federation peers, merged
+  local+remote lists, same-named session distinction, remote tile labeling,
+  connect routing, degradation visibility, and toggle-last behavior. All 17
+  tests pass.
+
+- **Protocol-level end-to-end proof (already shipped)**: The client library's
+  `federation_sessions()`, `Session.remote_id`, `Session.device_name`, and
+  `connect(remote_id=...)` were verified in a real two-server test (two
+  actual `muxplex serve` processes, a real session created on one, fetched
+  via federation from the other, connected through the proxy, the real ttyd
+  process spawned). This shipped in `muxplex` v0.54.0 and confirmed again in
+  v0.55.0. This repository's own federation-aware poll/render/connect logic
+  runs against `FakeClient` instances built to match those wire shapes
+  exactly.
+
+- **Service startup verification**: The updated code runs cleanly on real
+  hardware (MacBook Pro) — service starts with zero errors, `device_id`
+  persists across restart, heartbeat/sessions/state/settings are all healthy.
+
+- **Physical hardware sign-off: still pending.** The owner's Stream Deck was
+  not connected during this session's testing (transient, unrelated to
+  software — the device is physically available and was working as recently
+  as the prior release). The deck code has been thoroughly tested against
+  realistic fixtures; actual key-press confirmation on real hardware
+  (federated session highlight and connect) is still waiting for the owner's
+  own hands-on check once their Stream Deck is reconnected. This is stated
+  plainly rather than claimed to be complete.
+
+### Dependencies
+
+- `muxplex-client >= 0.54.0` — floor raised from 0.50.0. 0.54.0 is the first
+  published release carrying `federation_sessions()`, verified against the
+  actual published wheels rather than inferred: the symbol is defined zero
+  times in 0.52.0 and 0.53.0, and once each in 0.54.0's `sync_client.py` and
+  `async_client.py`. v0.55.0 confirmed working too. (This repo has shipped a
+  wrong dependency floor twice before — see `AGENTS.md` — so the floor is
+  checked against the dependency's own published artifacts every release.)
+
+### License & Attribution
+
+Built with [Amplifier](https://github.com/microsoft/amplifier)
+
 ## v0.16.0 (2026-08-16)
 
 **This sidecar now has its own identity, and can be pointed at a specific
