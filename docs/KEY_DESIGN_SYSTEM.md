@@ -150,6 +150,22 @@ hardware-verified 21-column Deck+ preview.
 Because PRIMARY scales with `S`, the **character budget is face-size-independent:
 ~7 characters at every deck size.** Truncation rules need no per-deck tuning.
 
+### User-controllable readability: `font_scale`
+
+The physical deck has no on-device UI (no settings panel a user can tap through,
+unlike the web/soft decks) -- so its one readability knob is a local config key,
+`font_scale` (`config.json`, float, default `1.0`, valid range `[0.5, 2.0]`,
+hot-reloadable). It multiplies PRIMARY and SECONDARY (`_primary_size`/
+`_secondary_size`'s `font_scale` parameter) and the touch-strip status font
+(`_STRIP_FONT_SIZE`), each clamped to a minimum of 1px. `1.0` reproduces today's
+rendering exactly, byte-for-byte.
+
+**TEXTURE is deliberately excluded.** Per this section's own rule above, TEXTURE's
+value is column count, not apparent size -- scaling it with `font_scale` would
+shrink the hardware-verified 21-column Deck+ preview crop exactly the way scaling
+it with `S` would. `font_scale` never reaches `_TEXTURE_SIZE` or the preview's
+geometry (`_preview_geometry`); only the three readable-text sizes above.
+
 ---
 
 ## 3. The state-vs-content collision

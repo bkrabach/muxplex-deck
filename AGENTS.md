@@ -158,6 +158,8 @@ product. See `README.md` for setup, config, and verification checklists.
 - `~/.config/muxplex-deck/config.json` (`--config` / `MUXPLEX_DECK_CONFIG`
   override): `server_url`, `key_file` (federation Bearer key), optional
   `ca_file`, `poll_interval`, `sort` (`"attention"` default | `"server"`),
+  `font_scale` (`1.0` default, `[0.5, 2.0]` -- multiplies PRIMARY/SECONDARY/
+  strip fonts, never the TEXTURE preview; see docs/KEY_DESIGN_SYSTEM.md),
   `focus_app` (macOS PWA foregrounding on key-press switches).
 - Python httpx does NOT use macOS Keychain trust — if the server cert is
   from muxplex's local CA, `ca_file` must point at it. Never disable

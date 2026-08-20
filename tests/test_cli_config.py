@@ -155,6 +155,7 @@ class TestConfigSetRoundTrip:
             ("sort", "server", "server"),
             ("view_pin", "focus", "focus"),
             ("name", "studio-deck", "studio-deck"),
+            ("font_scale", "1.5", 1.5),
         ],
     )
     def test_every_shipped_key_round_trips_exactly(
@@ -185,6 +186,7 @@ class TestConfigSetRoundTrip:
             "sort",
             "view_pin",
             "name",
+            "font_scale",
         }
         # "controls" is deliberately excluded from the scalar round-trip
         # above -- it's a dict, refused by `config set` entirely (see

@@ -332,6 +332,7 @@ def _make_config(tmp_path: Path) -> Config:
         view_pin=None,
         name="",
         controls={},
+        font_scale=1.0,
     )
 
 

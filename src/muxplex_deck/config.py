@@ -31,6 +31,9 @@ DEFAULT_KEY_FILE = "~/.config/muxplex-deck/federation_key"
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_SORT_MODE = "attention"
 VALID_SORT_MODES = ("attention", "server")
+DEFAULT_FONT_SCALE = 1.0
+MIN_FONT_SCALE = 0.5
+MAX_FONT_SCALE = 2.0
 
 # The full set of keys `config.json` supports, with their default values --
 # drives the `muxplex-deck config` CLI group (list/get/set/reset) the same
@@ -62,6 +65,20 @@ DEFAULT_CONFIG: dict = {
     # a fresh install has no "controls" key at all and sees zero behavior
     # change. See docs/CONTROL_MAPPING_DESIGN.md.
     "controls": {},
+    # Multiplies the PRIMARY/SECONDARY key-face type sizes and the
+    # strip-status font -- a user-controllable readability knob for the
+    # physical deck, which (unlike the web/soft decks) has no on-device UI
+    # to host a settings panel. 1.0 (default) is byte-identical to
+    # pre-existing rendering -- see `rendering._primary_size`/
+    # `_secondary_size`'s `font_scale` parameter. Deliberately does NOT
+    # touch `_TEXTURE_SIZE` (the mini-terminal preview): per
+    # docs/KEY_DESIGN_SYSTEM.md §2, that value is column-count texture,
+    # not apparent size, and scaling it would regress the
+    # hardware-verified 21-column Deck+ preview crop. Must be a real
+    # `DEFAULT_CONFIG` key, not merely read from an optional field -- see
+    # the `focus_app` incident above: a key absent from this dict is
+    # silently discarded by `load_raw_config`/`patch_raw_config`.
+    "font_scale": DEFAULT_FONT_SCALE,
 }
 
 
@@ -150,6 +167,22 @@ class Config:
     config-load time there may be no deck plugged in at all. Empty dict
     means "use the capability-derived defaults for whatever deck connects".
     See docs/CONTROL_MAPPING_DESIGN.md.
+    """
+    font_scale: float
+    """Multiplier applied to the PRIMARY/SECONDARY key-face type sizes and
+
+    the touch-strip status font (`rendering._primary_size`/
+    `_secondary_size`'s `font_scale` parameter, and
+    `rendering.render_status_strip`'s strip font). `1.0` (default) produces
+    byte-identical rendering to before this field existed. Valid range
+    `[0.5, 2.0]` -- validated here (Gate 1), never at the rendering layer,
+    so a bad hand-edit fails loud at load/reload time rather than silently
+    clamping. Deliberately does NOT affect `_TEXTURE_SIZE` (the mini-
+    terminal preview) -- see docs/KEY_DESIGN_SYSTEM.md §2: that value is
+    column-count texture, not apparent size, and scaling it would shrink
+    the hardware-verified 21-column Deck+ preview crop. Hot-reloadable:
+    see `RELOADABLE_KEYS` -- pure rendering input, applied on the very
+    next repaint with no restart needed.
     """
 
 
@@ -336,6 +369,17 @@ def load_config(config_path: str | None = None) -> Config:
 
     controls_value = _validate_controls(raw.get("controls", {}))
 
+    font_scale = raw.get("font_scale", DEFAULT_FONT_SCALE)
+    if (
+        not isinstance(font_scale, int | float)
+        or isinstance(font_scale, bool)
+        or not (MIN_FONT_SCALE <= font_scale <= MAX_FONT_SCALE)
+    ):
+        raise ConfigError(
+            f"Config field 'font_scale' must be a number in "
+            f"[{MIN_FONT_SCALE}, {MAX_FONT_SCALE}], got {font_scale!r}"
+        )
+
     return Config(
         server_url=server_url.rstrip("/"),
         federation_key=federation_key,
@@ -345,6 +389,7 @@ def load_config(config_path: str | None = None) -> Config:
         view_pin=view_pin,
         name=name_value,
         controls=controls_value,
+        font_scale=float(font_scale),
     )
 
 
@@ -439,6 +484,7 @@ RELOADABLE_KEYS: tuple[str, ...] = (
     "poll_interval",
     "view_pin",
     "name",
+    "font_scale",
 )
 
 # (report name as it appears in config.json / `config list`, Config attribute

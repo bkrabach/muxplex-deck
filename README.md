@@ -385,7 +385,8 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   "server_url": "https://<your-server>:8088",
   "key_file": "~/.config/muxplex-deck/federation_key",
   "poll_interval": 2.0,
-  "sort": "attention"
+  "sort": "attention",
+  "font_scale": 1.0
 }
 ```
 
@@ -409,6 +410,13 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
 - `controls` (optional, default `{}`) -- per-control action overrides; see
   "Control mappings" below. Not settable via `config set` -- use
   `muxplex-deck controls set` instead.
+- `font_scale` (optional, default `1.0`, valid range `0.5`-`2.0`) -- multiplies
+  the readable key-face text (session/control/picker labels) and the touch
+  strip's status font. The physical deck has no settings UI of its own, so
+  this is its one readability knob -- hot-reloadable, no restart needed.
+  Deliberately does **not** scale the mini-terminal preview: that texture's
+  size is column count, not apparent size (see
+  docs/KEY_DESIGN_SYSTEM.md's font_scale note).
 
 ### Control mappings
 

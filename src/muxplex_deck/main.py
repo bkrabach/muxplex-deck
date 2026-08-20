@@ -593,20 +593,31 @@ def _build_picker_strip_message(
     return " \u00b7 ".join(parts)
 
 
-def _paint_status_only(deck: DeckDevice, message: str, plan: layout.LayoutPlan) -> None:
+def _paint_status_only(
+    deck: DeckDevice,
+    message: str,
+    plan: layout.LayoutPlan,
+    *,
+    font_scale: float = 1.0,
+) -> None:
     """Blank the keys and show `message` wherever this deck can show status.
 
     Decks with a touch strip get the message there (pre-existing behavior);
     strip-less decks get it word-wrapped onto the VIEW key's position (or
     key 0 on a degenerate grid) -- the log always carries the full detail.
+    `font_scale` (default 1.0, byte-identical to before this parameter
+    existed) is `Config.font_scale`/`_ActiveRuntime.font_scale`.
     """
     with deck:
         rendering.paint_blank_keys(deck)
         if plan.use_strip:
-            rendering.paint_status_strip(deck, message)
+            rendering.paint_status_strip(deck, message, font_scale=font_scale)
         else:
             status_key = plan.view_key if plan.view_key is not None else 0
-            deck.set_key_image(status_key, rendering.render_status_key(deck, message))
+            deck.set_key_image(
+                status_key,
+                rendering.render_status_key(deck, message, font_scale=font_scale),
+            )
 
 
 def _raise_focus_best_effort(client: MuxplexClient) -> None:
@@ -651,6 +662,7 @@ class _ActiveRuntime:
         view_pin: str | None = None,
         device_id: str = "",
         name: str = "",
+        font_scale: float = 1.0,
     ) -> None:
         self.deck = deck
         self.client = client
@@ -668,6 +680,15 @@ class _ActiveRuntime:
         # heartbeat `label` this resolves to.
         self.device_id = device_id
         self.name = name
+
+        # Multiplies PRIMARY/SECONDARY key-face fonts and the strip-status
+        # font (`Config.font_scale`) -- read fresh by every `rendering.render_*`
+        # call this class makes (see `_paint_keys`/`_paint_control_keys`/
+        # `_paint_picker_keys`/`_paint_reduced_picker`/`_repaint_sessions`/
+        # `_repaint_picker`). Plain attribute, not captured into a closure,
+        # so `apply_reload` can change it and the very next repaint honors
+        # the new value -- same pattern as `poll_interval` above.
+        self.font_scale = font_scale
 
         # Parsed from `ServerState.active_remote_id` on every `refresh()`
         # (ADR §8.1 #10). Identifies which federation peer (if any) the
@@ -921,6 +942,7 @@ class _ActiveRuntime:
             self.sort_mode = config.sort
             self.poll_interval = config.poll_interval
             self.name = config.name
+            self.font_scale = config.font_scale
             if config.view_pin is not None and config.view_pin != self.view_pin:
                 self.active_view = config.view_pin
             self.view_pin = config.view_pin
@@ -1222,7 +1244,9 @@ class _ActiveRuntime:
                             remote_status_text=remote_status_text,
                         )
                     if message != self.last_strip:
-                        rendering.paint_status_strip(self.deck, message)
+                        rendering.paint_status_strip(
+                            self.deck, message, font_scale=self.font_scale
+                        )
                         self.last_strip = message
 
     def _repaint_picker(self, mode: PickerMode) -> None:
@@ -1281,7 +1305,9 @@ class _ActiveRuntime:
                 else:
                     self._paint_picker_keys(window, current)
                 if self.plan.use_strip and message != self.last_strip:
-                    rendering.paint_status_strip(self.deck, message)
+                    rendering.paint_status_strip(
+                        self.deck, message, font_scale=self.font_scale
+                    )
                     self.last_strip = message
 
     def _paint_picker_keys(self, options: list[str], current: str) -> None:
@@ -1302,7 +1328,12 @@ class _ActiveRuntime:
             else:
                 self.deck.set_key_image(
                     index,
-                    rendering.render_picker_key(self.deck, label, current=is_current),
+                    rendering.render_picker_key(
+                        self.deck,
+                        label,
+                        current=is_current,
+                        font_scale=self.font_scale,
+                    ),
                 )
             self.last_key_state[index] = identity
 
@@ -1339,7 +1370,12 @@ class _ActiveRuntime:
             else:
                 self.deck.set_key_image(
                     key_index,
-                    rendering.render_picker_key(self.deck, label, current=is_current),
+                    rendering.render_picker_key(
+                        self.deck,
+                        label,
+                        current=is_current,
+                        font_scale=self.font_scale,
+                    ),
                 )
             self.last_key_state[key_index] = identity
 
@@ -1361,7 +1397,11 @@ class _ActiveRuntime:
             self.deck.set_key_image(
                 key_index,
                 rendering.render_control_key(
-                    self.deck, name=name, body=body, state=state
+                    self.deck,
+                    name=name,
+                    body=body,
+                    state=state,
+                    font_scale=self.font_scale,
                 ),
             )
             self.last_key_state[key_index] = control_identity
@@ -1446,7 +1486,11 @@ class _ActiveRuntime:
                 self.deck.set_key_image(
                     key_index,
                     rendering.render_session_key(
-                        self.deck, session, active=active, origin_label=origin_label
+                        self.deck,
+                        session,
+                        active=active,
+                        origin_label=origin_label,
+                        font_scale=self.font_scale,
                     ),
                 )
             self.last_key_state[key_index] = identity
@@ -1506,7 +1550,11 @@ class _ActiveRuntime:
             self.deck.set_key_image(
                 key_index,
                 rendering.render_control_key(
-                    self.deck, name=name, body=body, state=state
+                    self.deck,
+                    name=name,
+                    body=body,
+                    state=state,
+                    font_scale=self.font_scale,
                 ),
             )
             self.last_key_state[key_index] = identity
@@ -1579,7 +1627,9 @@ class _ActiveRuntime:
             logger.exception("failed to commit view switch to %r", view)
             message = f"view switch failed: {view}"
             with self.paint_lock, self.deck:
-                rendering.paint_status_strip(self.deck, message)
+                rendering.paint_status_strip(
+                    self.deck, message, font_scale=self.font_scale
+                )
                 self.last_strip = message
 
     def handle_dial_push(self, dial: int, action: str) -> None:
@@ -1936,13 +1986,17 @@ class _ActiveRuntime:
             )
             with self.paint_lock, self.deck:
                 message = f"remote switch failed: {name} ({reason})"
-                rendering.paint_status_strip(self.deck, message)
+                rendering.paint_status_strip(
+                    self.deck, message, font_scale=self.font_scale
+                )
                 self.last_strip = message
         except MuxplexError:
             logger.exception("failed to switch to session %r", name)
             with self.paint_lock, self.deck:
                 message = f"switch failed: {name}"
-                rendering.paint_status_strip(self.deck, message)
+                rendering.paint_status_strip(
+                    self.deck, message, font_scale=self.font_scale
+                )
                 self.last_strip = message
 
     def _select_view_option(self, key: int) -> None:
@@ -2125,7 +2179,9 @@ class _ActiveRuntime:
             logger.exception("failed to commit target switch to %r", value)
             message = f"target switch failed: {value}"
             with self.paint_lock, self.deck:
-                rendering.paint_status_strip(self.deck, message)
+                rendering.paint_status_strip(
+                    self.deck, message, font_scale=self.font_scale
+                )
                 self.last_strip = message
 
 
@@ -2290,10 +2346,13 @@ def _run_active(
         config.view_pin,
         device_id,
         config.name,
+        config.font_scale,
     )
     logger.info("%s", layout.describe_plan(ctx.plan))
     _log_plan_diagnostics(ctx.plan)
-    _paint_status_only(deck, "connecting to muxplex...", ctx.plan)
+    _paint_status_only(
+        deck, "connecting to muxplex...", ctx.plan, font_scale=ctx.font_scale
+    )
 
     reporter.update(
         device_connected=True,
@@ -2335,7 +2394,12 @@ def _run_active(
                     "muxplex auth rejected -- check the federation key file: %s", exc
                 )
                 if shown_error_state != "auth":
-                    _paint_status_only(deck, "AUTH FAILED -- check key file", ctx.plan)
+                    _paint_status_only(
+                        deck,
+                        "AUTH FAILED -- check key file",
+                        ctx.plan,
+                        font_scale=ctx.font_scale,
+                    )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "auth"
                 if _interruptible_wait(deck, shutting_down, AUTH_RETRY_SECONDS):
@@ -2348,7 +2412,10 @@ def _run_active(
                 )
                 if shown_error_state != "unreachable":
                     _paint_status_only(
-                        deck, f"{hostname} UNREACHABLE -- retrying", ctx.plan
+                        deck,
+                        f"{hostname} UNREACHABLE -- retrying",
+                        ctx.plan,
+                        font_scale=ctx.font_scale,
                     )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
@@ -2362,7 +2429,12 @@ def _run_active(
                     "unexpected muxplex API error; treating as unreachable"
                 )
                 if shown_error_state != "unreachable":
-                    _paint_status_only(deck, f"{hostname} ERROR -- retrying", ctx.plan)
+                    _paint_status_only(
+                        deck,
+                        f"{hostname} ERROR -- retrying",
+                        ctx.plan,
+                        font_scale=ctx.font_scale,
+                    )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
                 if _interruptible_wait(deck, shutting_down, backoff):
