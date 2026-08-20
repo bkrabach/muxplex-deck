@@ -254,3 +254,100 @@ class TestNameParsing:
         config_mod.patch_raw_config({"name": "studio-deck"}, config_path)
         reloaded = config_mod.load_raw_config(config_path)
         assert reloaded["name"] == "studio-deck"
+
+
+# ---------------------------------------------------------------------------
+# `font_scale` -- Gate 1 parsing (physical-deck readability multiplier)
+# ---------------------------------------------------------------------------
+
+
+class TestFontScaleParsing:
+    def test_absent_font_scale_defaults_to_one(self, tmp_path: Path) -> None:
+        """No `font_scale` key at all -- byte-identical to before the field existed."""
+        path = _write_minimal_config(tmp_path)
+        cfg = load_config(str(path))
+        assert cfg.font_scale == 1.0
+
+    def test_explicit_default_value_is_kept(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 1.0})
+        cfg = load_config(str(path))
+        assert cfg.font_scale == 1.0
+
+    def test_integer_font_scale_is_coerced_to_float(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 1})
+        cfg = load_config(str(path))
+        assert cfg.font_scale == 1.0
+        assert isinstance(cfg.font_scale, float)
+
+    def test_max_boundary_is_accepted(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 2.0})
+        cfg = load_config(str(path))
+        assert cfg.font_scale == 2.0
+
+    def test_min_boundary_is_accepted(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 0.5})
+        cfg = load_config(str(path))
+        assert cfg.font_scale == 0.5
+
+    def test_zero_raises_config_error(self, tmp_path: Path) -> None:
+        """Fails closed -- mirrors `poll_interval`'s own zero/negative rejection."""
+        path = _write_minimal_config(tmp_path, {"font_scale": 0})
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(str(path))
+        assert "font_scale" in str(excinfo.value)
+
+    def test_negative_raises_config_error(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": -1})
+        with pytest.raises(ConfigError):
+            load_config(str(path))
+
+    def test_above_max_raises_config_error(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 3.0})
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(str(path))
+        assert "font_scale" in str(excinfo.value)
+
+    def test_below_min_raises_config_error(self, tmp_path: Path) -> None:
+        path = _write_minimal_config(tmp_path, {"font_scale": 0.49})
+        with pytest.raises(ConfigError):
+            load_config(str(path))
+
+    def test_string_font_scale_raises_config_error(self, tmp_path: Path) -> None:
+        """Fails closed -- never silently coerces a bad type into a number."""
+        path = _write_minimal_config(tmp_path, {"font_scale": "big"})
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(str(path))
+        assert "font_scale" in str(excinfo.value)
+
+    def test_bool_font_scale_raises_config_error(self, tmp_path: Path) -> None:
+        """`bool` is a subclass of `int` in Python -- must be explicitly rejected
+
+        the same way `poll_interval` rejects it, or `True`/`False` would
+        silently pass as `1.0`/`0.0`.
+        """
+        path = _write_minimal_config(tmp_path, {"font_scale": True})
+        with pytest.raises(ConfigError):
+            load_config(str(path))
+
+    def test_font_scale_is_in_default_config_and_reloadable(self) -> None:
+        """Full accounting: `font_scale` must be discoverable via `config list`/
+
+        `config set` and hot-reloadable without a restart -- both silent-
+        ignore failure modes this repo has hit before (the `focus_app`
+        incident).
+        """
+        assert "font_scale" in config_mod.DEFAULT_CONFIG
+        assert config_mod.DEFAULT_CONFIG["font_scale"] == 1.0
+        assert "font_scale" in config_mod.RELOADABLE_KEYS
+
+    def test_font_scale_round_trips_through_raw_config_helpers(
+        self, tmp_path: Path
+    ) -> None:
+        """Same round-trip proof `name` gets above -- the exact mechanism the
+
+        `focus_app` incident broke on.
+        """
+        config_path = str(tmp_path / "config.json")
+        config_mod.patch_raw_config({"font_scale": 1.5}, config_path)
+        reloaded = config_mod.load_raw_config(config_path)
+        assert reloaded["font_scale"] == 1.5

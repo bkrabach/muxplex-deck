@@ -282,6 +282,7 @@ class TestApplyReload:
             view_pin=None,
             name="",
             controls={"key.11": "view_next"},
+            font_scale=1.0,
         )
 
         ctx.apply_reload(reloaded)
@@ -307,6 +308,7 @@ class TestApplyReload:
             view_pin=None,
             name="",
             controls={},
+            font_scale=1.0,
         )
 
         ctx.apply_reload(reloaded)
@@ -334,6 +336,7 @@ class TestApplyReload:
             view_pin=None,
             name="",
             controls={},
+            font_scale=1.0,
         )
         ctx.apply_reload(reloaded)
 

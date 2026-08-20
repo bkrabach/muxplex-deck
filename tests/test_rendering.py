@@ -395,6 +395,153 @@ class TestFitLabelIsSoleTruncationGate:
         assert draw.textlength(fitted, font=font) <= geo.content_width
 
 
+class TestFontScale:
+    """`font_scale` (`Config.font_scale`) multiplies PRIMARY/SECONDARY/strip
+
+    fonts, deliberately leaving TEXTURE (`_TEXTURE_SIZE`) untouched -- see
+    docs/KEY_DESIGN_SYSTEM.md's font_scale note.
+    """
+
+    def test_default_font_scale_matches_no_font_scale_primary(self) -> None:
+        """`font_scale=1.0` is byte-identical to omitting the parameter."""
+        assert rendering._primary_size(72) == rendering._primary_size(72, 1.0)
+
+    def test_default_font_scale_matches_no_font_scale_secondary(self) -> None:
+        assert rendering._secondary_size(72) == rendering._secondary_size(72, 1.0)
+
+    @pytest.mark.parametrize("size", [72, 96, 120])
+    def test_primary_size_doubles_at_font_scale_two(self, size: int) -> None:
+        """Compare against the raw formula (round(2*S/9*scale)), not against
+
+        doubling an already-rounded base value -- rounding twice can drift
+        by a pixel at sizes where 2*S/9 isn't a whole number (e.g. S=96).
+        """
+        scaled = rendering._primary_size(size, 2.0)
+        assert scaled == round(2 * size / 9 * 2.0)
+
+    @pytest.mark.parametrize("size", [72, 96, 120])
+    def test_secondary_size_doubles_at_font_scale_two(self, size: int) -> None:
+        scaled = rendering._secondary_size(size, 2.0)
+        assert scaled == round(11 * size / 72 * 2.0)
+
+    @pytest.mark.parametrize("size", [72, 96, 120])
+    def test_primary_size_halves_at_font_scale_half(self, size: int) -> None:
+        scaled = rendering._primary_size(size, 0.5)
+        assert scaled == max(1, round(2 * size / 9 * 0.5))
+
+    def test_primary_size_never_drops_below_one_pixel(self) -> None:
+        """Clamp guard: an extreme scale-down must never produce <=0."""
+        assert rendering._primary_size(72, 0.01) >= 1
+
+    def test_secondary_size_never_drops_below_one_pixel(self) -> None:
+        assert rendering._secondary_size(72, 0.01) >= 1
+
+    @pytest.mark.parametrize("font_scale", [0.5, 1.0, 1.5, 2.0])
+    def test_texture_size_is_unaffected_by_font_scale(self, font_scale: float) -> None:
+        """TEXTURE is column-count, not apparent size -- never scales, at any
+
+        font_scale value. `_TEXTURE_SIZE` itself takes no `font_scale`
+        parameter at all -- this documents the invariant explicitly.
+        """
+        assert rendering._TEXTURE_SIZE == 11
+        # render_session_key doesn't expose the preview font size directly,
+        # but the constant it draws from must never change with font_scale.
+        deck = _deck(72)
+        session = _session("s1", snapshot="hello\nworld\n")
+        image_default = _to_image(
+            rendering.render_session_key(deck, session, active=False)
+        )
+        image_scaled = _to_image(
+            rendering.render_session_key(
+                deck, session, active=False, font_scale=font_scale
+            )
+        )
+        # The preview crop geometry (lines/columns) is independent of
+        # font_scale -- confirm the two renders are identical outside the
+        # NAME band (where font_scale legitimately changes glyph size).
+        geo = rendering._zone_geometry(72)
+        for y in range(geo.body_top, geo.body_top + geo.body_height):
+            for x in (geo.content_left, geo.content_left + geo.content_width - 1):
+                assert image_default.getpixel((x, y)) == image_scaled.getpixel((x, y))
+
+    def test_render_session_key_at_default_font_scale_matches_no_font_scale_arg(
+        self,
+    ) -> None:
+        """The additive-default guard: passing `font_scale=1.0` explicitly
+
+        must render byte-identical output to omitting the parameter
+        entirely -- this is what proves the change is additive.
+        """
+        deck = _deck(72)
+        session = _session("deckwork", snapshot="hello\n")
+        default_bytes = rendering.render_session_key(deck, session, active=True)
+        explicit_bytes = rendering.render_session_key(
+            deck, session, active=True, font_scale=1.0
+        )
+        assert default_bytes == explicit_bytes
+
+    def test_render_control_key_at_default_font_scale_matches_no_font_scale_arg(
+        self,
+    ) -> None:
+        deck = _deck(72)
+        default_bytes = rendering.render_control_key(
+            deck, name="< PREV", body="VIEW", state="1/2"
+        )
+        explicit_bytes = rendering.render_control_key(
+            deck, name="< PREV", body="VIEW", state="1/2", font_scale=1.0
+        )
+        assert default_bytes == explicit_bytes
+
+    def test_render_picker_key_at_default_font_scale_matches_no_font_scale_arg(
+        self,
+    ) -> None:
+        deck = _deck(72)
+        default_bytes = rendering.render_picker_key(deck, "all", current=True)
+        explicit_bytes = rendering.render_picker_key(
+            deck, "all", current=True, font_scale=1.0
+        )
+        assert default_bytes == explicit_bytes
+
+    def test_render_status_key_at_default_font_scale_matches_no_font_scale_arg(
+        self,
+    ) -> None:
+        deck = _deck(72)
+        default_bytes = rendering.render_status_key(deck, "AUTH FAILED")
+        explicit_bytes = rendering.render_status_key(
+            deck, "AUTH FAILED", font_scale=1.0
+        )
+        assert default_bytes == explicit_bytes
+
+    def test_render_control_key_grows_at_higher_font_scale(self) -> None:
+        """Sanity check that font_scale actually changes rendered ink, not
+
+        just that the parameter is accepted -- more ink pixels at a larger
+        scale for the same text.
+        """
+        deck = _deck(72)
+        bg = (0x10, 0x10, 0x36)
+
+        def _ink_pixel_count(jpeg_bytes: bytes) -> int:
+            image = _to_image(jpeg_bytes)
+            return sum(
+                1
+                for y in range(image.height)
+                for x in range(image.width)
+                if any(
+                    abs(a - e) > _COLOR_TOLERANCE
+                    for a, e in zip(_as_rgb(image.getpixel((x, y))), bg)
+                )
+            )
+
+        small = rendering.render_control_key(
+            deck, name="", body="1", state="", font_scale=0.5
+        )
+        large = rendering.render_control_key(
+            deck, name="", body="1", state="", font_scale=2.0
+        )
+        assert _ink_pixel_count(large) > _ink_pixel_count(small)
+
+
 class TestControlKeyZoneAssignment:
     """§6.2's worked table -- the named violations are actually fixed."""
 

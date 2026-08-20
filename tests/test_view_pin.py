@@ -217,6 +217,7 @@ class TestApplyReloadViewPin:
             view_pin=view_pin,
             name="",
             controls={},
+            font_scale=1.0,
         )
 
     def test_newly_setting_pin_snaps_active_view_immediately(self) -> None:

@@ -87,14 +87,24 @@ _NAME_BANNER_FILL = (0, 0, 0, 195)  # translucent black -- non-attention NAME ba
 _TEXTURE_SIZE = 11
 
 
-def _primary_size(size: int) -> int:
-    """PRIMARY type size for a face of edge `size` -- round(2*S/9)."""
-    return round(2 * size / 9)
+def _primary_size(size: int, font_scale: float = 1.0) -> int:
+    """PRIMARY type size for a face of edge `size` -- round(2*S/9).
+
+    `font_scale` (default 1.0, byte-identical to before this parameter
+    existed) is the user-controllable readability multiplier
+    (`Config.font_scale`) -- clamped to a minimum of 1px so a small
+    `font_scale` can never produce an unusable/invalid (<=0) font size.
+    """
+    return max(1, round(2 * size / 9 * font_scale))
 
 
-def _secondary_size(size: int) -> int:
-    """SECONDARY type size for a face of edge `size` -- round(11*S/72)."""
-    return round(11 * size / 72)
+def _secondary_size(size: int, font_scale: float = 1.0) -> int:
+    """SECONDARY type size for a face of edge `size` -- round(11*S/72).
+
+    See `_primary_size` for the `font_scale` contract (same default,
+    same >=1px clamp).
+    """
+    return max(1, round(11 * size / 72 * font_scale))
 
 
 # --- Zone geometry (docs/KEY_DESIGN_SYSTEM.md §1 + §3) ------------------
@@ -349,6 +359,7 @@ def render_session_key(
     *,
     active: bool,
     origin_label: str | None = None,
+    font_scale: float = 1.0,
 ) -> bytes:
     """Render one key: mini terminal preview, NAME band, active/attention state.
 
@@ -394,7 +405,7 @@ def render_session_key(
     # NAME band: needs an RGBA overlay composited onto the (opaque RGB)
     # preview, then flattened back to RGB for the native format -- same
     # reason the pre-v3 translucent banner needed one.
-    name_font = ImageFont.load_default(size=_primary_size(size))
+    name_font = ImageFont.load_default(size=_primary_size(size, font_scale))
     label = _fit_label(draw, session.name, name_font, geo.content_width)
 
     needs_attention = session.bell.needs_attention
@@ -431,7 +442,7 @@ def render_session_key(
         # treatment `render_control_key` gives its own STATE text; drawn
         # on the flattened RGB image (not the RGBA overlay above), same
         # as every other band on this face except NAME.
-        state_font = ImageFont.load_default(size=_secondary_size(size))
+        state_font = ImageFont.load_default(size=_secondary_size(size, font_scale))
         state_text = _fit_label(draw, origin_label, state_font, geo.content_width)
         _draw_band_text(
             draw,
@@ -459,7 +470,9 @@ def render_empty_key(deck: DeckDevice) -> bytes:
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 
-def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
+def render_picker_key(
+    deck: DeckDevice, label: str, *, current: bool, font_scale: float = 1.0
+) -> bytes:
     """Render one picker-mode key: a centered label on a distinct background.
 
     Shared by both the view picker (dial 0 press) and the page picker
@@ -477,7 +490,7 @@ def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
-    font = ImageFont.load_default(size=_primary_size(size))
+    font = ImageFont.load_default(size=_primary_size(size, font_scale))
     text = _fit_label(draw, label, font, geo.content_width)
     _draw_band_text(
         draw,
@@ -506,7 +519,12 @@ def render_picker_key(deck: DeckDevice, label: str, *, current: bool) -> bytes:
 
 
 def render_control_key(
-    deck: DeckDevice, *, name: str, body: str, state: str = ""
+    deck: DeckDevice,
+    *,
+    name: str,
+    body: str,
+    state: str = "",
+    font_scale: float = 1.0,
 ) -> bytes:
     """Render one control key from its (NAME, BODY, STATE) zone content.
 
@@ -526,7 +544,7 @@ def render_control_key(
     geo = _zone_geometry(size)
 
     if name:
-        font = ImageFont.load_default(size=_secondary_size(size))
+        font = ImageFont.load_default(size=_secondary_size(size, font_scale))
         text = _fit_label(draw, name, font, geo.content_width)
         _draw_band_text(
             draw,
@@ -540,7 +558,7 @@ def render_control_key(
         )
 
     if body:
-        font = ImageFont.load_default(size=_primary_size(size))
+        font = ImageFont.load_default(size=_primary_size(size, font_scale))
         text = _fit_label(draw, body, font, geo.content_width)
         _draw_band_text(
             draw,
@@ -554,7 +572,7 @@ def render_control_key(
         )
 
     if state:
-        font = ImageFont.load_default(size=_secondary_size(size))
+        font = ImageFont.load_default(size=_secondary_size(size, font_scale))
         text = _fit_label(draw, state, font, geo.content_width)
         _draw_band_text(
             draw,
@@ -573,7 +591,9 @@ def render_control_key(
 _STATUS_KEY_LINE_HEIGHT = 13
 
 
-def render_status_key(deck: DeckDevice, message: str) -> bytes:
+def render_status_key(
+    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+) -> bytes:
     """Render a status message word-wrapped onto a single key.
 
     Decks without a touch strip have nowhere else to show AUTH FAILED /
@@ -588,7 +608,7 @@ def render_status_key(deck: DeckDevice, message: str) -> bytes:
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
-    font = ImageFont.load_default(size=_secondary_size(size))
+    font = ImageFont.load_default(size=_secondary_size(size, font_scale))
     max_width = geo.content_width
     max_lines = max(1, geo.content_height // _STATUS_KEY_LINE_HEIGHT)
 
@@ -629,17 +649,21 @@ def _paint_full_touchscreen(deck: DeckDevice, image_bytes: bytes) -> None:
     deck.set_touchscreen_image(image_bytes, 0, 0, width, height)
 
 
-def render_status_strip(deck: DeckDevice, message: str) -> bytes:
+def render_status_strip(
+    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+) -> bytes:
     """Render the touch strip as a single centered status line.
 
     Outside the key face zone model (docs/KEY_DESIGN_SYSTEM.md is
-    explicitly scoped to LCD keys) -- unchanged from pre-v3.
+    explicitly scoped to LCD keys) -- unchanged from pre-v3, aside from
+    `font_scale` (default 1.0, byte-identical to before this parameter
+    existed) multiplying `_STRIP_FONT_SIZE`, clamped to a minimum of 1px.
     """
     image = PILHelper.create_touchscreen_image(
         cast(StreamDeck, deck), background="black"
     )
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=_STRIP_FONT_SIZE)
+    font = ImageFont.load_default(size=max(1, round(_STRIP_FONT_SIZE * font_scale)))
 
     bbox = draw.textbbox((0, 0), message, font=font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -652,9 +676,13 @@ def render_status_strip(deck: DeckDevice, message: str) -> bytes:
     return PILHelper.to_native_touchscreen_format(cast(StreamDeck, deck), image)
 
 
-def paint_status_strip(deck: DeckDevice, message: str) -> None:
+def paint_status_strip(
+    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+) -> None:
     """Render and paint the status strip in one call."""
-    _paint_full_touchscreen(deck, render_status_strip(deck, message))
+    _paint_full_touchscreen(
+        deck, render_status_strip(deck, message, font_scale=font_scale)
+    )
 
 
 def paint_blank_keys(deck: DeckDevice) -> None:

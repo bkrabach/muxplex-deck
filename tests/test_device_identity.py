@@ -331,6 +331,7 @@ class TestDeviceLabelResolution:
             view_pin=None,
             name="new-name",
             controls={},
+            font_scale=1.0,
         )
         ctx.apply_reload(reloaded)
         ctx.refresh()
