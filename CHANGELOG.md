@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.18.0 (2026-08-20)
+
+**Key text size is now adjustable via a new `font_scale` config option.**
+`font_scale` (default 1.0, range 0.5–2.0, hot-reloadable) multiplies the readable
+key text: the NAME/primary, control/secondary, and touch-strip status fonts.
+
+### Added
+
+- `font_scale` config key. Set it in `~/.config/muxplex-deck/config.json` (or via
+  `muxplex-deck config set font_scale <value>`) to enlarge or shrink key labels.
+  Applied live on the next config-watch tick — no restart needed.
+
+### Notes
+
+- The mini-terminal preview "texture" is deliberately NOT scaled (it encodes column
+  count, not readable text; scaling it would regress the hardware-verified crop — see
+  docs/KEY_DESIGN_SYSTEM.md). At `font_scale: 1.0` rendering is unchanged.
+
 ## v0.17.0 (2026-08-16)
 
 **The deck now sees and can connect to sessions across the whole federation,
