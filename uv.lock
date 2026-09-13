@@ -90,19 +90,19 @@ wheels = [
 
 [[package]]
 name = "muxplex-client"
-version = "0.54.0"
+version = "0.58.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/34/7a3b8ab51ed204ecdd23cf36057d4e2fcbb61aabf9ae0fdceee826024f61/muxplex_client-0.54.0.tar.gz", hash = "sha256:5ecb634310bef30862616f34ca4fd7f632492b2b8614efd61679ff2ad68fdbf9", size = 40682, upload-time = "2026-08-17T05:09:23.635Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/b2/ef64d2e8b780ebaa0b7974d67c7aebbbdf840db53e97f635e67d8653acb7/muxplex_client-0.58.5.tar.gz", hash = "sha256:887bedf99cb5fc81c9763b41ed4691c8257b93a84ac9da684d55f9ffb62c0400", size = 45615, upload-time = "2026-09-13T23:22:20.781Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/c3/d4b98d358f5229eb7450e7fb38cde0c939c5259c9fbb740680c1e5d8e53e/muxplex_client-0.54.0-py3-none-any.whl", hash = "sha256:aa0850c163a8a7f836ea6caa03bdf3265028bd32078fc1b9cdb98d1a4062de55", size = 33953, upload-time = "2026-08-17T05:09:20.438Z" },
+    { url = "https://files.pythonhosted.org/packages/14/fa/7ce68f0bf99f57cae2112e05ba2bb8676ce79a5a3942e57d3d658726ec6e/muxplex_client-0.58.5-py3-none-any.whl", hash = "sha256:4e6a951bf094ccff259dbeced7c58cb719e76f004af5a5531c0c199e815e347a", size = 36012, upload-time = "2026-09-13T23:22:17.984Z" },
 ]
 
 [[package]]
 name = "muxplex-deck"
-version = "0.17.0"
+version = "0.18.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
