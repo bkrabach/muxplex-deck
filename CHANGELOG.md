@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.18.1 (2026-09-13)
+
+### Maintenance
+
+- Correct the package version recorded in `uv.lock` and update its tested
+  `muxplex-client` resolution to 0.58.5. The declared `muxplex-client >= 0.54.0`
+  compatibility floor and all runtime behavior are unchanged.
+
+### Verified
+
+- Isolated checks cover the locked 0.58.5 client, the declared 0.54.0 client
+  compatibility canary, package metadata, and a fresh wheel installation. No
+  physical-deck or live-service validation is claimed for this maintenance release.
+
 ## v0.18.0 (2026-08-20)
 
 **Key text size is now adjustable via a new `font_scale` config option.**
