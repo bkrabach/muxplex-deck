@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -20,6 +21,7 @@ from muxplex_client import MuxplexClient, Settings
 from test_runtime_modes import FakeClient, FakeDeck, _make_sessions
 
 from muxplex_deck import main as main_mod
+from muxplex_deck.appearance import DEFAULT_APPEARANCE
 from muxplex_deck.config import ConfigWatcher, load_config
 from muxplex_deck.device import DeckDevice
 from muxplex_deck.main import _ActiveRuntime
@@ -60,6 +62,56 @@ def _make_reduced_deck() -> FakeDeck:
 
 
 class TestHotReloadWiring:
+    def test_appearance_edit_repaints_on_the_processed_tick(
+        self, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An appearance edit redraws now, rather than waiting one more poll."""
+
+        initial = load_config(str(config_path))
+        watcher = ConfigWatcher(str(config_path), initial)
+        deck = _make_reduced_deck()
+        client = FakeClient(_make_sessions(5), SETTINGS)
+        reporter = StatusReporter("https://example.test:8088", tmp_path / "status.json")
+        shutting_down = threading.Event()
+
+        painted: list[int] = []
+        original_set_key_image = deck.set_key_image
+
+        def _record_paint(index: int, image: bytes) -> None:
+            painted.append(index)
+            original_set_key_image(index, image)
+
+        deck.set_key_image = _record_paint  # type: ignore[method-assign]
+        ticks = {"n": 0, "before": 0, "after": 0}
+
+        def _fake_wait(
+            wait_deck: DeckDevice, event: threading.Event, seconds: float
+        ) -> bool:
+            ticks["n"] += 1
+            if ticks["n"] == 1:
+                data = json.loads(config_path.read_text(encoding="utf-8"))
+                data["appearance"] = {"primary": {"color": "#00FF00"}}
+                _write_config(config_path, data)
+                _bump_mtime(config_path)
+                ticks["before"] = len(painted)
+            if ticks["n"] == 2:
+                ticks["after"] = len(painted)
+                event.set()
+            return event.is_set()
+
+        monkeypatch.setattr(main_mod, "_interruptible_wait", _fake_wait)
+
+        main_mod._run_active(
+            cast(DeckDevice, deck),
+            cast(MuxplexClient, client),
+            shutting_down,
+            "test-server",
+            reporter,
+            watcher,
+        )
+
+        assert ticks["after"] > ticks["before"]
+
     def test_controls_edit_mid_session_is_applied_and_published(
         self, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -337,8 +389,13 @@ class TestApplyReload:
             name="",
             controls={},
             font_scale=1.0,
+            appearance=replace(
+                DEFAULT_APPEARANCE,
+                palette=replace(DEFAULT_APPEARANCE.palette, active="#AA00FF"),
+            ),
         )
         ctx.apply_reload(reloaded)
 
         assert all(state is None for state in ctx.last_key_state)
         assert ctx.last_strip is None
+        assert ctx.appearance.palette.active == "#AA00FF"

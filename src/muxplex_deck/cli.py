@@ -27,6 +27,13 @@ from typing import Any, NoReturn
 
 from . import config as config_mod
 from . import controls as controls_mod
+from .appearance import (
+    APPEARANCE_LEAVES,
+    DEFAULT_APPEARANCE,
+    AppearanceError,
+    appearance_to_dict,
+    validate_appearance,
+)
 from .config import DEFAULT_CONFIG, ConfigError
 
 # ---------------------------------------------------------------------------
@@ -185,6 +192,12 @@ def config_list(config_path: str | None = None) -> None:
             display = f"{count} binding{'' if count == 1 else 's'}"
             print(f"  {key}: {display}{marker}")
             continue
+        if key == "appearance":
+            # Like controls, appearance is structured. Keep the generic
+            # config overview scannable; its dedicated group shows each safe
+            # leaf and is the only CLI write surface.
+            print(f"  {key}: {len(APPEARANCE_LEAVES)} visual fields{marker}")
+            continue
         if isinstance(value, str):
             display = f'"{value}"' if value else '""'
         elif value is None:
@@ -239,18 +252,24 @@ def config_set(key: str, raw_value: str, config_path: str | None = None) -> None
     accepted. Structured keys need a dedicated interface (their own
     subcommand, or direct file editing), not CLI-string coercion.
     """
-    if key == "controls":
+    if key in ("controls", "appearance"):
         # `controls` is a dict -- every isinstance branch below would miss
         # it and fall through to storing the raw CLI string where a dict
         # belongs (exactly the silently-corrupted-config class this repo
         # hit five times on 2026-07-28). A dedicated subcommand group
         # exists instead: docs/CONTROL_MAPPING_DESIGN.md §8.1.
         print(
-            "Cannot set 'controls' via 'config set' -- it's a structured "
+            f"Cannot set {key!r} via 'config set' -- it's a structured "
             "mapping, not a scalar value. Use:\n"
-            "  muxplex-deck controls set <address> <action>\n"
-            "e.g. muxplex-deck controls set key.0 view_picker\n"
-            "See: muxplex-deck controls actions",
+            + (
+                "  muxplex-deck controls set <address> <action>\n"
+                "e.g. muxplex-deck controls set key.0 view_picker\n"
+                "See: muxplex-deck controls actions"
+                if key == "controls"
+                else "  muxplex-deck appearance set <role.field> <value>\n"
+                "e.g. muxplex-deck appearance set primary.scale 1.25\n"
+                "See: muxplex-deck appearance show"
+            ),
             file=sys.stderr,
         )
         sys.exit(1)
@@ -287,6 +306,16 @@ def config_set(key: str, raw_value: str, config_path: str | None = None) -> None
         print(f"Invalid value for {key}: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    if key == "font_scale":
+        raw_config = config_mod.load_raw_config(config_path)
+        try:
+            config_mod.validate_appearance_for_font_scale(
+                value, raw_config.get("appearance")
+            )
+        except ConfigError as exc:
+            print(f"Invalid value for {key}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     config_mod.patch_raw_config({key: value}, config_path)
     print(f"  {key}: {value}")
 
@@ -309,6 +338,107 @@ def config_reset(key: str | None = None, config_path: str | None = None) -> None
         config_mod.save_raw_config(copy.deepcopy(DEFAULT_CONFIG), config_path)
         resolved_path = config_mod._resolve_config_path(config_path)
         print(f"  All settings reset to defaults ({resolved_path})")
+
+
+# ---------------------------------------------------------------------------
+# appearance -- local physical-deck PRIMARY / SECONDARY / PREVIEW styling
+# ---------------------------------------------------------------------------
+
+
+def _appearance_value(appearance_data: dict, field: str) -> object:
+    group, leaf = field.split(".", 1)
+    return appearance_data[group][leaf]
+
+
+def appearance_show(config_path: str | None = None) -> int:
+    """`muxplex-deck appearance show` -- show physical-deck visual tokens."""
+
+    raw = config_mod.load_raw_config(config_path)
+    try:
+        _font_scale, appearance = config_mod.validate_appearance_for_font_scale(
+            raw.get("font_scale"), raw.get("appearance")
+        )
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    resolved_path = config_mod._resolve_config_path(config_path)
+    data = appearance_to_dict(appearance)
+    print(f"\nmuxplex-deck appearance ({resolved_path})\n")
+    for field in APPEARANCE_LEAVES:
+        print(f"  {field}: {_appearance_value(data, field)}")
+    print(
+        "\n  PRIMARY and SECONDARY scales combine with font_scale (maximum "
+        "1.25 each). PREVIEW adjusts its own crop metrics. "
+        "Hardware v1 uses one bundled font, so family, weight, and italic "
+        "are intentionally not configurable.\n"
+    )
+    return 0
+
+
+def appearance_set(field: str, raw_value: str, config_path: str | None = None) -> int:
+    """Set one validated appearance leaf, never a caller-supplied mapping."""
+
+    if field not in APPEARANCE_LEAVES:
+        print(f"Unknown appearance field: {field}", file=sys.stderr)
+        print(f"Valid fields: {', '.join(APPEARANCE_LEAVES)}", file=sys.stderr)
+        return 1
+    raw_config = config_mod.load_raw_config(config_path)
+    try:
+        _font_scale, current = config_mod.validate_appearance_for_font_scale(
+            raw_config.get("font_scale"), raw_config.get("appearance")
+        )
+        data = appearance_to_dict(current)
+        group, leaf = field.split(".", 1)
+        data[group][leaf] = float(raw_value) if leaf == "scale" else raw_value
+        validated = validate_appearance(data)
+        config_mod.validate_appearance_for_font_scale(
+            raw_config.get("font_scale"), appearance_to_dict(validated)
+        )
+    except (AppearanceError, ConfigError, ValueError) as exc:
+        print(f"Invalid appearance value for {field}: {exc}", file=sys.stderr)
+        return 1
+    config_mod.patch_raw_config(
+        {"appearance": appearance_to_dict(validated)}, config_path
+    )
+    print(f"  {field}: {_appearance_value(appearance_to_dict(validated), field)}")
+    _report_reload_effect(config_path, raw_config, check_command="appearance show")
+    return 0
+
+
+def appearance_reset(field: str | None = None, config_path: str | None = None) -> int:
+    """Reset one appearance leaf or the entire appearance object to defaults."""
+
+    if field is not None and field not in APPEARANCE_LEAVES:
+        print(f"Unknown appearance field: {field}", file=sys.stderr)
+        print(f"Valid fields: {', '.join(APPEARANCE_LEAVES)}", file=sys.stderr)
+        return 1
+    raw_config = config_mod.load_raw_config(config_path)
+    if field is None:
+        updated = appearance_to_dict(DEFAULT_APPEARANCE)
+        print("  All appearance settings reset to defaults")
+    else:
+        try:
+            _font_scale, current = config_mod.validate_appearance_for_font_scale(
+                raw_config.get("font_scale"), raw_config.get("appearance")
+            )
+            updated = appearance_to_dict(current)
+        except (AppearanceError, ConfigError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        defaults = appearance_to_dict(DEFAULT_APPEARANCE)
+        group, leaf = field.split(".", 1)
+        updated[group][leaf] = defaults[group][leaf]
+        print(f"  {field} reset to: {_appearance_value(updated, field)}")
+    try:
+        config_mod.validate_appearance_for_font_scale(
+            raw_config.get("font_scale"), updated
+        )
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    config_mod.patch_raw_config({"appearance": updated}, config_path)
+    _report_reload_effect(config_path, raw_config, check_command="appearance show")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +704,10 @@ def _wait_for_config_pickup(
 
 
 def _report_reload_effect(
-    config_path: str | None, raw_config_before_write: dict
+    config_path: str | None,
+    raw_config_before_write: dict,
+    *,
+    check_command: str = "controls",
 ) -> None:
     """Print one extra line after a `controls` write: did a running sidecar pick it up?
 
@@ -599,7 +732,8 @@ def _report_reload_effect(
     if reload_info is None:
         print(
             "  (a sidecar appears to be running but hasn't confirmed picking "
-            "this up yet -- check `muxplex-deck controls` or `muxplex-deck status`)"
+            f"this up yet -- check `muxplex-deck {check_command}` or "
+            "`muxplex-deck status`)"
         )
         return
     error = reload_info.get("error")
@@ -2297,6 +2431,27 @@ def _build_parser() -> _ReportingArgumentParser:
         "key", nargs="?", help="Config key (omit to reset all)"
     )
 
+    appearance_parser = sub.add_parser(
+        "appearance", help="Show and manage physical-deck visual appearance"
+    )
+    appearance_sub = appearance_parser.add_subparsers(dest="appearance_command")
+    appearance_sub.add_parser(
+        "show", help="Show role typography and palette colors (default)"
+    )
+    appearance_set_parser = appearance_sub.add_parser(
+        "set", help="Set one dotted appearance field"
+    )
+    appearance_set_parser.add_argument(
+        "field", help="Dotted field, e.g. primary.scale or palette.active"
+    )
+    appearance_set_parser.add_argument("value", help="Scale or #RRGGBB color")
+    appearance_reset_parser = appearance_sub.add_parser(
+        "reset", help="Reset one dotted field or all appearance settings"
+    )
+    appearance_reset_parser.add_argument(
+        "field", nargs="?", help="Dotted field (omit to reset all)"
+    )
+
     controls_parser = sub.add_parser(
         "controls", help="Show and manage per-control action bindings"
     )
@@ -2417,6 +2572,15 @@ def main() -> None:
             sys.exit(controls_unset(args.address, getattr(args, "config", None)))
         elif cmd == "reset":
             sys.exit(controls_reset(getattr(args, "config", None)))
+    elif args.command == "appearance":
+        cmd = getattr(args, "appearance_command", None)
+        config_path = getattr(args, "config", None)
+        if cmd in (None, "show"):
+            sys.exit(appearance_show(config_path))
+        elif cmd == "set":
+            sys.exit(appearance_set(args.field, args.value, config_path))
+        elif cmd == "reset":
+            sys.exit(appearance_reset(getattr(args, "field", None), config_path))
     elif args.command == "wsl":
         cmd = getattr(args, "wsl_command", None)
         if cmd == "attach":

@@ -26,7 +26,7 @@ from typing import cast
 
 import pytest
 from muxplex_client import Bell, Session
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from muxplex_deck import rendering
 from muxplex_deck.device import DeckDevice
@@ -393,6 +393,47 @@ class TestFitLabelIsSoleTruncationGate:
         )
         assert fitted.endswith("\u2026")
         assert draw.textlength(fitted, font=font) <= geo.content_width
+
+
+class TestStatusStripFit:
+    def test_short_message_is_preserved(self) -> None:
+        image = Image.new("RGB", (800, 100))
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default(size=rendering._STRIP_FONT_SIZE)
+        message = "ACTIVE: deckwork"
+
+        assert (
+            rendering._fit_status_strip_message(draw, message, font, image.width)
+            == message
+        )
+
+    @pytest.mark.parametrize("font_scale", [1.0, 1.25])
+    def test_long_message_is_ellipsized_within_strip_width(
+        self, monkeypatch: pytest.MonkeyPatch, font_scale: float
+    ) -> None:
+        deck = _deck(120)
+        message = "ACTIVE: " + "very-long-session-name " * 100
+        calls: list[tuple[str, ImageFont.FreeTypeFont | ImageFont.ImageFont]] = []
+
+        def record_text(
+            draw: ImageDraw.ImageDraw,
+            xy: tuple[float, float],
+            text: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            font = cast(ImageFont.FreeTypeFont | ImageFont.ImageFont, kwargs["font"])
+            calls.append((text, font))
+
+        monkeypatch.setattr(ImageDraw.ImageDraw, "text", record_text)
+        rendering.render_status_strip(deck, message, font_scale=font_scale)
+
+        assert len(calls) == 1
+        rendered_message, font = calls[0]
+        assert rendered_message.endswith("\u2026")
+        assert len(rendered_message) < len(message)
+        measurement_draw = ImageDraw.Draw(Image.new("RGB", (800, 100)))
+        assert measurement_draw.textlength(rendered_message, font=font) <= 800
 
 
 class TestFontScale:

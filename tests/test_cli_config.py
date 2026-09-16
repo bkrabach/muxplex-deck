@@ -155,7 +155,7 @@ class TestConfigSetRoundTrip:
             ("sort", "server", "server"),
             ("view_pin", "focus", "focus"),
             ("name", "studio-deck", "studio-deck"),
-            ("font_scale", "1.5", 1.5),
+            ("font_scale", "1.25", 1.25),
         ],
     )
     def test_every_shipped_key_round_trips_exactly(
@@ -188,12 +188,23 @@ class TestConfigSetRoundTrip:
             "name",
             "font_scale",
         }
-        # "controls" is deliberately excluded from the scalar round-trip
+        # "controls" and "appearance" are deliberately excluded from the scalar round-trip
         # above -- it's a dict, refused by `config set` entirely (see
         # TestConfigSetControlsRefusal below) and has its own dedicated
         # `controls set`/`unset`/`reset` interface (test_cli_controls.py).
-        assert set(DEFAULT_CONFIG.keys()) - {"controls"} == covered
+        assert set(DEFAULT_CONFIG.keys()) - {"controls", "appearance"} == covered
         assert "controls" in DEFAULT_CONFIG
+        assert "appearance" in DEFAULT_CONFIG
+
+    def test_font_scale_rejects_unsafe_combined_readable_scale(
+        self, config_path: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            cli.config_set("font_scale", "1.26", config_path)
+
+        assert excinfo.value.code == 1
+        assert load_raw_config(config_path)["font_scale"] == 1.0
+        assert "appearance.primary.scale" in capsys.readouterr().err
 
     def test_structured_default_type_is_rejected_loudly_not_stored_as_a_string(
         self,

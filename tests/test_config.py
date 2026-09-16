@@ -279,10 +279,12 @@ class TestFontScaleParsing:
         assert cfg.font_scale == 1.0
         assert isinstance(cfg.font_scale, float)
 
-    def test_max_boundary_is_accepted(self, tmp_path: Path) -> None:
+    def test_font_scale_that_overflows_smallest_key_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
         path = _write_minimal_config(tmp_path, {"font_scale": 2.0})
-        cfg = load_config(str(path))
-        assert cfg.font_scale == 2.0
+        with pytest.raises(ConfigError, match="appearance.primary.scale"):
+            load_config(str(path))
 
     def test_min_boundary_is_accepted(self, tmp_path: Path) -> None:
         path = _write_minimal_config(tmp_path, {"font_scale": 0.5})

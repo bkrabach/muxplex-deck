@@ -20,6 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import controls as controls_mod
+from .appearance import (
+    DEFAULT_APPEARANCE,
+    DEFAULT_APPEARANCE_DATA,
+    Appearance,
+    AppearanceError,
+    validate_appearance,
+    validate_readable_type_scales,
+)
 
 try:
     import pwd
@@ -79,6 +87,10 @@ DEFAULT_CONFIG: dict = {
     # the `focus_app` incident above: a key absent from this dict is
     # silently discarded by `load_raw_config`/`patch_raw_config`.
     "font_scale": DEFAULT_FONT_SCALE,
+    # Per-role physical-deck appearance. This is deliberately structured and
+    # therefore managed by `muxplex-deck appearance`, never generic
+    # `config set`; see appearance.py for its strict validator.
+    "appearance": DEFAULT_APPEARANCE_DATA,
 }
 
 
@@ -175,14 +187,24 @@ class Config:
     `_secondary_size`'s `font_scale` parameter, and
     `rendering.render_status_strip`'s strip font). `1.0` (default) produces
     byte-identical rendering to before this field existed. Valid range
-    `[0.5, 2.0]` -- validated here (Gate 1), never at the rendering layer,
-    so a bad hand-edit fails loud at load/reload time rather than silently
-    clamping. Deliberately does NOT affect `_TEXTURE_SIZE` (the mini-
+    `[0.5, 2.0]`, with a coupled maximum of `1.25` after multiplying the
+    PRIMARY or SECONDARY appearance role scale -- validated here (Gate 1),
+    never at the rendering layer, so a bad hand-edit fails loud at
+    load/reload time rather than silently clamping. Deliberately does NOT
+    affect `_TEXTURE_SIZE` (the mini-
     terminal preview) -- see docs/KEY_DESIGN_SYSTEM.md §2: that value is
     column-count texture, not apparent size, and scaling it would shrink
     the hardware-verified 21-column Deck+ preview crop. Hot-reloadable:
     see `RELOADABLE_KEYS` -- pure rendering input, applied on the very
     next repaint with no restart needed.
+    """
+    appearance: Appearance = DEFAULT_APPEARANCE
+    """Physical-deck PRIMARY / SECONDARY / PREVIEW typography and palette.
+
+    The supported v1 controls are bounded role scales and opaque RGB colors;
+    no font-family, weight, or italic setting is exposed because the bundled
+    hardware renderer cannot implement those capabilities. Hot-reloadable:
+    all appearance inputs trigger a full repaint on the next poll tick.
     """
 
 
@@ -299,6 +321,29 @@ def _validate_controls(raw_controls: object) -> dict[str, str]:
     return validated
 
 
+def validate_appearance_for_font_scale(
+    font_scale_value: object, raw_appearance: object
+) -> tuple[float, Appearance]:
+    """Validate the coupled readable-text settings as one config boundary."""
+
+    if (
+        not isinstance(font_scale_value, int | float)
+        or isinstance(font_scale_value, bool)
+        or not (MIN_FONT_SCALE <= font_scale_value <= MAX_FONT_SCALE)
+    ):
+        raise ConfigError(
+            f"Config field 'font_scale' must be a number in "
+            f"[{MIN_FONT_SCALE}, {MAX_FONT_SCALE}], got {font_scale_value!r}"
+        )
+    font_scale = float(font_scale_value)
+    try:
+        appearance = validate_appearance(raw_appearance)
+        validate_readable_type_scales(font_scale, appearance)
+    except AppearanceError as exc:
+        raise ConfigError(str(exc)) from exc
+    return font_scale, appearance
+
+
 def load_config(config_path: str | None = None) -> Config:
     """Load and validate configuration.
 
@@ -369,16 +414,9 @@ def load_config(config_path: str | None = None) -> Config:
 
     controls_value = _validate_controls(raw.get("controls", {}))
 
-    font_scale = raw.get("font_scale", DEFAULT_FONT_SCALE)
-    if (
-        not isinstance(font_scale, int | float)
-        or isinstance(font_scale, bool)
-        or not (MIN_FONT_SCALE <= font_scale <= MAX_FONT_SCALE)
-    ):
-        raise ConfigError(
-            f"Config field 'font_scale' must be a number in "
-            f"[{MIN_FONT_SCALE}, {MAX_FONT_SCALE}], got {font_scale!r}"
-        )
+    font_scale, appearance = validate_appearance_for_font_scale(
+        raw.get("font_scale", DEFAULT_FONT_SCALE), raw.get("appearance")
+    )
 
     return Config(
         server_url=server_url.rstrip("/"),
@@ -389,7 +427,8 @@ def load_config(config_path: str | None = None) -> Config:
         view_pin=view_pin,
         name=name_value,
         controls=controls_value,
-        font_scale=float(font_scale),
+        font_scale=font_scale,
+        appearance=appearance,
     )
 
 
@@ -485,6 +524,7 @@ RELOADABLE_KEYS: tuple[str, ...] = (
     "view_pin",
     "name",
     "font_scale",
+    "appearance",
 )
 
 # (report name as it appears in config.json / `config list`, Config attribute

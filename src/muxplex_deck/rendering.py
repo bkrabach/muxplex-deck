@@ -54,6 +54,7 @@ from PIL import Image, ImageDraw, ImageFont
 from StreamDeck.Devices.StreamDeck import StreamDeck
 from StreamDeck.ImageHelpers import PILHelper
 
+from .appearance import DEFAULT_APPEARANCE, Appearance
 from .device import DeckDevice
 
 _STRIP_FONT_SIZE = 22
@@ -87,7 +88,7 @@ _NAME_BANNER_FILL = (0, 0, 0, 195)  # translucent black -- non-attention NAME ba
 _TEXTURE_SIZE = 11
 
 
-def _primary_size(size: int, font_scale: float = 1.0) -> int:
+def _primary_size(size: int, font_scale: float = 1.0, role_scale: float = 1.0) -> int:
     """PRIMARY type size for a face of edge `size` -- round(2*S/9).
 
     `font_scale` (default 1.0, byte-identical to before this parameter
@@ -95,16 +96,16 @@ def _primary_size(size: int, font_scale: float = 1.0) -> int:
     (`Config.font_scale`) -- clamped to a minimum of 1px so a small
     `font_scale` can never produce an unusable/invalid (<=0) font size.
     """
-    return max(1, round(2 * size / 9 * font_scale))
+    return max(1, round(2 * size / 9 * font_scale * role_scale))
 
 
-def _secondary_size(size: int, font_scale: float = 1.0) -> int:
+def _secondary_size(size: int, font_scale: float = 1.0, role_scale: float = 1.0) -> int:
     """SECONDARY type size for a face of edge `size` -- round(11*S/72).
 
     See `_primary_size` for the `font_scale` contract (same default,
     same >=1px clamp).
     """
-    return max(1, round(11 * size / 72 * font_scale))
+    return max(1, round(11 * size / 72 * font_scale * role_scale))
 
 
 # --- Zone geometry (docs/KEY_DESIGN_SYSTEM.md §1 + §3) ------------------
@@ -330,6 +331,34 @@ def _preview_geometry(width: int, content_height: int) -> tuple[int, int]:
     return lines, columns
 
 
+def _preview_metrics(scale: float = 1.0) -> tuple[int, int, float]:
+    """Return (font_size, line_height, character_width) for PREVIEW.
+
+    Unlike the original global `font_scale`, a deliberate PREVIEW role scale
+    changes the terminal crop itself.  Its matching line-height and estimated
+    advance are scaled together, so increasing ink never writes overlapping
+    lines and crop rows/columns remain physically realizable.  At the default
+    1.0, each returned value is exactly the legacy metric.
+    """
+
+    return (
+        max(1, round(_TEXTURE_SIZE * scale)),
+        max(1, round(_PREVIEW_LINE_HEIGHT * scale)),
+        _PREVIEW_CHAR_WIDTH * scale,
+    )
+
+
+def _scaled_preview_geometry(
+    width: int, content_height: int, preview_scale: float
+) -> tuple[int, int, int]:
+    """Return (lines, columns, line_height) for an appearance-scaled preview."""
+
+    _font_size, line_height, char_width = _preview_metrics(preview_scale)
+    lines = max(1, content_height // line_height)
+    columns = max(1, int((width - _PREVIEW_LEFT_MARGIN) / char_width))
+    return lines, columns, line_height
+
+
 def _preview_lines(snapshot: str, max_lines: int, max_columns: int) -> list[str]:
     """Bottom-left crop of a session's snapshot, ready to draw line-by-line.
 
@@ -360,6 +389,7 @@ def render_session_key(
     active: bool,
     origin_label: str | None = None,
     font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> bytes:
     """Render one key: mini terminal preview, NAME band, active/attention state.
 
@@ -382,30 +412,39 @@ def render_session_key(
     plain session name unchanged, so truncation/fit behavior for every
     existing (local) session is untouched.
     """
-    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_SESSION)
+    image = PILHelper.create_key_image(
+        cast(StreamDeck, deck), background=appearance.palette.session_background
+    )
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
-    preview_font = ImageFont.load_default(size=_TEXTURE_SIZE)
+    preview_font_size, _preview_height, _preview_width = _preview_metrics(
+        appearance.preview.scale
+    )
+    preview_font = ImageFont.load_default(size=preview_font_size)
 
-    max_lines, max_columns = _preview_geometry(image.width, geo.content_height)
+    max_lines, max_columns, preview_line_height = _scaled_preview_geometry(
+        image.width, geo.content_height, appearance.preview.scale
+    )
     lines = _preview_lines(session.snapshot, max_lines, max_columns)
     content_bottom = geo.content_top + geo.content_height
-    base_y = content_bottom - len(lines) * _PREVIEW_LINE_HEIGHT
+    base_y = content_bottom - len(lines) * preview_line_height
     for row, line in enumerate(lines):
         if not line:
             continue
         draw.text(
-            (geo.content_left, base_y + row * _PREVIEW_LINE_HEIGHT),
+            (geo.content_left, base_y + row * preview_line_height),
             line,
-            fill=_INK_TEXTURE,
+            fill=appearance.preview.color,
             font=preview_font,
         )
 
     # NAME band: needs an RGBA overlay composited onto the (opaque RGB)
     # preview, then flattened back to RGB for the native format -- same
     # reason the pre-v3 translucent banner needed one.
-    name_font = ImageFont.load_default(size=_primary_size(size, font_scale))
+    name_font = ImageFont.load_default(
+        size=_primary_size(size, font_scale, appearance.primary.scale)
+    )
     label = _fit_label(draw, session.name, name_font, geo.content_width)
 
     needs_attention = session.bell.needs_attention
@@ -418,11 +457,11 @@ def render_session_key(
         # Split state channel (docs/KEY_DESIGN_SYSTEM.md §3): fill turns
         # amber, ink inverts to black (~10.4:1 contrast) -- signalled by
         # BOTH fill and ink polarity, never hue alone.
-        ImageDraw.Draw(overlay).rectangle(band_box, fill=_ATTENTION_BAND_RGBA)
-        name_ink = _INK_ATTENTION
+        ImageDraw.Draw(overlay).rectangle(band_box, fill=appearance.palette.attention)
+        name_ink = appearance.palette.attention_text
     else:
         ImageDraw.Draw(overlay).rectangle(band_box, fill=_NAME_BANNER_FILL)
-        name_ink = _INK_PRIMARY
+        name_ink = appearance.primary.color
     image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(image)
     _draw_band_text(
@@ -442,13 +481,15 @@ def render_session_key(
         # treatment `render_control_key` gives its own STATE text; drawn
         # on the flattened RGB image (not the RGBA overlay above), same
         # as every other band on this face except NAME.
-        state_font = ImageFont.load_default(size=_secondary_size(size, font_scale))
+        state_font = ImageFont.load_default(
+            size=_secondary_size(size, font_scale, appearance.secondary.scale)
+        )
         state_text = _fit_label(draw, origin_label, state_font, geo.content_width)
         _draw_band_text(
             draw,
             state_text,
             state_font,
-            _INK_SECONDARY,
+            appearance.secondary.color,
             content_left=geo.content_left,
             content_width=geo.content_width,
             band_top=geo.state_top,
@@ -459,19 +500,28 @@ def render_session_key(
         # The other split state channel: a ring at the face edge, costing
         # zero content pixels -- lives entirely in the margin the NAME
         # band is inset by, so it never touches the band it's next to.
-        _draw_border(draw, image, _ACTIVE_RING_COLOR, geo.border)
+        _draw_border(draw, image, appearance.palette.active, geo.border)
 
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 
-def render_empty_key(deck: DeckDevice) -> bytes:
+def render_empty_key(
+    deck: DeckDevice, *, appearance: Appearance = DEFAULT_APPEARANCE
+) -> bytes:
     """Render a blank (unused) key slot -- no session mapped to it."""
-    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_EMPTY)
+    image = PILHelper.create_key_image(
+        cast(StreamDeck, deck), background=appearance.palette.empty_background
+    )
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 
 def render_picker_key(
-    deck: DeckDevice, label: str, *, current: bool, font_scale: float = 1.0
+    deck: DeckDevice,
+    label: str,
+    *,
+    current: bool,
+    font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> bytes:
     """Render one picker-mode key: a centered label on a distinct background.
 
@@ -486,24 +536,28 @@ def render_picker_key(
     `label` is the BODY (the discriminator), drawn at PRIMARY size in the
     BODY band.
     """
-    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_CONTROL)
+    image = PILHelper.create_key_image(
+        cast(StreamDeck, deck), background=appearance.palette.control_background
+    )
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
-    font = ImageFont.load_default(size=_primary_size(size, font_scale))
+    font = ImageFont.load_default(
+        size=_primary_size(size, font_scale, appearance.primary.scale)
+    )
     text = _fit_label(draw, label, font, geo.content_width)
     _draw_band_text(
         draw,
         text,
         font,
-        _INK_PRIMARY,
+        appearance.primary.color,
         content_left=geo.content_left,
         content_width=geo.content_width,
         band_top=geo.body_top,
         band_height=geo.body_height,
     )
     if current:
-        _draw_border(draw, image, _ACTIVE_RING_COLOR, geo.border)
+        _draw_border(draw, image, appearance.palette.active, geo.border)
     return PILHelper.to_native_key_format(cast(StreamDeck, deck), image)
 
 
@@ -525,6 +579,7 @@ def render_control_key(
     body: str,
     state: str = "",
     font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> bytes:
     """Render one control key from its (NAME, BODY, STATE) zone content.
 
@@ -538,19 +593,23 @@ def render_control_key(
     adjacent `< PREV` keys distinguished only by a dim caption were the
     exact complaint this design system exists to fix.
     """
-    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_CONTROL)
+    image = PILHelper.create_key_image(
+        cast(StreamDeck, deck), background=appearance.palette.control_background
+    )
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
 
     if name:
-        font = ImageFont.load_default(size=_secondary_size(size, font_scale))
+        font = ImageFont.load_default(
+            size=_secondary_size(size, font_scale, appearance.secondary.scale)
+        )
         text = _fit_label(draw, name, font, geo.content_width)
         _draw_band_text(
             draw,
             text,
             font,
-            _INK_SECONDARY,
+            appearance.secondary.color,
             content_left=geo.content_left,
             content_width=geo.content_width,
             band_top=geo.name_top,
@@ -558,13 +617,15 @@ def render_control_key(
         )
 
     if body:
-        font = ImageFont.load_default(size=_primary_size(size, font_scale))
+        font = ImageFont.load_default(
+            size=_primary_size(size, font_scale, appearance.primary.scale)
+        )
         text = _fit_label(draw, body, font, geo.content_width)
         _draw_band_text(
             draw,
             text,
             font,
-            _INK_PRIMARY,
+            appearance.primary.color,
             content_left=geo.content_left,
             content_width=geo.content_width,
             band_top=geo.body_top,
@@ -572,13 +633,15 @@ def render_control_key(
         )
 
     if state:
-        font = ImageFont.load_default(size=_secondary_size(size, font_scale))
+        font = ImageFont.load_default(
+            size=_secondary_size(size, font_scale, appearance.secondary.scale)
+        )
         text = _fit_label(draw, state, font, geo.content_width)
         _draw_band_text(
             draw,
             text,
             font,
-            _INK_SECONDARY,
+            appearance.secondary.color,
             content_left=geo.content_left,
             content_width=geo.content_width,
             band_top=geo.state_top,
@@ -591,8 +654,29 @@ def render_control_key(
 _STATUS_KEY_LINE_HEIGHT = 13
 
 
+def _status_key_metrics(size: int, secondary_scale: float = 1.0) -> tuple[int, int]:
+    """Return status-key font size and a line height safe for its real glyphs.
+
+    At a 72px key and scale 1.0 this preserves the legacy 11px/13px metrics.
+    Larger keys and effective SECONDARY scales grow both values together.
+    """
+
+    font_size = _secondary_size(size, secondary_scale)
+    baseline_line_height = max(
+        1, round(_STATUS_KEY_LINE_HEIGHT * size / 72 * secondary_scale)
+    )
+    reference_bottom = round(
+        ImageFont.load_default(size=font_size).getbbox(_VCENTER_REFERENCE)[3]
+    )
+    return font_size, max(baseline_line_height, reference_bottom)
+
+
 def render_status_key(
-    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+    deck: DeckDevice,
+    message: str,
+    *,
+    font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> bytes:
     """Render a status message word-wrapped onto a single key.
 
@@ -604,13 +688,22 @@ def render_status_key(
     unknown length and there is nothing else on the face to align to, so
     it fills the whole content box rather than being confined to one band.
     """
-    image = PILHelper.create_key_image(cast(StreamDeck, deck), background=_BG_EMPTY)
+    image = PILHelper.create_key_image(
+        cast(StreamDeck, deck), background=appearance.palette.empty_background
+    )
     draw = ImageDraw.Draw(image)
     size = image.width
     geo = _zone_geometry(size)
-    font = ImageFont.load_default(size=_secondary_size(size, font_scale))
+    effective_secondary_scale = font_scale * appearance.secondary.scale
+    font_size, line_height = _status_key_metrics(size, effective_secondary_scale)
+    font = ImageFont.load_default(size=font_size)
     max_width = geo.content_width
-    max_lines = max(1, geo.content_height // _STATUS_KEY_LINE_HEIGHT)
+    # Text is anchored at the supplied y coordinate, not its ink's top. Its
+    # bbox bottom is therefore the fit constraint for the last line; using
+    # only content_height // line_height can let the final scaled line spill
+    # into the bottom margin even when earlier lines do not overlap.
+    reference_bottom = font.getbbox(_VCENTER_REFERENCE)[3]
+    max_lines = max(1, 1 + (geo.content_height - reference_bottom) // line_height)
 
     lines: list[str] = []
     current = ""
@@ -628,9 +721,9 @@ def render_status_key(
 
     for row, line in enumerate(lines):
         draw.text(
-            (geo.content_left, geo.content_top + row * _STATUS_KEY_LINE_HEIGHT),
+            (geo.content_left, geo.content_top + row * line_height),
             _fit_label(draw, line, font, max_width),
-            fill=_INK_SECONDARY,
+            fill=appearance.secondary.color,
             font=font,
         )
 
@@ -649,8 +742,35 @@ def _paint_full_touchscreen(deck: DeckDevice, image_bytes: bytes) -> None:
     deck.set_touchscreen_image(image_bytes, 0, 0, width, height)
 
 
+def _fit_status_strip_message(
+    draw: ImageDraw.ImageDraw,
+    message: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: float,
+) -> str:
+    """Return a status-strip message that fits its finite pixel width.
+
+    Preserve messages that already fit exactly.  Longer messages keep their
+    leading context and end with the renderer's standard ellipsis; this is
+    deterministic for every strip size and the active font scale.
+    """
+
+    if draw.textlength(message, font=font) <= max_width:
+        return message
+    ellipsis = "\u2026"
+    if draw.textlength(ellipsis, font=font) > max_width:
+        return ""
+    while message and draw.textlength(message + ellipsis, font=font) > max_width:
+        message = message[:-1]
+    return message + ellipsis
+
+
 def render_status_strip(
-    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+    deck: DeckDevice,
+    message: str,
+    *,
+    font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> bytes:
     """Render the touch strip as a single centered status line.
 
@@ -663,29 +783,41 @@ def render_status_strip(
         cast(StreamDeck, deck), background="black"
     )
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=max(1, round(_STRIP_FONT_SIZE * font_scale)))
+    font = ImageFont.load_default(
+        size=max(1, round(_STRIP_FONT_SIZE * font_scale * appearance.primary.scale))
+    )
 
+    message = _fit_status_strip_message(draw, message, font, image.width)
     bbox = draw.textbbox((0, 0), message, font=font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     position = (
         (image.width - text_w) / 2 - bbox[0],
         (image.height - text_h) / 2 - bbox[1],
     )
-    draw.text(position, message, fill="#ffffff", font=font)
+    draw.text(position, message, fill=appearance.primary.color, font=font)
 
     return PILHelper.to_native_touchscreen_format(cast(StreamDeck, deck), image)
 
 
 def paint_status_strip(
-    deck: DeckDevice, message: str, *, font_scale: float = 1.0
+    deck: DeckDevice,
+    message: str,
+    *,
+    font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> None:
     """Render and paint the status strip in one call."""
     _paint_full_touchscreen(
-        deck, render_status_strip(deck, message, font_scale=font_scale)
+        deck,
+        render_status_strip(
+            deck, message, font_scale=font_scale, appearance=appearance
+        ),
     )
 
 
-def paint_blank_keys(deck: DeckDevice) -> None:
+def paint_blank_keys(
+    deck: DeckDevice, *, appearance: Appearance = DEFAULT_APPEARANCE
+) -> None:
     """Blank every key -- used before a status-only strip message is shown."""
     for index in range(deck.key_count()):
-        deck.set_key_image(index, render_empty_key(deck))
+        deck.set_key_image(index, render_empty_key(deck, appearance=appearance))

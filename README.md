@@ -67,6 +67,9 @@ Linux, launchd on macOS), `doctor`, `update`, and `version`. Bare
 | `muxplex-deck config get <key>` | Show one config value |
 | `muxplex-deck config set <key> <value>` | Set a config value (type auto-detected) |
 | `muxplex-deck config reset [key]` | Reset one key, or all keys, to defaults |
+| `muxplex-deck appearance show` | Show physical-deck type-role scales and colors |
+| `muxplex-deck appearance set <role.field> <value>` | Set one safe appearance leaf |
+| `muxplex-deck appearance reset [role.field]` | Reset one appearance leaf, or all appearance settings |
 | `muxplex-deck service install` | Install + enable + start the background service |
 | `muxplex-deck service uninstall` | Stop + disable + remove the service |
 | `muxplex-deck service start` / `stop` / `restart` | Control the service |
@@ -386,7 +389,20 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
   "key_file": "~/.config/muxplex-deck/federation_key",
   "poll_interval": 2.0,
   "sort": "attention",
-  "font_scale": 1.0
+  "font_scale": 1.0,
+  "appearance": {
+    "primary": {"scale": 1.0, "color": "#FFFFFF"},
+    "secondary": {"scale": 1.0, "color": "#8888AA"},
+    "preview": {"scale": 1.0, "color": "#7A7A7A"},
+    "palette": {
+      "session_background": "#0A0A0A",
+      "control_background": "#101036",
+      "empty_background": "#000000",
+      "active": "#00D9F5",
+      "attention": "#F1A640",
+      "attention_text": "#000000"
+    }
+  }
 }
 ```
 
@@ -410,13 +426,25 @@ Config is a JSON file at `~/.config/muxplex-deck/config.json` by default
 - `controls` (optional, default `{}`) -- per-control action overrides; see
   "Control mappings" below. Not settable via `config set` -- use
   `muxplex-deck controls set` instead.
-- `font_scale` (optional, default `1.0`, valid range `0.5`-`2.0`) -- multiplies
+- `font_scale` (optional, default `1.0`, valid range `0.5`-`2.0` before
+  role-scale validation) -- multiplies
   the readable key-face text (session/control/picker labels) and the touch
   strip's status font. The physical deck has no settings UI of its own, so
   this is its one readability knob -- hot-reloadable, no restart needed.
   Deliberately does **not** scale the mini-terminal preview: that texture's
   size is column count, not apparent size (see
   docs/KEY_DESIGN_SYSTEM.md's font_scale note).
+- `appearance` (optional) -- physical-deck-only visual roles, aligned with
+  the soft deck: `primary`, `secondary`, and `preview` each have a bounded
+  `scale` (`0.5`-`2.0`) and `#RRGGBB` ink color; `font_scale * primary.scale`
+  and `font_scale * secondary.scale` must each be at most `1.25`, which keeps
+  readable text inside the 72px key's fixed bands. `preview.scale` is
+  independent and adjusts its crop metrics with its font. `palette` controls session,
+  control, and empty backgrounds plus active/attention state colors. Every
+  leaf is hot-reloadable and defaults reproduce legacy rendering exactly.
+  Use `muxplex-deck appearance show|set|reset`; generic `config set` refuses
+  the structured mapping. The hardware renderer ships one bundled regular
+  font, so family, weight, and italic are deliberately not configurable.
 
 ### Control mappings
 

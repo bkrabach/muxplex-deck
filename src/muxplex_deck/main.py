@@ -80,6 +80,7 @@ from . import attention, interaction, layout, rendering, views
 from . import config as config_mod
 from . import controls as controls_mod
 from . import identity as identity_mod
+from .appearance import DEFAULT_APPEARANCE, Appearance
 from .config import Config
 from .device import (
     DeckDevice,
@@ -599,6 +600,7 @@ def _paint_status_only(
     plan: layout.LayoutPlan,
     *,
     font_scale: float = 1.0,
+    appearance: Appearance = DEFAULT_APPEARANCE,
 ) -> None:
     """Blank the keys and show `message` wherever this deck can show status.
 
@@ -609,14 +611,18 @@ def _paint_status_only(
     existed) is `Config.font_scale`/`_ActiveRuntime.font_scale`.
     """
     with deck:
-        rendering.paint_blank_keys(deck)
+        rendering.paint_blank_keys(deck, appearance=appearance)
         if plan.use_strip:
-            rendering.paint_status_strip(deck, message, font_scale=font_scale)
+            rendering.paint_status_strip(
+                deck, message, font_scale=font_scale, appearance=appearance
+            )
         else:
             status_key = plan.view_key if plan.view_key is not None else 0
             deck.set_key_image(
                 status_key,
-                rendering.render_status_key(deck, message, font_scale=font_scale),
+                rendering.render_status_key(
+                    deck, message, font_scale=font_scale, appearance=appearance
+                ),
             )
 
 
@@ -663,6 +669,7 @@ class _ActiveRuntime:
         device_id: str = "",
         name: str = "",
         font_scale: float = 1.0,
+        appearance: Appearance = DEFAULT_APPEARANCE,
     ) -> None:
         self.deck = deck
         self.client = client
@@ -689,6 +696,7 @@ class _ActiveRuntime:
         # so `apply_reload` can change it and the very next repaint honors
         # the new value -- same pattern as `poll_interval` above.
         self.font_scale = font_scale
+        self.appearance = appearance
 
         # Parsed from `ServerState.active_remote_id` on every `refresh()`
         # (ADR §8.1 #10). Identifies which federation peer (if any) the
@@ -943,6 +951,7 @@ class _ActiveRuntime:
             self.poll_interval = config.poll_interval
             self.name = config.name
             self.font_scale = config.font_scale
+            self.appearance = config.appearance
             if config.view_pin is not None and config.view_pin != self.view_pin:
                 self.active_view = config.view_pin
             self.view_pin = config.view_pin
@@ -1245,7 +1254,10 @@ class _ActiveRuntime:
                         )
                     if message != self.last_strip:
                         rendering.paint_status_strip(
-                            self.deck, message, font_scale=self.font_scale
+                            self.deck,
+                            message,
+                            font_scale=self.font_scale,
+                            appearance=self.appearance,
                         )
                         self.last_strip = message
 
@@ -1306,7 +1318,10 @@ class _ActiveRuntime:
                     self._paint_picker_keys(window, current)
                 if self.plan.use_strip and message != self.last_strip:
                     rendering.paint_status_strip(
-                        self.deck, message, font_scale=self.font_scale
+                        self.deck,
+                        message,
+                        font_scale=self.font_scale,
+                        appearance=self.appearance,
                     )
                     self.last_strip = message
 
@@ -1324,7 +1339,10 @@ class _ActiveRuntime:
             if self.last_key_state[index] == identity:
                 continue
             if label is None:
-                self.deck.set_key_image(index, rendering.render_empty_key(self.deck))
+                self.deck.set_key_image(
+                    index,
+                    rendering.render_empty_key(self.deck, appearance=self.appearance),
+                )
             else:
                 self.deck.set_key_image(
                     index,
@@ -1333,6 +1351,7 @@ class _ActiveRuntime:
                         label,
                         current=is_current,
                         font_scale=self.font_scale,
+                        appearance=self.appearance,
                     ),
                 )
             self.last_key_state[index] = identity
@@ -1365,7 +1384,8 @@ class _ActiveRuntime:
                 continue
             if label is None:
                 self.deck.set_key_image(
-                    key_index, rendering.render_empty_key(self.deck)
+                    key_index,
+                    rendering.render_empty_key(self.deck, appearance=self.appearance),
                 )
             else:
                 self.deck.set_key_image(
@@ -1375,6 +1395,7 @@ class _ActiveRuntime:
                         label,
                         current=is_current,
                         font_scale=self.font_scale,
+                        appearance=self.appearance,
                     ),
                 )
             self.last_key_state[key_index] = identity
@@ -1402,6 +1423,7 @@ class _ActiveRuntime:
                     body=body,
                     state=state,
                     font_scale=self.font_scale,
+                    appearance=self.appearance,
                 ),
             )
             self.last_key_state[key_index] = control_identity
@@ -1418,7 +1440,10 @@ class _ActiveRuntime:
             blank_identity: object = ("picker-blank",)
             if self.last_key_state[key_index] == blank_identity:
                 continue
-            self.deck.set_key_image(key_index, rendering.render_empty_key(self.deck))
+            self.deck.set_key_image(
+                key_index,
+                rendering.render_empty_key(self.deck, appearance=self.appearance),
+            )
             self.last_key_state[key_index] = blank_identity
 
     def _paint_keys(
@@ -1480,7 +1505,8 @@ class _ActiveRuntime:
                 continue
             if session is None:
                 self.deck.set_key_image(
-                    key_index, rendering.render_empty_key(self.deck)
+                    key_index,
+                    rendering.render_empty_key(self.deck, appearance=self.appearance),
                 )
             else:
                 self.deck.set_key_image(
@@ -1491,6 +1517,7 @@ class _ActiveRuntime:
                         active=active,
                         origin_label=origin_label,
                         font_scale=self.font_scale,
+                        appearance=self.appearance,
                     ),
                 )
             self.last_key_state[key_index] = identity
@@ -1530,7 +1557,8 @@ class _ActiveRuntime:
                 if self.last_key_state[key_index] == identity:
                     continue
                 self.deck.set_key_image(
-                    key_index, rendering.render_empty_key(self.deck)
+                    key_index,
+                    rendering.render_empty_key(self.deck, appearance=self.appearance),
                 )
                 self.last_key_state[key_index] = identity
                 continue
@@ -1555,6 +1583,7 @@ class _ActiveRuntime:
                     body=body,
                     state=state,
                     font_scale=self.font_scale,
+                    appearance=self.appearance,
                 ),
             )
             self.last_key_state[key_index] = identity
@@ -1628,7 +1657,10 @@ class _ActiveRuntime:
             message = f"view switch failed: {view}"
             with self.paint_lock, self.deck:
                 rendering.paint_status_strip(
-                    self.deck, message, font_scale=self.font_scale
+                    self.deck,
+                    message,
+                    font_scale=self.font_scale,
+                    appearance=self.appearance,
                 )
                 self.last_strip = message
 
@@ -1987,7 +2019,10 @@ class _ActiveRuntime:
             with self.paint_lock, self.deck:
                 message = f"remote switch failed: {name} ({reason})"
                 rendering.paint_status_strip(
-                    self.deck, message, font_scale=self.font_scale
+                    self.deck,
+                    message,
+                    font_scale=self.font_scale,
+                    appearance=self.appearance,
                 )
                 self.last_strip = message
         except MuxplexError:
@@ -1995,7 +2030,10 @@ class _ActiveRuntime:
             with self.paint_lock, self.deck:
                 message = f"switch failed: {name}"
                 rendering.paint_status_strip(
-                    self.deck, message, font_scale=self.font_scale
+                    self.deck,
+                    message,
+                    font_scale=self.font_scale,
+                    appearance=self.appearance,
                 )
                 self.last_strip = message
 
@@ -2180,7 +2218,10 @@ class _ActiveRuntime:
             message = f"target switch failed: {value}"
             with self.paint_lock, self.deck:
                 rendering.paint_status_strip(
-                    self.deck, message, font_scale=self.font_scale
+                    self.deck,
+                    message,
+                    font_scale=self.font_scale,
+                    appearance=self.appearance,
                 )
                 self.last_strip = message
 
@@ -2347,11 +2388,16 @@ def _run_active(
         device_id,
         config.name,
         config.font_scale,
+        config.appearance,
     )
     logger.info("%s", layout.describe_plan(ctx.plan))
     _log_plan_diagnostics(ctx.plan)
     _paint_status_only(
-        deck, "connecting to muxplex...", ctx.plan, font_scale=ctx.font_scale
+        deck,
+        "connecting to muxplex...",
+        ctx.plan,
+        font_scale=ctx.font_scale,
+        appearance=ctx.appearance,
     )
 
     reporter.update(
@@ -2399,6 +2445,7 @@ def _run_active(
                         "AUTH FAILED -- check key file",
                         ctx.plan,
                         font_scale=ctx.font_scale,
+                        appearance=ctx.appearance,
                     )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "auth"
@@ -2416,6 +2463,7 @@ def _run_active(
                         f"{hostname} UNREACHABLE -- retrying",
                         ctx.plan,
                         font_scale=ctx.font_scale,
+                        appearance=ctx.appearance,
                     )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
@@ -2434,6 +2482,7 @@ def _run_active(
                         f"{hostname} ERROR -- retrying",
                         ctx.plan,
                         font_scale=ctx.font_scale,
+                        appearance=ctx.appearance,
                     )
                     ctx.invalidate_paint_cache()
                     shown_error_state = "unreachable"
@@ -2471,6 +2520,13 @@ def _run_active(
                     assert outcome.config is not None
                     if outcome.applied:
                         ctx.apply_reload(outcome.config)
+                        # Appearance is a pure rendering input: it has no
+                        # server dependency and must visibly take effect on
+                        # this processed tick, not only after a later poll.
+                        # `apply_reload` invalidates the diff cache first, so
+                        # this redraw cannot be skipped as stale.
+                        if "appearance" in outcome.applied:
+                            ctx.repaint()
                         reporter.update(unapplied=_unapplied_for_status(ctx.plan))
                         logger.info(
                             "config reload applied: %s", ", ".join(outcome.applied)
