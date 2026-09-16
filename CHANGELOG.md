@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.19.0 (2026-09-16)
+
+### Added
+
+- Local physical-deck appearance configuration for primary and secondary text,
+  terminal-preview scaling, and key palette colors. Defaults preserve legacy
+  rendering.
+- `muxplex-deck appearance show|set|reset` CLI commands for validated
+  individual appearance fields.
+- Appearance changes hot-reload in a running sidecar.
+
+### Compatibility
+
+- **Pre-existing `font_scale` values above `1.25` must be lowered to `1.25` or
+  less before starting this version.** Otherwise fixed-key fit validation
+  rejects the configuration and the sidecar does not start. This ensures
+  primary and secondary text fit within the fixed key bands.
+
 ## v0.18.1 (2026-09-13)
 
 ### Maintenance
